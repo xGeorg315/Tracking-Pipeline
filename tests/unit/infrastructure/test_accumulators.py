@@ -39,6 +39,50 @@ def _track_with_intensity(points: np.ndarray, intensity: np.ndarray) -> Track:
     return track
 
 
+def _single_chunk_track(
+    points: np.ndarray,
+    *,
+    center: np.ndarray | None = None,
+    intensity: np.ndarray | None = None,
+    frame_id: int = 0,
+) -> Track:
+    track = Track(track_id=42, hit_count=1, age=1, missed=0, ended_by_missed=True)
+    world_points = np.asarray(points, dtype=np.float32)
+    track_center = np.zeros((3,), dtype=np.float32) if center is None else np.asarray(center, dtype=np.float32)
+    track.centers.append(track_center.copy())
+    track.frame_ids.append(int(frame_id))
+    track.world_points.append(world_points.copy())
+    track.local_points.append((world_points - track_center).astype(np.float32))
+    if intensity is not None:
+        intensity_values = np.asarray(intensity, dtype=np.float32)
+        track.world_intensity.append(intensity_values.copy())
+        track.local_intensity.append(intensity_values.copy())
+    track.bbox_extents.append(compute_extent(world_points))
+    return track
+
+
+def _symmetry_accumulator(
+    *,
+    enabled: bool = True,
+    save_world: bool = False,
+    min_saved_aggregate_points: int = 0,
+    fusion_voxel_size: float = 0.10,
+) -> VoxelFusionAccumulator:
+    return VoxelFusionAccumulator(
+        AggregationConfig(
+            symmetry_completion=enabled,
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=fusion_voxel_size,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=min_saved_aggregate_points,
+        ),
+        OutputConfig(require_track_exit=False, save_world=save_world),
+        TrackingConfig(min_track_hits=1),
+    )
+
+
 def _points(point_count: int, center_y: float, extent_y: float) -> np.ndarray:
     x = np.linspace(-0.15, 0.15, point_count, dtype=np.float32)
     y = np.linspace(center_y - (extent_y * 0.5), center_y + (extent_y * 0.5), point_count, dtype=np.float32)
@@ -112,6 +156,16 @@ def test_voxel_fusion_accumulator_saves_track() -> None:
     result = accumulator.accumulate(_track(), LaneBox.from_values([-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]))
     assert result.status == "saved"
     assert len(result.points) > 0
+    extent = compute_extent(result.points)
+    assert result.metrics["vehicle_length_axis"] == "y"
+    assert result.metrics["vehicle_width_axis"] == "x"
+    assert result.metrics["vehicle_height_axis"] == "z"
+    assert np.isclose(result.metrics["vehicle_length"], float(extent[1]))
+    assert np.isclose(result.metrics["vehicle_width"], float(extent[0]))
+    assert np.isclose(result.metrics["vehicle_height"], float(extent[2]))
+    assert np.isclose(result.metrics["extent_x"], float(extent[0]))
+    assert np.isclose(result.metrics["extent_y"], float(extent[1]))
+    assert np.isclose(result.metrics["extent_z"], float(extent[2]))
 
 
 def test_voxel_fusion_accumulator_averages_intensity_per_voxel() -> None:
@@ -145,6 +199,217 @@ def test_voxel_fusion_accumulator_averages_intensity_per_voxel() -> None:
     assert result.intensity is not None
     assert len(result.points) == 1
     assert np.allclose(result.intensity, np.array([0.5], dtype=np.float32))
+
+
+def test_symmetry_completion_disabled_leaves_saved_aggregate_unchanged() -> None:
+    track = _single_chunk_track(
+        np.array(
+            [
+                [0.22, 0.00, 1.0],
+                [0.22, 0.12, 1.0],
+                [0.22, 0.24, 1.0],
+            ],
+            dtype=np.float32,
+        ),
+        center=np.zeros((3,), dtype=np.float32),
+    )
+    accumulator = _symmetry_accumulator(enabled=False, save_world=False, fusion_voxel_size=0.10)
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, -1.0, 2.0, 0.0, 2.0]))
+
+    assert result.status == "saved"
+    assert len(result.points) == 3
+    assert result.metrics["symmetry_completion_enabled"] is False
+    assert result.metrics["symmetry_completion_applied"] is False
+    assert result.metrics["point_count_before_symmetry_completion"] == 3
+    assert result.metrics["point_count_after_symmetry_completion"] == 3
+    assert result.metrics["symmetry_completion_generated_points"] == 0
+
+
+def test_symmetry_completion_cuts_at_plane_and_mirrors_stronger_half_with_intensity() -> None:
+    track = _single_chunk_track(
+        np.array(
+            [
+                [0.22, 0.00, 1.0],
+                [0.22, 0.12, 1.0],
+                [0.22, 0.24, 1.0],
+            ],
+            dtype=np.float32,
+        ),
+        center=np.zeros((3,), dtype=np.float32),
+        intensity=np.array([0.2, 0.5, 0.8], dtype=np.float32),
+    )
+    accumulator = _symmetry_accumulator(enabled=True, save_world=False, fusion_voxel_size=0.10)
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, -1.0, 2.0, 0.0, 2.0]))
+
+    assert result.status == "saved"
+    assert len(result.points) == 6
+    assert result.intensity is not None
+    negative_points = result.points[result.points[:, 0] < 0.0]
+    positive_points = result.points[result.points[:, 0] > 0.0]
+    assert len(negative_points) == 3
+    assert len(positive_points) == 3
+    assert np.allclose(np.sort(negative_points[:, 0]), np.array([-0.22, -0.22, -0.22], dtype=np.float32), atol=1e-6)
+    assert np.allclose(result.intensity[result.points[:, 0] < 0.0], np.array([0.2, 0.5, 0.8], dtype=np.float32), atol=1e-6)
+    assert result.metrics["symmetry_completion_enabled"] is True
+    assert result.metrics["symmetry_completion_applied"] is True
+    assert result.metrics["symmetry_completion_lateral_axis"] == "x"
+    assert result.metrics["symmetry_completion_plane_coordinate"] == 0.0
+    assert result.metrics["symmetry_completion_source_side"] == "positive"
+    assert result.metrics["point_count_before_symmetry_completion"] == 3
+    assert result.metrics["symmetry_completion_source_slice_count"] == 3
+    assert result.metrics["symmetry_completion_target_slice_count"] == 0
+    assert result.metrics["symmetry_completion_candidate_count"] == 3
+    assert result.metrics["symmetry_completion_generated_points"] == 3
+    assert result.metrics["point_count_after_symmetry_completion"] == 6
+    assert result.metrics["point_count_after_downsample"] == 6
+    assert result.metrics["symmetry_completion_skipped_reason"] == "applied"
+
+
+def test_symmetry_completion_replaces_weaker_half_instead_of_overlapping_with_it() -> None:
+    track = _single_chunk_track(
+        np.array(
+            [
+                [0.22, 0.00, 1.0],
+                [0.22, 0.12, 1.0],
+                [0.22, 0.24, 1.0],
+                [-0.18, 0.00, 1.0],
+                [-0.18, 0.12, 1.0],
+            ],
+            dtype=np.float32,
+        ),
+        center=np.zeros((3,), dtype=np.float32),
+    )
+    accumulator = _symmetry_accumulator(enabled=True, save_world=False, fusion_voxel_size=0.10)
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, -1.0, 1.0, 0.0, 2.0]))
+
+    assert result.status == "saved"
+    assert len(result.points) == 6
+    assert result.metrics["symmetry_completion_applied"] is True
+    assert result.metrics["symmetry_completion_source_side"] == "positive"
+    assert result.metrics["symmetry_completion_candidate_count"] == 3
+    assert result.metrics["symmetry_completion_generated_points"] == 3
+    assert result.metrics["point_count_after_symmetry_completion"] == 6
+    assert not np.any(np.isclose(result.points[:, 0], -0.18, atol=1e-6))
+    assert np.allclose(np.sort(result.points[result.points[:, 0] < 0.0][:, 0]), np.array([-0.22, -0.22, -0.22], dtype=np.float32), atol=1e-6)
+
+
+def test_symmetry_completion_uses_world_center_median_for_plane_coordinate() -> None:
+    track = _single_chunk_track(
+        np.array(
+            [
+                [5.22, 0.00, 1.0],
+                [5.22, 0.12, 1.0],
+                [5.22, 0.24, 1.0],
+            ],
+            dtype=np.float32,
+        ),
+        center=np.array([5.0, 0.5, 1.0], dtype=np.float32),
+    )
+    accumulator = _symmetry_accumulator(enabled=True, save_world=True, fusion_voxel_size=0.10)
+
+    result = accumulator.accumulate(track, LaneBox.from_values([4.0, 6.0, -1.0, 2.0, 0.0, 2.0]))
+
+    assert result.status == "saved"
+    assert result.metrics["symmetry_completion_plane_coordinate"] == 5.0
+    assert np.allclose(
+        np.sort(result.points[:, 0]),
+        np.array([4.78, 4.78, 4.78, 5.22, 5.22, 5.22], dtype=np.float32),
+        atol=1e-6,
+    )
+
+
+def test_symmetry_completion_refines_local_plane_for_asymmetric_two_sided_aggregate() -> None:
+    track = _single_chunk_track(
+        np.array(
+            [
+                [-1.00, 0.00, 1.0],
+                [-1.00, 0.12, 1.0],
+                [0.50, 0.24, 1.0],
+            ],
+            dtype=np.float32,
+        ),
+        center=np.zeros((3,), dtype=np.float32),
+    )
+    accumulator = _symmetry_accumulator(enabled=True, save_world=False, fusion_voxel_size=0.10)
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-2.0, 2.0, -1.0, 3.0, 0.0, 2.0]))
+
+    assert result.status == "saved"
+    assert result.metrics["symmetry_completion_plane_coordinate"] < -0.1
+    assert result.metrics["symmetry_completion_plane_coordinate"] > -0.6
+    assert result.metrics["symmetry_completion_source_side"] == "negative"
+    assert np.any(result.points[:, 0] > 0.3)
+
+
+def test_symmetry_completion_does_not_change_min_saved_points_status() -> None:
+    track = _single_chunk_track(
+        np.array([[0.30, 0.00, 1.0]], dtype=np.float32),
+        center=np.zeros((3,), dtype=np.float32),
+    )
+    accumulator = _symmetry_accumulator(enabled=True, save_world=False, min_saved_aggregate_points=2, fusion_voxel_size=0.10)
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, -1.0, 1.0, 0.0, 2.0]))
+
+    assert result.status == "skipped_min_saved_points"
+    assert len(result.points) == 0
+    assert result.metrics["symmetry_completion_enabled"] is True
+    assert result.metrics["symmetry_completion_applied"] is False
+    assert result.metrics["point_count_before_symmetry_completion"] == 1
+    assert result.metrics["point_count_after_symmetry_completion"] == 1
+
+
+def test_symmetry_completion_prefers_more_extended_half_when_counts_match() -> None:
+    track = _single_chunk_track(
+        np.array(
+            [
+                [0.22, 0.00, 1.0],
+                [0.22, 0.12, 1.0],
+                [0.22, 0.24, 1.0],
+                [-0.18, 0.12, 1.0],
+                [-0.18, 0.24, 1.0],
+                [-0.18, 0.36, 1.0],
+            ],
+            dtype=np.float32,
+        ),
+        center=np.zeros((3,), dtype=np.float32),
+    )
+    accumulator = _symmetry_accumulator(enabled=True, save_world=False, fusion_voxel_size=0.10)
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-2.0, 2.0, -1.0, 1.0, 0.0, 2.0]))
+
+    assert result.status == "saved"
+    assert result.metrics["symmetry_completion_applied"] is True
+    assert result.metrics["symmetry_completion_source_side"] == "positive"
+    assert result.metrics["symmetry_completion_source_slice_count"] == 3
+    assert result.metrics["symmetry_completion_target_slice_count"] == 3
+    assert result.metrics["symmetry_completion_candidate_count"] == 3
+    assert result.metrics["symmetry_completion_generated_points"] == 3
+    assert np.allclose(np.sort(result.points[result.points[:, 0] < 0.0][:, 0]), np.array([-0.22, -0.22, -0.22], dtype=np.float32), atol=1e-6)
+
+
+def test_symmetry_completion_skips_when_all_points_stay_in_center_strip() -> None:
+    centered_track = _single_chunk_track(
+        np.array(
+            [
+                [0.00, 0.00, 1.0],
+                [0.02, 0.12, 1.0],
+                [-0.02, 0.24, 1.0],
+            ],
+            dtype=np.float32,
+        ),
+        center=np.zeros((3,), dtype=np.float32),
+    )
+    accumulator = _symmetry_accumulator(enabled=True, save_world=False, fusion_voxel_size=0.10)
+
+    result = accumulator.accumulate(centered_track, LaneBox.from_values([-2.0, 2.0, -1.0, 2.0, 0.0, 2.0]))
+
+    assert result.status == "saved"
+    assert result.metrics["symmetry_completion_applied"] is False
+    assert result.metrics["symmetry_completion_skipped_reason"] == "no_off_plane_points"
+    assert len(result.points) == 3
 
 
 def test_registration_voxel_fusion_accumulator_falls_back_without_backend() -> None:

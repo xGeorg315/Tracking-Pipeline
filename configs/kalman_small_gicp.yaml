@@ -8,7 +8,7 @@ aggregation:
   registration_backend: small_gicp
   frame_selection_method: keyframe_motion
   keyframe_keep: 8
-  registration_min_fitness: 0.20
+  registration_min_fitness: 0.22
   registration_max_corr_dist: 0.75
   shape_consistency_filter: true
 postprocessing:

@@ -57,6 +57,7 @@ class TrackingConfig:
 @dataclass(slots=True)
 class AggregationConfig:
     algorithm: str = "voxel_fusion"
+    symmetry_completion: bool = False
     frame_selection_method: str = "auto"
     use_all_frames: bool = True
     top_k_frames: int = 10

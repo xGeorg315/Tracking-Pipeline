@@ -132,6 +132,8 @@ class VoxelFusionAccumulator:
             long_vehicle_mode_applied,
         )
         final_points = len(filtered_xyz)
+        symmetry_metrics = self._symmetry_completion_metrics(filtered_xyz, selected_centers)
+        dimension_metrics = self._vehicle_dimension_metrics(filtered_xyz)
         metrics: dict[str, Any] = {
             **self._base_metrics(track),
             **selection_info,
@@ -152,6 +154,8 @@ class VoxelFusionAccumulator:
             "long_vehicle_mode_applied": bool(long_vehicle_mode_applied),
             "min_saved_aggregate_points": int(self.config.min_saved_aggregate_points),
             "mode": "world" if self.output_config.save_world else "local",
+            **dimension_metrics,
+            **symmetry_metrics,
         }
         if final_points == 0:
             return AggregateResult(track.track_id, np.zeros((0, 3), dtype=np.float32), selected_frame_ids, "empty_filtered", metrics)
@@ -167,7 +171,16 @@ class VoxelFusionAccumulator:
         if float(track.quality_score or 0.0) < quality_threshold:
             metrics["quality_threshold"] = quality_threshold
             return AggregateResult(track.track_id, np.zeros((0, 3), dtype=np.float32), selected_frame_ids, "skipped_quality_threshold", metrics)
-        return AggregateResult(track.track_id, filtered_xyz, selected_frame_ids, "saved", metrics, intensity=filtered_intensity)
+        completed_xyz, completed_intensity, symmetry_metrics = self._apply_symmetry_completion(
+            filtered_xyz,
+            filtered_intensity,
+            selected_centers,
+            component_count_post_fusion,
+        )
+        metrics.update(symmetry_metrics)
+        metrics.update(self._vehicle_dimension_metrics(completed_xyz))
+        metrics["point_count_after_downsample"] = int(len(completed_xyz))
+        return AggregateResult(track.track_id, completed_xyz, selected_frame_ids, "saved", metrics, intensity=completed_intensity)
 
     def _base_metrics(self, track: Track) -> dict[str, Any]:
         return {
@@ -175,6 +188,258 @@ class VoxelFusionAccumulator:
             "quality_metrics": track.quality_metrics,
             "track_source_ids": track.source_track_ids or [track.track_id],
         }
+
+    def _symmetry_completion_metrics(
+        self,
+        xyz: np.ndarray,
+        selected_centers: list[np.ndarray],
+    ) -> dict[str, Any]:
+        _, lateral_idx, _ = self._symmetry_axes()
+        return {
+            "symmetry_completion_enabled": bool(self.config.symmetry_completion),
+            "symmetry_completion_applied": False,
+            "symmetry_completion_lateral_axis": ["x", "y", "z"][lateral_idx],
+            "symmetry_completion_plane_coordinate": self._symmetry_plane_coordinate(selected_centers, xyz, lateral_idx),
+            "point_count_before_symmetry_completion": int(len(xyz)),
+            "symmetry_completion_generated_points": 0,
+            "point_count_after_symmetry_completion": int(len(xyz)),
+            "symmetry_completion_source_side": "none",
+            "symmetry_completion_source_slice_count": 0,
+            "symmetry_completion_target_slice_count": 0,
+            "symmetry_completion_candidate_count": 0,
+            "symmetry_completion_overlap_rejected_count": 0,
+            "symmetry_completion_continuity_rejected_count": 0,
+            "symmetry_completion_capped_count": 0,
+            "symmetry_completion_skipped_reason": "disabled" if not self.config.symmetry_completion else "not_run",
+        }
+
+    def _vehicle_dimension_metrics(self, xyz: np.ndarray) -> dict[str, Any]:
+        axis_idx, lateral_idx, vertical_idx = self._symmetry_axes()
+        extent = compute_extent(np.asarray(xyz, dtype=np.float32))
+        axis_names = ["x", "y", "z"]
+        return {
+            "vehicle_length": float(extent[axis_idx]),
+            "vehicle_width": float(extent[lateral_idx]),
+            "vehicle_height": float(extent[vertical_idx]),
+            "vehicle_length_axis": axis_names[axis_idx],
+            "vehicle_width_axis": axis_names[lateral_idx],
+            "vehicle_height_axis": axis_names[vertical_idx],
+            "extent_x": float(extent[0]),
+            "extent_y": float(extent[1]),
+            "extent_z": float(extent[2]),
+        }
+
+    def _apply_symmetry_completion(
+        self,
+        xyz: np.ndarray,
+        intensity: np.ndarray | None,
+        selected_centers: list[np.ndarray],
+        component_count_post_fusion: int,
+    ) -> tuple[np.ndarray, np.ndarray | None, dict[str, Any]]:
+        points = np.asarray(xyz, dtype=np.float32)
+        metrics = self._symmetry_completion_metrics(points, selected_centers)
+        if not self.config.symmetry_completion or len(points) == 0:
+            metrics["symmetry_completion_skipped_reason"] = "disabled" if not self.config.symmetry_completion else "empty"
+            return points, None if intensity is None else np.asarray(intensity, dtype=np.float32), metrics
+        _ = component_count_post_fusion
+
+        axis_idx, lateral_idx, vertical_idx = self._symmetry_axes()
+        plane_coordinate = float(metrics["symmetry_completion_plane_coordinate"])
+        completion_voxel = self._symmetry_completion_voxel()
+        intensity_values = None
+        if intensity is not None and len(np.asarray(intensity, dtype=np.float32)) == len(points):
+            intensity_values = np.asarray(intensity, dtype=np.float32)
+
+        slice_records, side_point_clouds = self._symmetry_slice_records(
+            points,
+            intensity_values,
+            plane_coordinate,
+            axis_idx,
+            lateral_idx,
+            vertical_idx,
+            completion_voxel,
+        )
+        positive_slice_count = sum(1 for records in slice_records.values() if 1 in records)
+        negative_slice_count = sum(1 for records in slice_records.values() if -1 in records)
+        positive_count = int(len(side_point_clouds.get(1, np.zeros((0, 3), dtype=np.float32))))
+        negative_count = int(len(side_point_clouds.get(-1, np.zeros((0, 3), dtype=np.float32))))
+        if positive_count == 0 and negative_count == 0:
+            metrics["symmetry_completion_skipped_reason"] = "no_off_plane_points"
+            return points, intensity_values, metrics
+
+        dominant_side = self._symmetry_half_source_side(points, plane_coordinate, lateral_idx, completion_voxel)
+        source_slice_count = positive_slice_count if dominant_side > 0 else negative_slice_count
+        target_slice_count = negative_slice_count if dominant_side > 0 else positive_slice_count
+        metrics["symmetry_completion_source_side"] = "positive" if dominant_side > 0 else "negative"
+        metrics["symmetry_completion_source_slice_count"] = int(source_slice_count)
+        metrics["symmetry_completion_target_slice_count"] = int(target_slice_count)
+
+        signed_distance = points[:, lateral_idx].astype(np.float64) - plane_coordinate
+        positive_mask = signed_distance > (0.5 * completion_voxel)
+        negative_mask = signed_distance < (-0.5 * completion_voxel)
+        center_mask = ~(positive_mask | negative_mask)
+        source_mask = positive_mask if dominant_side > 0 else negative_mask
+        kept_mask = center_mask | source_mask
+        source_points = np.asarray(points[source_mask], dtype=np.float32)
+        if len(source_points) == 0:
+            metrics["symmetry_completion_skipped_reason"] = "no_source_side"
+            return points, intensity_values, metrics
+
+        mirrored_points = source_points.copy()
+        mirrored_points[:, lateral_idx] = np.float32((2.0 * plane_coordinate) - mirrored_points[:, lateral_idx])
+        metrics["symmetry_completion_candidate_count"] = int(len(source_points))
+
+        kept_points = np.asarray(points[kept_mask], dtype=np.float32)
+        combined_xyz = np.vstack([kept_points, mirrored_points]).astype(np.float32, copy=False)
+        combined_intensity = None
+        if intensity_values is not None:
+            kept_intensity = np.asarray(intensity_values[kept_mask], dtype=np.float32)
+            source_intensity = np.asarray(intensity_values[source_mask], dtype=np.float32)
+            combined_intensity = np.concatenate([kept_intensity, source_intensity], axis=0).astype(np.float32, copy=False)
+        combined_xyz, combined_intensity = self._mean_per_voxel(combined_xyz, combined_intensity, completion_voxel)
+        metrics.update(
+            {
+                "symmetry_completion_applied": True,
+                "symmetry_completion_generated_points": int(len(source_points)),
+                "point_count_after_symmetry_completion": int(len(combined_xyz)),
+                "symmetry_completion_skipped_reason": "applied",
+            }
+        )
+        return combined_xyz, combined_intensity, metrics
+
+    def _symmetry_axes(self) -> tuple[int, int, int]:
+        axis_idx = axis_to_index(self.config.frame_selection_line_axis)
+        lateral_idx, vertical_idx = orthogonal_axes(axis_idx)
+        return axis_idx, lateral_idx, vertical_idx
+
+    def _symmetry_completion_voxel(self) -> float:
+        return max(0.05, float(self.config.aggregate_voxel), float(self.config.fusion_voxel_size))
+
+    def _symmetry_slice_records(
+        self,
+        points: np.ndarray,
+        intensity: np.ndarray | None,
+        plane_coordinate: float,
+        axis_idx: int,
+        lateral_idx: int,
+        vertical_idx: int,
+        completion_voxel: float,
+    ) -> tuple[dict[tuple[int, int], dict[int, dict[str, Any]]], dict[int, np.ndarray]]:
+        off_plane_mask = np.abs(np.asarray(points, dtype=np.float32)[:, lateral_idx] - float(plane_coordinate)) >= (0.5 * completion_voxel)
+        off_plane_points = np.asarray(points, dtype=np.float32)[off_plane_mask]
+        off_plane_intensity = None if intensity is None else np.asarray(intensity, dtype=np.float32)[off_plane_mask]
+        if len(off_plane_points) == 0:
+            return {}, {1: np.zeros((0, 3), dtype=np.float32), -1: np.zeros((0, 3), dtype=np.float32)}
+
+        side_distances = off_plane_points[:, lateral_idx].astype(np.float64) - float(plane_coordinate)
+        side_point_clouds = {
+            1: np.asarray(off_plane_points[side_distances > 0.0], dtype=np.float32),
+            -1: np.asarray(off_plane_points[side_distances < 0.0], dtype=np.float32),
+        }
+        raw_buckets: dict[tuple[int, int, int], dict[str, Any]] = {}
+        for index, point in enumerate(off_plane_points):
+            signed_distance = float(point[lateral_idx] - plane_coordinate)
+            side = 1 if signed_distance > 0.0 else -1
+            bucket = raw_buckets.setdefault(
+                (
+                    int(np.floor(float(point[axis_idx]) / completion_voxel)),
+                    int(np.floor(float(point[vertical_idx]) / completion_voxel)),
+                    int(side),
+                ),
+                {
+                    "points": [],
+                    "distances": [],
+                    "intensity": [],
+                },
+            )
+            bucket["points"].append(np.asarray(point, dtype=np.float32))
+            bucket["distances"].append(abs(signed_distance))
+            if off_plane_intensity is not None:
+                bucket["intensity"].append(float(off_plane_intensity[index]))
+
+        slice_records: dict[tuple[int, int], dict[int, dict[str, Any]]] = {}
+        for (longitudinal_bin, vertical_bin, side), bucket in raw_buckets.items():
+            bucket_points = np.asarray(bucket["points"], dtype=np.float32)
+            bucket_distances = np.asarray(bucket["distances"], dtype=np.float32)
+            lateral_bins = np.floor(bucket_distances / completion_voxel).astype(np.int32)
+            outer_bin = int(np.max(lateral_bins))
+            outer_mask = lateral_bins == outer_bin
+            outer_points = bucket_points[outer_mask]
+            representative_point = np.asarray(np.mean(outer_points, axis=0), dtype=np.float32)
+            representative_intensity = None
+            if off_plane_intensity is not None and bucket["intensity"]:
+                bucket_intensity = np.asarray(bucket["intensity"], dtype=np.float32)
+                representative_intensity = float(np.mean(bucket_intensity[outer_mask]))
+            slice_records.setdefault((int(longitudinal_bin), int(vertical_bin)), {})[int(side)] = {
+                "point": representative_point,
+                "intensity": representative_intensity,
+                "support_count": int(len(bucket_points)),
+                "outer_lateral_distance": float(np.mean(bucket_distances[outer_mask])),
+            }
+        return slice_records, side_point_clouds
+
+    def _symmetry_half_source_side(
+        self,
+        points: np.ndarray,
+        plane_coordinate: float,
+        lateral_idx: int,
+        completion_voxel: float,
+    ) -> int:
+        signed_distance = np.asarray(points, dtype=np.float32)[:, lateral_idx].astype(np.float64) - float(plane_coordinate)
+        positive_mask = signed_distance > (0.5 * completion_voxel)
+        negative_mask = signed_distance < (-0.5 * completion_voxel)
+        positive_count = int(np.sum(positive_mask))
+        negative_count = int(np.sum(negative_mask))
+        if positive_count > negative_count:
+            return 1
+        if negative_count > positive_count:
+            return -1
+        positive_extent = 0.0 if positive_count == 0 else float(np.mean(np.abs(signed_distance[positive_mask])))
+        negative_extent = 0.0 if negative_count == 0 else float(np.mean(np.abs(signed_distance[negative_mask])))
+        if positive_extent > negative_extent:
+            return 1
+        if negative_extent > positive_extent:
+            return -1
+        return 1
+
+    def _symmetry_plane_coordinate(
+        self,
+        selected_centers: list[np.ndarray],
+        xyz: np.ndarray,
+        lateral_idx: int,
+    ) -> float:
+        base_plane = 0.0
+        if self.output_config.save_world:
+            if selected_centers:
+                center_values = np.asarray(selected_centers, dtype=np.float64)
+                if center_values.ndim == 2 and center_values.shape[1] > lateral_idx:
+                    base_plane = float(np.median(center_values[:, lateral_idx]))
+            else:
+                points = np.asarray(xyz, dtype=np.float64)
+                if points.ndim == 2 and len(points) > 0 and points.shape[1] > lateral_idx:
+                    base_plane = float(np.mean(points[:, lateral_idx]))
+
+        points = np.asarray(xyz, dtype=np.float64)
+        if points.ndim != 2 or len(points) == 0 or points.shape[1] <= lateral_idx:
+            return float(base_plane)
+        values = points[:, lateral_idx]
+        values = values[np.isfinite(values)]
+        if len(values) == 0:
+            return float(base_plane)
+
+        completion_voxel = self._symmetry_completion_voxel()
+        centered = values - float(base_plane)
+        has_negative = bool(np.any(centered < (-0.5 * completion_voxel)))
+        has_positive = bool(np.any(centered > (0.5 * completion_voxel)))
+        if not (has_negative and has_positive):
+            return float(base_plane)
+
+        lower = float(np.percentile(values, 5.0))
+        upper = float(np.percentile(values, 95.0))
+        robust_midpoint = 0.5 * (lower + upper)
+        if abs(robust_midpoint - float(base_plane)) < (0.5 * completion_voxel):
+            return float(base_plane)
+        return float(robust_midpoint)
 
     def _prepare_for_fusion(self, chunks: list[np.ndarray]) -> tuple[list[np.ndarray], dict[str, Any]]:
         return chunks, {

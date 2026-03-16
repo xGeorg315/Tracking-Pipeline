@@ -632,6 +632,14 @@ Eine Zeile pro Track mit:
 - `aggregate_status`
 - `aggregation_metrics`
 
+Wichtige Felder in `aggregation_metrics`:
+- `vehicle_length`
+- `vehicle_width`
+- `vehicle_height`
+- `vehicle_length_axis`
+- `vehicle_width_axis`
+- `vehicle_height_axis`
+
 ### `aggregates/*.pcd`
 Die finale aggregierte Punktwolke pro gespeichertem Track.
 

@@ -51,6 +51,8 @@ def validate_config(config: PipelineConfig) -> None:
         raise ConfigError(f"Unsupported registration backend: {config.aggregation.registration_backend}")
     if config.aggregation.fusion_weight_mode not in SUPPORTED_FUSION_WEIGHT_MODES:
         raise ConfigError(f"Unsupported fusion weight mode: {config.aggregation.fusion_weight_mode}")
+    if not isinstance(config.aggregation.symmetry_completion, bool):
+        raise ConfigError("aggregation.symmetry_completion must be a boolean")
     if len(config.preprocessing.lane_box) != 6:
         raise ConfigError("preprocessing.lane_box must contain exactly 6 values")
     if config.preprocessing.bootstrap_frames < 0:

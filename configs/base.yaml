@@ -38,6 +38,7 @@ tracking:
   association_size_weight: 0.15
 aggregation:
   algorithm: voxel_fusion
+  symmetry_completion: true
   frame_selection_method: auto
   use_all_frames: true
   top_k_frames: 10
