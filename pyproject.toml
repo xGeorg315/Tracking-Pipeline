@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tracking-pipeline"
+version = "0.2.0"
+description = "Modular point cloud tracking and aggregation pipeline"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "betterproto>=1.2.5,<2",
+  "numpy>=1.26",
+  "open3d>=0.18",
+  "PyYAML>=6.0",
+  "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+registration = [
+  "small-gicp",
+]
+benchmark = [
+  "hdbscan>=0.8",
+]
+
+[project.scripts]
+tracking-pipeline = "tracking_pipeline.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

@@ -1,0 +1,100 @@
+input:
+  paths:
+    - ../data/3.pb
+  format: a42_pb
+preprocessing:
+  lane_box: [-2.10, 1.80, 4.0, 35.30, 0.12, 5.15]
+  bootstrap_frames: 10
+clustering:
+  algorithm: dbscan
+  eps: 1.15
+  min_points: 20
+  vehicle_min_points: 12
+  vehicle_max_points: 10000
+  plane_distance_threshold: 0.12
+  plane_ransac_n: 3
+  plane_num_iterations: 120
+  ground_normal_z_min: 0.75
+  hdbscan_min_cluster_size: 20
+  hdbscan_min_samples: 10
+  sensor_range_min: 0.0
+  sensor_range_max: 120.0
+  sensor_depth_jump_ratio: 0.08
+  sensor_depth_jump_abs: 0.45
+  sensor_min_component_size: 8
+  sensor_neighbor_rows: 1
+  sensor_neighbor_cols: 1
+  sensor_ground_row_ignore: 0
+tracking:
+  algorithm: kalman_nn
+  max_dist: 3.4
+  max_missed: 12
+  min_track_hits: 4
+  sticky_extra_dist_per_missed: 0.55
+  sticky_max_dist: 6.2
+  kf_init_var: 5.0
+  kf_process_var: 0.08
+  kf_meas_var: 0.60
+  association_size_weight: 0.15
+aggregation:
+  algorithm: voxel_fusion
+  frame_selection_method: auto
+  use_all_frames: true
+  top_k_frames: 10
+  keyframe_keep: 8
+  chunk_quality_filter: true
+  chunk_min_points_ratio_to_peak: 0.60
+  chunk_min_extent_ratio_to_peak: 0.55
+  chunk_min_segment_length: 4
+  frame_selection_line_axis: y
+  frame_selection_line_ratio: 0.10
+  frame_selection_touch_margin: 0.12
+  frame_downsample_voxel: 0.07
+  shape_consistency_filter: false
+  shape_consistency_max_extent_ratio: 2.0
+  registration_backend: small_gicp
+  registration_max_corr_dist: 0.95
+  registration_max_iter: 80
+  registration_min_fitness: 0.25
+  registration_max_translation: 3.2
+  global_registration_voxel: 0.12
+  fusion_voxel_size: 0.05
+  fusion_min_observations: 1
+  fusion_weight_mode: point_count
+  consensus_ratio: 0.35
+  min_track_quality_for_save: 0.0
+  min_saved_aggregate_points: 180
+  long_vehicle_mode: false
+  long_vehicle_length_threshold: 4.5
+  length_coverage_bins: 10
+  min_track_quality_for_save_long_vehicle: 0.0
+  tail_bridge_longitudinal_gap_max: 1.5
+  tail_bridge_lateral_gap_max: 0.8
+  tail_bridge_vertical_gap_max: 0.5
+  post_filter_stat_nb_neighbors: 12
+  post_filter_stat_std_ratio: 2.3
+  aggregate_voxel: 0.06
+postprocessing:
+  enable_tracklet_stitching: false
+  stitching_max_gap: 4
+  stitching_max_center_dist: 2.5
+  enable_co_moving_track_merge: false
+  parallel_merge_max_lateral_offset: 0.8
+  parallel_merge_max_longitudinal_gap: 4.0
+  parallel_merge_min_overlap_frames: 5
+  parallel_merge_min_overlap_ratio: 0.6
+  enable_trajectory_smoothing: false
+  smoothing_window: 3
+  enable_track_quality_scoring: true
+output:
+  root_dir: runs
+  save_world: false
+  save_aggregate_intensity: true
+  require_track_exit: true
+  track_exit_edge_margin: 0.9 # 0.6 for best resulte
+visualization:
+  enabled: true
+  color_by_intensity: false
+  max_points: 120000
+  max_cluster_points: 15000
+  max_assoc_dist: 4.2

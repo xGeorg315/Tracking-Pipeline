@@ -1,0 +1,7 @@
+input:
+  paths:
+    - ../tests/fixtures/sample_a42.pb
+tracking:
+  algorithm: euclidean_nn
+aggregation:
+  algorithm: voxel_fusion

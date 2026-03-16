@@ -1,0 +1,30 @@
+input:
+  paths:
+    - ../data/3.pb
+clustering:
+  algorithm: euclidean_clustering
+  eps: 0.30
+  vehicle_min_points: 8
+tracking:
+  algorithm: hungarian_kalman
+aggregation:
+  algorithm: weighted_voxel_fusion
+  frame_selection_method: length_coverage
+  keyframe_keep: 8
+  length_coverage_bins: 12
+  fusion_weight_mode: quality
+  min_track_quality_for_save: 0.2
+  min_track_quality_for_save_long_vehicle: 0.0
+  long_vehicle_mode: true
+  long_vehicle_length_threshold: 4.5
+  tail_bridge_longitudinal_gap_max: 2.2
+  tail_bridge_lateral_gap_max: 1.0
+  tail_bridge_vertical_gap_max: 0.6
+  aggregate_voxel: 0.05
+postprocessing:
+  enable_co_moving_track_merge: true
+  parallel_merge_max_lateral_offset: 0.9
+  parallel_merge_max_longitudinal_gap: 4.5
+  parallel_merge_min_overlap_frames: 4
+  parallel_merge_min_overlap_ratio: 0.5
+  enable_track_quality_scoring: true

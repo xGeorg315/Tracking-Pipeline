@@ -1,0 +1,17 @@
+input:
+  paths:
+    - ../tests/fixtures/sample_a42.pb
+clustering:
+  algorithm: euclidean_clustering
+  eps: 0.25
+  vehicle_min_points: 10
+tracking:
+  algorithm: hungarian_kalman
+aggregation:
+  algorithm: weighted_voxel_fusion
+  frame_selection_method: keyframe_motion
+  keyframe_keep: 6
+  fusion_weight_mode: point_count
+  aggregate_voxel: 0.04
+postprocessing:
+  enable_track_quality_scoring: true

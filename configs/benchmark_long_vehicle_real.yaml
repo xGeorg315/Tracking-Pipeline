@@ -1,0 +1,16 @@
+name: long_vehicle_real_proxy
+output_root: benchmarks
+warmup_runs: 1
+measure_runs: 3
+sequences:
+  - ../data/3.pb
+presets:
+  - kalman_registration.yaml
+  - kalman_generalized_icp.yaml
+  - kalman_feature_global_then_local.yaml
+  - hungarian_weighted.yaml
+  - long_vehicle_hungarian_weighted.yaml
+  - range_image_hungarian_weighted.yaml
+  - long_vehicle_range_image_hungarian_weighted.yaml
+  - beam_neighbor_hungarian_weighted.yaml
+  - long_vehicle_beam_neighbor_hungarian_weighted.yaml

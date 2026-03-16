@@ -1,0 +1,7 @@
+input:
+  paths:
+    - ../data/3.pb
+tracking:
+  algorithm: kalman_nn
+aggregation:
+  algorithm: voxel_fusion

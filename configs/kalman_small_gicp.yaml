@@ -1,0 +1,15 @@
+input:
+  paths:
+    - ../data/3.pb
+tracking:
+  algorithm: kalman_nn
+aggregation:
+  algorithm: registration_voxel_fusion
+  registration_backend: small_gicp
+  frame_selection_method: keyframe_motion
+  keyframe_keep: 8
+  registration_min_fitness: 0.20
+  registration_max_corr_dist: 0.75
+  shape_consistency_filter: true
+postprocessing:
+  enable_trajectory_smoothing: true

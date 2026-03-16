@@ -1,0 +1,18 @@
+input:
+  paths:
+    - ../data/3.pb
+clustering:
+  algorithm: ground_removed_dbscan
+  plane_distance_threshold: 0.10
+  plane_num_iterations: 150
+tracking:
+  algorithm: kalman_nn
+aggregation:
+  algorithm: registration_voxel_fusion
+  registration_backend: icp_point_to_plane
+  frame_selection_method: keyframe_motion
+  keyframe_keep: 8
+  shape_consistency_filter: true
+postprocessing:
+  enable_trajectory_smoothing: true
+  enable_track_quality_scoring: true

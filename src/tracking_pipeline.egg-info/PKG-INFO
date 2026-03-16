@@ -1,0 +1,53 @@
+Metadata-Version: 2.4
+Name: tracking-pipeline
+Version: 0.1.0
+Summary: Modular point cloud tracking and aggregation pipeline
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: betterproto<2,>=1.2.5
+Requires-Dist: numpy>=1.26
+Requires-Dist: open3d>=0.18
+Requires-Dist: PyYAML>=6.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Provides-Extra: registration
+Requires-Dist: small-gicp; extra == "registration"
+
+# Tracking Pipeline
+
+Modulare Python-Pipeline fuer Tracking, Punktwolken-Akkumulation und Open3D-Replay.
+
+## Features
+- Eingangsformat: length-delimited `a42.frame.Frame` `.pb`
+- Clusterer: `dbscan`
+- Tracker: `euclidean_nn`, `kalman_nn`
+- Akkumulatoren: `voxel_fusion`, `registration_voxel_fusion`
+- Persistente Run-Artefakte in `runs/`
+- Open3D-Replay fuer Einzelruns
+
+## Installation
+```bash
+pip install -e .
+```
+
+Mit optionalem Registrierungsbackend:
+```bash
+pip install -e .[registration]
+```
+
+## Nutzung
+Run ausfuehren:
+```bash
+tracking-pipeline run -c configs/kalman_voxel.yaml
+```
+
+Replay starten:
+```bash
+tracking-pipeline replay -c configs/kalman_voxel.yaml
+```
+
+## Architektur
+- `tracking_pipeline.domain`: Fachliche Datentypen und Regeln
+- `tracking_pipeline.application`: Ports, Factories, Use Cases
+- `tracking_pipeline.infrastructure`: Reader, Algorithmen, Writer, Viewer
+- `tracking_pipeline.config`: YAML-Config und Validierung

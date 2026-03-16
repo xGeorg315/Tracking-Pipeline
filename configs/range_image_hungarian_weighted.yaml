@@ -1,0 +1,21 @@
+input:
+  paths:
+    - ../data/3.pb
+clustering:
+  algorithm: range_image_connected_components
+  vehicle_min_points: 8
+  sensor_depth_jump_ratio: 0.13
+  sensor_depth_jump_abs: 0.75
+  sensor_min_component_size: 8
+  sensor_neighbor_cols: 3
+tracking:
+  algorithm: hungarian_kalman
+aggregation:
+  algorithm: weighted_voxel_fusion
+  frame_selection_method: keyframe_motion
+  keyframe_keep: 6
+  fusion_weight_mode: quality
+  min_track_quality_for_save: 0.2
+  aggregate_voxel: 0.05
+postprocessing:
+  enable_track_quality_scoring: true
