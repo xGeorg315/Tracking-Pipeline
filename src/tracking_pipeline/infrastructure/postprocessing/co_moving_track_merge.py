@@ -101,9 +101,24 @@ class CoMovingTrackMergePostprocessor:
                     [np.asarray(values[2], dtype=np.float32) for values in observations if values[2] is not None],
                     axis=0,
                 ).astype(np.float32, copy=False)
+            point_timestamps_ns = None
+            if all(values[6] is not None for values in observations):
+                point_timestamps_ns = np.concatenate(
+                    [np.asarray(values[6], dtype=np.int64) for values in observations if values[6] is not None],
+                    axis=0,
+                ).astype(np.int64, copy=False)
             center = np.mean(world_points, axis=0).astype(np.float32)
             extent = compute_extent(world_points)
-            merged.add_observation(center, world_points, int(frame_id), extent, intensity=world_intensity)
+            frame_timestamp_ns = int(observations[0][7])
+            merged.add_observation(
+                center,
+                world_points,
+                int(frame_id),
+                frame_timestamp_ns,
+                extent,
+                intensity=world_intensity,
+                point_timestamp_ns=point_timestamps_ns,
+            )
 
         merged.age = max(left.age, right.age, merged.last_frame - merged.first_frame + 1)
         merged.missed = min(left.missed, right.missed)
@@ -116,11 +131,13 @@ class CoMovingTrackMergePostprocessor:
     def _by_frame(
         self,
         track: Track,
-    ) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray, np.ndarray | None, np.ndarray]]:
-        mapping: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray, np.ndarray | None, np.ndarray]] = {}
+    ) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray, np.ndarray | None, np.ndarray, np.ndarray | None, int]]:
+        mapping: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray, np.ndarray | None, np.ndarray, np.ndarray | None, int]] = {}
         local_intensity = track.local_intensity if len(track.local_intensity) == len(track.local_points) else [None for _ in track.local_points]
         world_intensity = track.world_intensity if len(track.world_intensity) == len(track.world_points) else [None for _ in track.world_points]
-        for center, frame_id, local_points, world_points, local_scalar, world_scalar, extent in zip(
+        point_timestamps_ns = track.point_timestamps_ns if len(track.point_timestamps_ns) == len(track.world_points) else [None for _ in track.world_points]
+        frame_timestamps_ns = track.frame_timestamps_ns if len(track.frame_timestamps_ns) == len(track.frame_ids) else [-1 for _ in track.frame_ids]
+        for center, frame_id, local_points, world_points, local_scalar, world_scalar, extent, point_timestamp_ns, frame_timestamp_ns in zip(
             track.centers,
             track.frame_ids,
             track.local_points,
@@ -128,6 +145,8 @@ class CoMovingTrackMergePostprocessor:
             local_intensity,
             world_intensity,
             track.bbox_extents,
+            point_timestamps_ns,
+            frame_timestamps_ns,
         ):
             mapping[int(frame_id)] = (
                 np.asarray(center, dtype=np.float32),
@@ -136,5 +155,7 @@ class CoMovingTrackMergePostprocessor:
                 np.asarray(local_points, dtype=np.float32),
                 None if local_scalar is None else np.asarray(local_scalar, dtype=np.float32),
                 np.asarray(extent, dtype=np.float32),
+                None if point_timestamp_ns is None else np.asarray(point_timestamp_ns, dtype=np.int64),
+                int(frame_timestamp_ns),
             )
         return mapping

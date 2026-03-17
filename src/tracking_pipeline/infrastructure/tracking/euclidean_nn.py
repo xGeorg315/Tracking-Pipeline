@@ -15,10 +15,10 @@ class EuclideanNNTracker:
         self.tracks: dict[int, Track] = {}
         self.finished_tracks: dict[int, Track] = {}
 
-    def _spawn_track(self, detection: Detection, frame_idx: int) -> ActiveTrackState:
+    def _spawn_track(self, detection: Detection, frame_idx: int, frame_timestamp_ns: int) -> ActiveTrackState:
         track_id = self.next_id
         self.next_id += 1
-        self.tracks[track_id] = initialize_track(track_id, detection, frame_idx)
+        self.tracks[track_id] = initialize_track(track_id, detection, frame_idx, frame_timestamp_ns)
         return ActiveTrackState(track_id=track_id, points=detection.points, center=detection.center, intensity=detection.intensity)
 
     def _associate(self, detections: list[Detection]) -> tuple[dict[int, int], list[int], list[int]]:
@@ -41,13 +41,19 @@ class EuclideanNNTracker:
         unmatched_tracks = [track_ids[row] for row in unmatched_rows]
         return assignments, unmatched_tracks, unmatched_detections
 
-    def step(self, detections: list[Detection], frame_idx: int) -> FrameTrackingState:
+    def step(self, detections: list[Detection], frame_idx: int, frame_timestamp_ns: int) -> FrameTrackingState:
         assignments, unmatched_tracks, unmatched_detections = self._associate(detections)
         active_tracks: list[ActiveTrackState] = []
 
         for track_id, detection_idx in assignments.items():
             detection = detections[detection_idx]
-            append_detection(self.tracks[track_id], detection, frame_idx, np.asarray(detection.center, dtype=np.float32))
+            append_detection(
+                self.tracks[track_id],
+                detection,
+                frame_idx,
+                frame_timestamp_ns,
+                np.asarray(detection.center, dtype=np.float32),
+            )
             active_tracks.append(
                 ActiveTrackState(
                     track_id=track_id,
@@ -70,7 +76,7 @@ class EuclideanNNTracker:
             del self.tracks[track_id]
 
         for detection_idx in unmatched_detections:
-            active_tracks.append(self._spawn_track(detections[detection_idx], frame_idx))
+            active_tracks.append(self._spawn_track(detections[detection_idx], frame_idx, frame_timestamp_ns))
 
         return FrameTrackingState(
             frame_index=frame_idx,

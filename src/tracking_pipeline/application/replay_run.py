@@ -28,7 +28,7 @@ def replay_run(config: PipelineConfig, project_root: Path) -> None:
     frames = reader.iter_frames(config.input.paths)
     for frame in frames:
         cluster_result = clusterer.cluster(frame, lane_box)
-        state = tracker.step(cluster_result.detections, frame.frame_index)
+        state = tracker.step(cluster_result.detections, frame.frame_index, frame.timestamp_ns)
         state.lane_points = cluster_result.lane_points
         state.lane_intensity = cluster_result.lane_intensity
         state.detections = cluster_result.detections

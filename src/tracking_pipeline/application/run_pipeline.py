@@ -49,7 +49,7 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
         with profiler.stage("cluster_frames"):
             cluster_result = clusterer.cluster(frame, lane_box)
         with profiler.stage("tracker_steps"):
-            tracker.step(cluster_result.detections, frame.frame_index)
+            tracker.step(cluster_result.detections, frame.frame_index, frame.timestamp_ns)
 
     with profiler.stage("tracker_finalize"):
         tracks = tracker.finalize()

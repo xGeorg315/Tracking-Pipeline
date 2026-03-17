@@ -14,7 +14,7 @@ class HDBSCANClusterer:
         self._hdbscan = self._try_import()
 
     def cluster(self, frame: FrameData, lane_box: LaneBox) -> ClusterResult:
-        lane_points, lane_intensity = crop_lane_points(frame, lane_box)
+        lane_points, lane_intensity, lane_point_timestamp_ns = crop_lane_points(frame, lane_box)
         if len(lane_points) < self.config.vehicle_min_points:
             return ClusterResult(
                 lane_points=lane_points,
@@ -29,7 +29,16 @@ class HDBSCANClusterer:
             min_samples=int(self.config.hdbscan_min_samples),
         )
         labels = np.asarray(clusterer.fit_predict(lane_points), dtype=np.int32)
-        return build_cluster_result("hdbscan", lane_points, lane_intensity, lane_points, lane_intensity, labels, self.config)
+        return build_cluster_result(
+            "hdbscan",
+            lane_points,
+            lane_intensity,
+            lane_points,
+            lane_intensity,
+            lane_point_timestamp_ns,
+            labels,
+            self.config,
+        )
 
     def _try_import(self):
         try:

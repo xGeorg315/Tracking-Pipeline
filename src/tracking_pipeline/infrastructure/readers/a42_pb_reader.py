@@ -57,12 +57,19 @@ class A42PBReader:
                             [np.asarray(scan.intensity, dtype=np.float32) for scan in scans if scan.intensity is not None],
                             axis=0,
                         ).astype(np.float32, copy=False)
+                    point_timestamp_ns = None
+                    if scans and all(scan.point_timestamp_ns is not None for scan in scans):
+                        point_timestamp_ns = np.concatenate(
+                            [np.asarray(scan.point_timestamp_ns, dtype=np.int64) for scan in scans if scan.point_timestamp_ns is not None],
+                            axis=0,
+                        ).astype(np.int64, copy=False)
                     frames.append(
                         FrameData(
                             frame_index=frame_index,
                             timestamp_ns=timestamp_ns,
                             points=points,
                             point_intensity=point_intensity,
+                            point_timestamp_ns=point_timestamp_ns,
                             source_path=str(path),
                             source_frame_index=source_frame_index,
                             source_sequence_index=sequence_index,
@@ -87,6 +94,13 @@ class A42PBReader:
         intensity = self._unpack_point_intensity(pointcloud, len(xyz_all))
         if intensity is not None:
             intensity = np.asarray(intensity[finite_mask], dtype=np.float32)
+        point_timestamp_ns = self._decode_point_timestamp_ns(
+            pointcloud,
+            int(getattr(scan, "scan_timestamp_ns", 0)),
+            len(xyz_all),
+        )
+        if point_timestamp_ns is not None:
+            point_timestamp_ns = np.asarray(point_timestamp_ns[finite_mask], dtype=np.int64)
         calibration = self._calibration_to_data(getattr(scan, "calibration", None))
         ranges = np.linalg.norm(xyz, axis=1).astype(np.float32)
         row_index = self._compute_row_index(xyz, ranges, calibration, pointcloud)
@@ -96,6 +110,7 @@ class A42PBReader:
             timestamp_ns=int(getattr(scan, "scan_timestamp_ns", 0)),
             xyz=xyz,
             intensity=intensity,
+            point_timestamp_ns=point_timestamp_ns,
             ranges=ranges,
             row_index=row_index,
             col_index=col_index,
@@ -186,6 +201,15 @@ class A42PBReader:
         if not raw or len(raw) != count * 2:
             return None
         return (np.frombuffer(raw, dtype="<u2").astype(np.float32) / 65535.0).astype(np.float32, copy=False)
+
+    def _decode_point_timestamp_ns(self, pointcloud: object, scan_timestamp_ns: int, count: int) -> np.ndarray | None:
+        if not pointcloud or count <= 0:
+            return None
+        raw = getattr(pointcloud, "timestamp_offset", b"")
+        if not raw or len(raw) != count * 8:
+            return None
+        offsets = np.frombuffer(raw, dtype="<u8").astype(np.int64, copy=False)
+        return (offsets + np.int64(scan_timestamp_ns)).astype(np.int64, copy=False)
 
     def _compute_row_index(
         self,

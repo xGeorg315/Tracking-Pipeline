@@ -153,6 +153,7 @@ flowchart LR
 ## Wichtige Besonderheiten
 
 - **Intensity-Unterstuetzung**: Intensitaet wird im aktuellen Datensatz aus `reflectivity` uebernommen, falls `pointcloud.intensity` leer ist.
+- **Motion Deskew**: Aggregate koennen optional objektrelativ per Punktzeit (`timestamp_offset`) entzerrt werden.
 - **Symmetry Completion**: Aggregate koennen optional lokal vervollstaendigt werden.
 - **Fahrzeugdimensionen**: `aggregation_metrics` enthalten `vehicle_length`, `vehicle_width`, `vehicle_height` plus Achseninfo.
 - **Performance-Analyse**: Benchmarks schreiben neben Qualitaetsmetriken auch Stage- und Ressourcenmetriken.

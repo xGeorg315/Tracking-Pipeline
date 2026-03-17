@@ -39,6 +39,8 @@ tracking:
 aggregation:
   algorithm: voxel_fusion
   symmetry_completion: true
+  motion_deskew: true
+  truncate_after_lane_end_touch: true
   frame_selection_method: auto
   use_all_frames: true
   top_k_frames: 10
@@ -91,11 +93,11 @@ output:
   root_dir: runs
   save_world: false
   save_aggregate_intensity: true
-  require_track_exit: true
+  require_track_exit: false
   track_exit_edge_margin: 0.9 # 0.6 for best resulte
 visualization:
   enabled: true
   color_by_intensity: false
-  max_points: 120000
+  max_points: 12000
   max_cluster_points: 15000
   max_assoc_dist: 4.2

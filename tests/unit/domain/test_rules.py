@@ -5,6 +5,7 @@ import numpy as np
 from tracking_pipeline.domain.models import Track
 from tracking_pipeline.domain.rules import (
     filter_chunks_by_shape_consistency,
+    find_lane_end_touch_index,
     is_valid_transform,
     select_best_frames_for_aggregation,
     track_exited_lane_box,
@@ -98,6 +99,49 @@ def test_select_best_frames_for_aggregation_length_coverage_preserves_longitudin
     assert frame_ids[-1] == 23
     assert 22 in frame_ids
     assert info["strategy"] == "length_coverage"
+
+
+def test_find_lane_end_touch_index_uses_first_point_touch_on_axis_min() -> None:
+    lane_box = LaneBox.from_values([-1.0, 1.0, 0.0, 20.0, 0.0, 2.0])
+    chunks = [
+        np.array([[0.0, 2.0, 0.0], [0.0, 2.5, 0.0]], dtype=np.float32),
+        np.array([[0.0, 0.03, 0.0], [0.0, 0.30, 0.0]], dtype=np.float32),
+        np.array([[0.0, -0.4, 0.0], [0.0, 0.1, 0.0]], dtype=np.float32),
+    ]
+    centers = [chunk.mean(axis=0) for chunk in chunks]
+
+    touch_idx = find_lane_end_touch_index(chunks, centers, lane_box, axis_idx=1, touch_margin=0.05)
+
+    assert touch_idx == 1
+
+
+def test_find_lane_end_touch_index_returns_none_without_touch() -> None:
+    lane_box = LaneBox.from_values([-1.0, 1.0, 0.0, 20.0, 0.0, 2.0])
+    chunks = [
+        np.array([[0.0, 1.0, 0.0], [0.0, 1.2, 0.0]], dtype=np.float32),
+        np.array([[0.0, 0.4, 0.0], [0.0, 0.6, 0.0]], dtype=np.float32),
+    ]
+    centers = [chunk.mean(axis=0) for chunk in chunks]
+
+    touch_idx = find_lane_end_touch_index(chunks, centers, lane_box, axis_idx=1, touch_margin=0.05)
+
+    assert touch_idx is None
+
+
+def test_find_lane_end_touch_index_falls_back_to_center_when_points_miss() -> None:
+    lane_box = LaneBox.from_values([-1.0, 1.0, 0.0, 20.0, 0.0, 2.0])
+    chunks = [
+        np.array([[0.0, 1.0, 0.0], [0.0, 1.2, 0.0]], dtype=np.float32),
+        np.array([[0.0, 0.20, 0.0], [0.0, 0.22, 0.0]], dtype=np.float32),
+    ]
+    centers = [
+        np.array([0.0, 1.1, 0.0], dtype=np.float32),
+        np.array([0.0, 0.03, 0.0], dtype=np.float32),
+    ]
+
+    touch_idx = find_lane_end_touch_index(chunks, centers, lane_box, axis_idx=1, touch_margin=0.05)
+
+    assert touch_idx == 1
 
 
 def test_filter_chunks_by_shape_consistency_removes_large_outlier() -> None:

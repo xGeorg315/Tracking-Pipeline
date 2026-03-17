@@ -67,6 +67,17 @@ def find_touch_start_index(
     return None
 
 
+def find_lane_end_touch_index(
+    chunks: list[np.ndarray],
+    centers: list[np.ndarray],
+    lane_box: LaneBox,
+    axis_idx: int,
+    touch_margin: float = 0.12,
+) -> int | None:
+    lane_end_value, _ = lane_axis_bounds(lane_box, axis_idx)
+    return find_touch_start_index(chunks, centers, axis_idx, lane_end_value, touch_margin)
+
+
 def select_keyframes_by_motion(centers: list[np.ndarray], keep: int) -> list[int]:
     if not centers:
         return []

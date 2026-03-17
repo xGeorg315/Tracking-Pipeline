@@ -20,6 +20,7 @@ class SensorPointBatch:
     row_index: np.ndarray
     col_index: np.ndarray
     intensity: np.ndarray | None = None
+    point_timestamp_ns: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -31,14 +32,15 @@ class SensorCell:
     center: np.ndarray
     mean_range: float
     intensity: np.ndarray | None = None
+    point_timestamp_ns: np.ndarray | None = None
 
 
-def crop_lane_points(frame: FrameData, lane_box: LaneBox) -> tuple[np.ndarray, np.ndarray | None]:
+def crop_lane_points(frame: FrameData, lane_box: LaneBox) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
     xyz = np.asarray(frame.points, dtype=np.float32)
     if len(xyz) == 0:
-        return np.zeros((0, 3), dtype=np.float32), None
+        return np.zeros((0, 3), dtype=np.float32), None, None
     mask = lane_box.mask(xyz)
-    return xyz[mask], apply_mask_optional(frame.point_intensity, mask)
+    return xyz[mask], apply_mask_optional(frame.point_intensity, mask), _apply_mask_optional_int64(frame.point_timestamp_ns, mask)
 
 
 def crop_lane_sensor_batches(
@@ -71,6 +73,7 @@ def crop_lane_sensor_batches(
                 row_index=np.asarray(scan.row_index[mask], dtype=np.int32),
                 col_index=np.asarray(scan.col_index[mask], dtype=np.int32),
                 intensity=apply_mask_optional(scan.intensity, mask),
+                point_timestamp_ns=_apply_mask_optional_int64(scan.point_timestamp_ns, mask),
             )
         )
     lane_points = np.concatenate(lane_parts, axis=0) if lane_parts else np.zeros((0, 3), dtype=np.float32)
@@ -84,6 +87,7 @@ def build_cluster_result(
     lane_intensity: np.ndarray | None,
     cluster_points: np.ndarray,
     cluster_intensity: np.ndarray | None,
+    cluster_point_timestamp_ns: np.ndarray | None,
     labels: np.ndarray,
     config: ClusteringConfig,
     extra_metrics: dict[str, Any] | None = None,
@@ -123,6 +127,7 @@ def build_cluster_result(
                 min_bound=points.min(axis=0).astype(np.float32),
                 max_bound=points.max(axis=0).astype(np.float32),
                 intensity=apply_mask_optional(cluster_intensity, mask),
+                point_timestamp_ns=_apply_mask_optional_int64(cluster_point_timestamp_ns, mask),
                 metadata={
                     "point_count": int(len(points)),
                     "algorithm": algorithm,
@@ -151,7 +156,7 @@ def build_sensor_cluster_result(
         connect_fn=connect_fn,
     )
     filtered_components = [component for component in components if sum(len(cell.points) for cell in component) >= int(config.sensor_min_component_size)]
-    cluster_points, cluster_intensity, labels = _components_to_points(filtered_components)
+    cluster_points, cluster_intensity, cluster_point_timestamp_ns, labels = _components_to_points(filtered_components)
     metrics = {
         "sensor_scan_count": len(batches),
         "sensor_cell_count": len(cells),
@@ -166,6 +171,7 @@ def build_sensor_cluster_result(
         lane_intensity,
         cluster_points,
         cluster_intensity,
+        cluster_point_timestamp_ns,
         labels,
         config,
         extra_metrics=metrics,
@@ -193,6 +199,7 @@ def _build_sensor_cells(batches: list[SensorPointBatch]) -> dict[tuple[int, int,
                 center=points.mean(axis=0).astype(np.float32),
                 mean_range=float(np.mean(batch.ranges[mask])),
                 intensity=apply_mask_optional(batch.intensity, mask),
+                point_timestamp_ns=_apply_mask_optional_int64(batch.point_timestamp_ns, mask),
             )
     return cells
 
@@ -231,19 +238,37 @@ def _connected_components(
     return components
 
 
-def _components_to_points(components: list[list[SensorCell]]) -> tuple[np.ndarray, np.ndarray | None, np.ndarray]:
+def _components_to_points(components: list[list[SensorCell]]) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray]:
     if not components:
-        return np.zeros((0, 3), dtype=np.float32), None, np.zeros((0,), dtype=np.int32)
+        return np.zeros((0, 3), dtype=np.float32), None, None, np.zeros((0,), dtype=np.int32)
     point_parts: list[np.ndarray] = []
     intensity_parts: list[np.ndarray | None] = []
+    timestamp_parts: list[np.ndarray | None] = []
     label_parts: list[np.ndarray] = []
     for label, component in enumerate(components):
         for cell in component:
             point_parts.append(cell.points)
             intensity_parts.append(cell.intensity)
+            timestamp_parts.append(cell.point_timestamp_ns)
             label_parts.append(np.full((len(cell.points),), label, dtype=np.int32))
     return (
         np.concatenate(point_parts, axis=0),
         optional_concatenate(intensity_parts),
+        _optional_concatenate_int64(timestamp_parts),
         np.concatenate(label_parts, axis=0),
     )
+
+
+def _apply_mask_optional_int64(values: np.ndarray | None, mask: np.ndarray) -> np.ndarray | None:
+    if values is None:
+        return None
+    return np.asarray(values, dtype=np.int64)[np.asarray(mask, dtype=bool)]
+
+
+def _optional_concatenate_int64(parts: list[np.ndarray | None]) -> np.ndarray | None:
+    if not parts or any(part is None for part in parts):
+        return None
+    arrays = [np.asarray(part, dtype=np.int64) for part in parts if part is not None]
+    if not arrays:
+        return np.zeros((0,), dtype=np.int64)
+    return np.concatenate(arrays, axis=0).astype(np.int64, copy=False)

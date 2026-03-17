@@ -115,6 +115,8 @@ output:
 | --- | --- | --- |
 | `algorithm` | `voxel_fusion` | Akkumulator-Auswahl |
 | `symmetry_completion` | `false` | optionale lokale Symmetrievervollstaendigung |
+| `motion_deskew` | `false` | objektrelativer intra-scan Deskew fuer elongierte Tracks anhand von `timestamp_offset` |
+| `truncate_after_lane_end_touch` | `false` | verwirft alle Folgeframes nach erstem Touch am Lane-Ende (`frame_selection_line_axis`-Min-Seite) |
 | `frame_selection_method` | `auto` | Strategie zur Chunk-/Frame-Auswahl |
 | `use_all_frames` | `true` | alle Track-Frames verwenden statt nur Auswahl |
 | `top_k_frames` | `10` | Limit fuer `line_touch_last_k` / Top-K-Auswahl |
@@ -251,5 +253,5 @@ measure_runs: 3
 
 - Fuer normale Einstiege ist `kalman_voxel.yaml` die einfachste stabile Basis.
 - `registration_voxel_fusion` lohnt sich nur, wenn Chunks ohne Registrierung sichtbar versetzt bleiben.
-- `symmetry_completion` und `save_aggregate_intensity` sind additive Features auf dem finalen Aggregate-Output.
+- `motion_deskew`, `symmetry_completion` und `save_aggregate_intensity` sind additive Features auf dem finalen Aggregate-Output.
 - Wenn ein Preset nicht explizit alle Werte setzt, kommen sie aus `configs/base.yaml`.

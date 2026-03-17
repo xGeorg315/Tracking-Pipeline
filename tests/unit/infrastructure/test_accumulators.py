@@ -83,6 +83,56 @@ def _symmetry_accumulator(
     )
 
 
+def _motion_deskew_accumulator(
+    *,
+    enabled: bool,
+    save_world: bool = False,
+    long_vehicle_mode: bool = True,
+) -> VoxelFusionAccumulator:
+    return VoxelFusionAccumulator(
+        AggregationConfig(
+            motion_deskew=enabled,
+            long_vehicle_mode=long_vehicle_mode,
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.05,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+        ),
+        OutputConfig(require_track_exit=False, save_world=save_world),
+        TrackingConfig(min_track_hits=1),
+    )
+
+
+def _motion_distorted_track(*, with_point_timestamps: bool = True) -> Track:
+    track = Track(track_id=77, hit_count=3, age=3, missed=0, ended_by_missed=True)
+    point_time_offsets_ns = np.array([0, 50_000_000, 100_000_000], dtype=np.int64)
+    x_values = np.array([-1.0, 0.0, 1.0], dtype=np.float32)
+    speed_mps = 10.0
+    for index, center_y in enumerate([0.0, 10.0, 20.0]):
+        frame_timestamp_ns = int(index * 1_000_000_000)
+        absolute_times = frame_timestamp_ns + point_time_offsets_ns
+        dt_seconds = (point_time_offsets_ns.astype(np.float64) - float(np.median(point_time_offsets_ns))) * 1e-9
+        points = np.stack(
+            [
+                x_values,
+                np.full((len(x_values),), center_y, dtype=np.float32) + (speed_mps * dt_seconds).astype(np.float32),
+                np.zeros((len(x_values),), dtype=np.float32),
+            ],
+            axis=1,
+        ).astype(np.float32)
+        center = np.array([0.0, center_y, 0.0], dtype=np.float32)
+        track.centers.append(center.copy())
+        track.frame_ids.append(index)
+        track.frame_timestamps_ns.append(frame_timestamp_ns)
+        track.world_points.append(points.copy())
+        track.local_points.append((points - center).astype(np.float32))
+        track.bbox_extents.append(np.array([2.0, 1.0, 0.0], dtype=np.float32))
+        track.point_timestamps_ns.append(absolute_times.copy() if with_point_timestamps else None)
+    return track
+
+
 def _points(point_count: int, center_y: float, extent_y: float) -> np.ndarray:
     x = np.linspace(-0.15, 0.15, point_count, dtype=np.float32)
     y = np.linspace(center_y - (extent_y * 0.5), center_y + (extent_y * 0.5), point_count, dtype=np.float32)
@@ -149,6 +199,33 @@ class _SubsetRegistrationAccumulator(VoxelFusionAccumulator):
             "registration_chunk_weights": [1.0, 0.8],
             "registration_skipped": False,
         }
+
+
+class _CapturingAccumulator(VoxelFusionAccumulator):
+    def __init__(self, config: AggregationConfig, output_config: OutputConfig, tracking_config: TrackingConfig):
+        super().__init__(config, output_config, tracking_config)
+        self.captured: dict[str, object] = {}
+
+    def _apply_registration_subset(
+        self,
+        accumulation_input: list[np.ndarray],
+        prepared_intensity: list[np.ndarray | None],
+        selected_centers: list[np.ndarray],
+        selected_frame_ids: list[int],
+        registration_metrics: dict[str, object],
+    ) -> tuple[list[np.ndarray], list[np.ndarray | None], list[np.ndarray], list[int], dict[str, object]]:
+        self.captured["prepared_intensity"] = [
+            None if values is None else np.asarray(values, dtype=np.float32).copy() for values in prepared_intensity
+        ]
+        self.captured["selected_centers"] = [np.asarray(center, dtype=np.float32).copy() for center in selected_centers]
+        self.captured["selected_frame_ids"] = list(selected_frame_ids)
+        return super()._apply_registration_subset(
+            accumulation_input,
+            prepared_intensity,
+            selected_centers,
+            selected_frame_ids,
+            registration_metrics,
+        )
 
 
 def test_voxel_fusion_accumulator_saves_track() -> None:
@@ -224,6 +301,244 @@ def test_symmetry_completion_disabled_leaves_saved_aggregate_unchanged() -> None
     assert result.metrics["point_count_before_symmetry_completion"] == 3
     assert result.metrics["point_count_after_symmetry_completion"] == 3
     assert result.metrics["symmetry_completion_generated_points"] == 0
+
+
+def test_lane_end_touch_filter_disabled_leaves_all_frames_available() -> None:
+    track = Track(track_id=88, hit_count=4, age=4, missed=1, ended_by_missed=True)
+    for frame_id, center_y in ((10, 2.8), (11, 1.5), (12, 0.08), (13, -0.5)):
+        points = np.array(
+            [
+                [0.0, center_y - 0.1, 0.0],
+                [0.0, center_y + 0.1, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        center = np.mean(points, axis=0).astype(np.float32)
+        intensity = np.full((len(points),), frame_id / 100.0, dtype=np.float32)
+        track.centers.append(center)
+        track.frame_ids.append(frame_id)
+        track.world_points.append(points.copy())
+        track.local_points.append((points - center).astype(np.float32))
+        track.world_intensity.append(intensity.copy())
+        track.local_intensity.append(intensity.copy())
+        track.bbox_extents.append(compute_extent(points))
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.1,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            truncate_after_lane_end_touch=False,
+        ),
+        OutputConfig(require_track_exit=False, save_world=False),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, 0.0, 10.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert result.selected_frame_ids == [10, 11, 12, 13]
+    assert result.metrics["lane_end_touch_filter_enabled"] is False
+    assert result.metrics["lane_end_touch_found"] is False
+    assert result.metrics["lane_end_touch_frame_id"] == -1
+    assert result.metrics["lane_end_touch_index"] == -1
+    assert result.metrics["lane_end_touch_axis"] == "y"
+    assert result.metrics["lane_end_touch_value"] == 0.0
+    assert result.metrics["lane_end_touch_kept_frame_count"] == 4
+
+
+def test_lane_end_touch_filter_truncates_all_track_frames_using_world_points() -> None:
+    track = Track(track_id=89, hit_count=4, age=4, missed=1, ended_by_missed=True)
+    for frame_id, center_y in ((10, 2.8), (11, 1.5), (12, 0.08), (13, -0.5)):
+        points = np.array(
+            [
+                [0.0, center_y - 0.1, 0.0],
+                [0.0, center_y + 0.1, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        center = np.mean(points, axis=0).astype(np.float32)
+        intensity = np.full((len(points),), frame_id / 100.0, dtype=np.float32)
+        track.centers.append(center)
+        track.frame_ids.append(frame_id)
+        track.world_points.append(points.copy())
+        track.local_points.append((points - center).astype(np.float32))
+        track.world_intensity.append(intensity.copy())
+        track.local_intensity.append(intensity.copy())
+        track.bbox_extents.append(compute_extent(points))
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.1,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            truncate_after_lane_end_touch=True,
+        ),
+        OutputConfig(require_track_exit=False, save_world=False),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, 0.0, 10.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert result.selected_frame_ids == [10, 11, 12]
+    assert result.metrics["lane_end_touch_filter_enabled"] is True
+    assert result.metrics["lane_end_touch_found"] is True
+    assert result.metrics["lane_end_touch_frame_id"] == 12
+    assert result.metrics["lane_end_touch_index"] == 2
+    assert result.metrics["lane_end_touch_axis"] == "y"
+    assert result.metrics["lane_end_touch_value"] == 0.0
+    assert result.metrics["lane_end_touch_kept_frame_count"] == 3
+
+
+def test_lane_end_touch_filter_limits_keyframe_motion_and_keeps_intensity_centers_aligned() -> None:
+    track = Track(track_id=90, hit_count=4, age=4, missed=1, ended_by_missed=True)
+    centers_by_frame: list[np.ndarray] = []
+    for frame_id, center_y in ((10, 3.0), (11, 1.8), (12, 0.05), (13, -0.6)):
+        points = np.array(
+            [
+                [0.0, center_y - 0.15, 0.0],
+                [0.0, center_y + 0.15, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        center = np.mean(points, axis=0).astype(np.float32)
+        intensity = np.full((len(points),), frame_id / 100.0, dtype=np.float32)
+        centers_by_frame.append(center.copy())
+        track.centers.append(center)
+        track.frame_ids.append(frame_id)
+        track.world_points.append(points.copy())
+        track.local_points.append((points - center).astype(np.float32))
+        track.world_intensity.append(intensity.copy())
+        track.local_intensity.append(intensity.copy())
+        track.bbox_extents.append(compute_extent(points))
+    accumulator = _CapturingAccumulator(
+        AggregationConfig(
+            frame_selection_method="keyframe_motion",
+            use_all_frames=False,
+            keyframe_keep=2,
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.1,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            truncate_after_lane_end_touch=True,
+        ),
+        OutputConfig(require_track_exit=False, save_world=False),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, 0.0, 10.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert result.selected_frame_ids == [10, 11, 12]
+    assert accumulator.captured["selected_frame_ids"] == [10, 11, 12]
+    captured_centers = accumulator.captured["selected_centers"]
+    assert isinstance(captured_centers, list)
+    assert np.allclose(captured_centers[0], centers_by_frame[0])
+    assert np.allclose(captured_centers[1], centers_by_frame[1])
+    assert np.allclose(captured_centers[2], centers_by_frame[2])
+    captured_intensity = accumulator.captured["prepared_intensity"]
+    assert isinstance(captured_intensity, list)
+    assert np.isclose(float(np.mean(captured_intensity[0])), 0.10)
+    assert np.isclose(float(np.mean(captured_intensity[1])), 0.11)
+    assert np.isclose(float(np.mean(captured_intensity[2])), 0.12)
+    assert 13 not in result.selected_frame_ids
+
+
+def test_lane_end_touch_filter_limits_length_coverage_to_prefix() -> None:
+    track = _track_from_profile([30, 40, 50, 60], [1.0, 2.0, 3.0, 4.0], start_frame=200)
+    touching_points = track.world_points[2].copy()
+    touching_points[:, 1] -= float(np.min(touching_points[:, 1])) - 0.02
+    track.world_points[2] = touching_points
+    track.local_points[2] = (touching_points - track.centers[2]).astype(np.float32)
+    post_touch_points = track.world_points[3].copy()
+    post_touch_points[:, 1] -= 4.5
+    track.world_points[3] = post_touch_points
+    track.local_points[3] = (post_touch_points - track.centers[3]).astype(np.float32)
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            frame_selection_method="length_coverage",
+            use_all_frames=False,
+            keyframe_keep=2,
+            length_coverage_bins=4,
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.1,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            truncate_after_lane_end_touch=True,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, 0.0, 10.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert result.selected_frame_ids == [201, 202]
+    assert result.metrics["lane_end_touch_found"] is True
+    assert result.metrics["lane_end_touch_frame_id"] == 202
+    assert 203 not in result.selected_frame_ids
+
+
+def test_motion_deskew_disabled_leaves_distorted_local_extent_unchanged() -> None:
+    track = _motion_distorted_track()
+    accumulator = _motion_deskew_accumulator(enabled=False, save_world=False, long_vehicle_mode=True)
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-5.0, 5.0, -5.0, 25.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert result.metrics["motion_deskew_enabled"] is False
+    assert result.metrics["motion_deskew_applied"] is False
+    assert result.metrics["motion_deskew_skipped_reason"] == "disabled"
+    assert np.isclose(result.metrics["extent_y"], 1.0, atol=1e-4)
+
+
+def test_motion_deskew_corrects_distorted_local_chunks_for_long_vehicle() -> None:
+    track = _motion_distorted_track()
+    accumulator = _motion_deskew_accumulator(enabled=True, save_world=False, long_vehicle_mode=True)
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-5.0, 5.0, -5.0, 25.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert result.metrics["motion_deskew_enabled"] is True
+    assert result.metrics["motion_deskew_applied"] is True
+    assert result.metrics["motion_deskew_skipped_reason"] == "applied"
+    assert result.metrics["motion_deskew_corrected_chunk_count"] == 3
+    assert result.metrics["motion_deskew_confident_chunk_count"] == 3
+    assert np.isclose(result.metrics["motion_deskew_mean_speed_mps"], 10.0, atol=1e-3)
+    assert np.isclose(result.metrics["motion_deskew_mean_time_span_ms"], 100.0, atol=1e-3)
+    assert result.metrics["motion_deskew_mean_abs_shift_m"] > 0.0
+    assert result.metrics["extent_y"] < 1e-4
+
+
+def test_motion_deskew_skips_non_elongated_candidate() -> None:
+    track = _motion_distorted_track()
+    accumulator = _motion_deskew_accumulator(enabled=True, save_world=False, long_vehicle_mode=False)
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-5.0, 5.0, -5.0, 25.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert result.metrics["motion_deskew_applied"] is False
+    assert result.metrics["motion_deskew_skipped_reason"] == "not_elongated_candidate"
+    assert np.isclose(result.metrics["extent_y"], 1.0, atol=1e-4)
+
+
+def test_motion_deskew_skips_when_point_timestamps_are_missing() -> None:
+    track = _motion_distorted_track(with_point_timestamps=False)
+    accumulator = _motion_deskew_accumulator(enabled=True, save_world=False, long_vehicle_mode=True)
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-5.0, 5.0, -5.0, 25.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert result.metrics["motion_deskew_applied"] is False
+    assert result.metrics["motion_deskew_skipped_reason"] == "no_point_timestamps"
+    assert np.isclose(result.metrics["extent_y"], 1.0, atol=1e-4)
 
 
 def test_symmetry_completion_cuts_at_plane_and_mirrors_stronger_half_with_intensity() -> None:

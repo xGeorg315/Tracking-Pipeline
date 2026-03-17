@@ -14,7 +14,7 @@ class EuclideanClusteringClusterer:
         self.config = config
 
     def cluster(self, frame: FrameData, lane_box: LaneBox) -> ClusterResult:
-        lane_points, lane_intensity = crop_lane_points(frame, lane_box)
+        lane_points, lane_intensity, lane_point_timestamp_ns = crop_lane_points(frame, lane_box)
         if len(lane_points) < self.config.vehicle_min_points:
             return ClusterResult(
                 lane_points=lane_points,
@@ -25,4 +25,13 @@ class EuclideanClusteringClusterer:
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(lane_points.astype(np.float64))
         labels = np.asarray(pcd.cluster_dbscan(eps=float(self.config.eps), min_points=1, print_progress=False))
-        return build_cluster_result("euclidean_clustering", lane_points, lane_intensity, lane_points, lane_intensity, labels, self.config)
+        return build_cluster_result(
+            "euclidean_clustering",
+            lane_points,
+            lane_intensity,
+            lane_points,
+            lane_intensity,
+            lane_point_timestamp_ns,
+            labels,
+            self.config,
+        )

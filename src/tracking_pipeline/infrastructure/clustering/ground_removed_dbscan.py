@@ -15,7 +15,7 @@ class GroundRemovedDBSCANClusterer:
         self.config = config
 
     def cluster(self, frame: FrameData, lane_box: LaneBox) -> ClusterResult:
-        lane_points, lane_intensity = crop_lane_points(frame, lane_box)
+        lane_points, lane_intensity, lane_point_timestamp_ns = crop_lane_points(frame, lane_box)
         if len(lane_points) < self.config.vehicle_min_points:
             return ClusterResult(
                 lane_points=lane_points,
@@ -28,6 +28,7 @@ class GroundRemovedDBSCANClusterer:
         extra_metrics = {"ground_removed_count": 0, "ground_model": None}
         cluster_input = lane_points
         cluster_intensity = lane_intensity
+        cluster_point_timestamp_ns = lane_point_timestamp_ns
         if len(lane_points) >= max(self.config.plane_ransac_n, self.config.vehicle_min_points):
             plane_model, inliers = pcd.segment_plane(
                 distance_threshold=float(self.config.plane_distance_threshold),
@@ -41,6 +42,8 @@ class GroundRemovedDBSCANClusterer:
                 mask[np.asarray(inliers, dtype=np.int32)] = False
                 cluster_input = lane_points[mask]
                 cluster_intensity = apply_mask_optional(lane_intensity, mask)
+                if lane_point_timestamp_ns is not None:
+                    cluster_point_timestamp_ns = np.asarray(lane_point_timestamp_ns, dtype=np.int64)[mask]
                 extra_metrics["ground_removed_count"] = int(len(inliers))
                 extra_metrics["ground_model"] = [float(value) for value in plane_model]
         if len(cluster_input) < self.config.vehicle_min_points:
@@ -59,6 +62,7 @@ class GroundRemovedDBSCANClusterer:
             lane_intensity,
             cluster_input,
             cluster_intensity,
+            cluster_point_timestamp_ns,
             labels,
             self.config,
             extra_metrics=extra_metrics,

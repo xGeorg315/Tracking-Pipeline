@@ -30,6 +30,7 @@ class LidarScanData:
     col_index: np.ndarray
     calibration: SensorCalibrationData
     intensity: np.ndarray | None = None
+    point_timestamp_ns: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -50,6 +51,7 @@ class FrameData:
     timestamp_ns: int
     points: np.ndarray
     point_intensity: np.ndarray | None = None
+    point_timestamp_ns: np.ndarray | None = None
     source_path: str = ""
     source_frame_index: int = -1
     source_sequence_index: int = 0
@@ -65,6 +67,7 @@ class Detection:
     min_bound: np.ndarray
     max_bound: np.ndarray
     intensity: np.ndarray | None = None
+    point_timestamp_ns: np.ndarray | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -104,10 +107,12 @@ class Track:
     track_id: int
     centers: list[np.ndarray] = field(default_factory=list)
     frame_ids: list[int] = field(default_factory=list)
+    frame_timestamps_ns: list[int] = field(default_factory=list)
     local_points: list[np.ndarray] = field(default_factory=list)
     world_points: list[np.ndarray] = field(default_factory=list)
     local_intensity: list[np.ndarray | None] = field(default_factory=list)
     world_intensity: list[np.ndarray | None] = field(default_factory=list)
+    point_timestamps_ns: list[np.ndarray | None] = field(default_factory=list)
     bbox_extents: list[np.ndarray] = field(default_factory=list)
     hit_count: int = 0
     age: int = 0
@@ -133,17 +138,21 @@ class Track:
         center: np.ndarray,
         points_world: np.ndarray,
         frame_idx: int,
+        frame_timestamp_ns: int,
         extent: np.ndarray,
         intensity: np.ndarray | None = None,
+        point_timestamp_ns: np.ndarray | None = None,
     ) -> None:
         center = np.asarray(center, dtype=np.float32)
         extent = np.asarray(extent, dtype=np.float32)
         self.centers.append(center.copy())
         self.frame_ids.append(int(frame_idx))
+        self.frame_timestamps_ns.append(int(frame_timestamp_ns))
         self.world_points.append(points_world.copy())
         self.local_points.append((points_world - center).copy())
         self.world_intensity.append(None if intensity is None else np.asarray(intensity, dtype=np.float32).copy())
         self.local_intensity.append(None if intensity is None else np.asarray(intensity, dtype=np.float32).copy())
+        self.point_timestamps_ns.append(None if point_timestamp_ns is None else np.asarray(point_timestamp_ns, dtype=np.int64).copy())
         self.bbox_extents.append(extent.copy())
         self.hit_count = len(self.frame_ids)
 

@@ -12,6 +12,7 @@ from tracking_pipeline.domain.rules import (
     axis_to_index,
     compute_extent,
     filter_chunks_by_shape_consistency,
+    find_lane_end_touch_index,
     orthogonal_axes,
     select_best_frames_for_aggregation,
     track_exited_lane_box,
@@ -36,21 +37,31 @@ class VoxelFusionAccumulator:
 
         long_vehicle_mode_applied = self._track_is_long_vehicle(track)
         frame_selection_method = self._effective_frame_selection_method(track, long_vehicle_mode_applied)
-        chunks = track.world_points if self.output_config.save_world else track.local_points
-        chunk_intensity = ensure_aligned_optional(
-            track.world_intensity if self.output_config.save_world else track.local_intensity,
-            len(chunks),
-        )
-        chunk_extents = self._chunk_extents_for_track(track, chunks)
-        chunks, track_centers, track_frame_ids, chunk_quality_info = self._filter_chunks_by_quality_window(
-            list(chunks),
-            list(track.centers),
-            list(track.frame_ids),
+        all_world_chunks = list(track.world_points)
+        all_chunk_intensity = ensure_aligned_optional(track.world_intensity, len(all_world_chunks))
+        all_point_timestamps_ns = ensure_aligned_optional(track.point_timestamps_ns, len(all_world_chunks))
+        (
+            world_chunks,
+            chunk_intensity,
+            chunk_point_timestamps_ns,
+            track_centers,
+            track_frame_ids,
+            track_frame_timestamps_ns,
+            chunk_extents,
+            lane_end_touch_info,
+        ) = self._truncate_after_lane_end_touch(track, lane_box, all_world_chunks, all_chunk_intensity, all_point_timestamps_ns)
+        available_frame_ids = list(track_frame_ids)
+        world_chunks, track_centers, track_frame_ids, chunk_quality_info = self._filter_chunks_by_quality_window(
+            list(world_chunks),
+            list(track_centers),
+            list(track_frame_ids),
             chunk_extents,
         )
-        chunk_intensity = self._select_optional_by_frame_ids(track.frame_ids, chunk_intensity, track_frame_ids)
+        chunk_intensity = self._select_optional_by_frame_ids(available_frame_ids, chunk_intensity, track_frame_ids)
+        chunk_point_timestamps_ns = self._select_optional_by_frame_ids(available_frame_ids, chunk_point_timestamps_ns, track_frame_ids)
+        track_frame_timestamps_ns = self._select_scalar_by_frame_ids(available_frame_ids, track_frame_timestamps_ns, track_frame_ids)
         selected_chunks, selected_centers, selected_frame_ids, selection_info = select_best_frames_for_aggregation(
-            chunks=list(chunks),
+            chunks=list(world_chunks),
             centers=list(track_centers),
             frame_ids=list(track_frame_ids),
             frame_selection_method=frame_selection_method,
@@ -64,7 +75,9 @@ class VoxelFusionAccumulator:
             line_touch_margin=self.config.frame_selection_touch_margin,
         )
         selected_intensity = self._select_optional_by_frame_ids(track_frame_ids, chunk_intensity, selected_frame_ids)
-        selection_info = {**chunk_quality_info, **selection_info}
+        selected_point_timestamps_ns = self._select_optional_by_frame_ids(track_frame_ids, chunk_point_timestamps_ns, selected_frame_ids)
+        selected_frame_timestamps_ns = self._select_scalar_by_frame_ids(track_frame_ids, track_frame_timestamps_ns, selected_frame_ids)
+        selection_info = {**lane_end_touch_info, **chunk_quality_info, **selection_info}
         if self.config.shape_consistency_filter:
             pre_shape_frame_ids = [int(frame_id) for frame_id in selected_frame_ids]
             selected_chunks, selected_centers, selected_frame_ids, shape_info = filter_chunks_by_shape_consistency(
@@ -78,10 +91,36 @@ class VoxelFusionAccumulator:
                 selected_intensity,
                 selected_frame_ids,
             )
+            selected_point_timestamps_ns = self._select_optional_by_frame_ids(
+                pre_shape_frame_ids,
+                selected_point_timestamps_ns,
+                selected_frame_ids,
+            )
+            selected_frame_timestamps_ns = self._select_scalar_by_frame_ids(
+                pre_shape_frame_ids,
+                selected_frame_timestamps_ns,
+                selected_frame_ids,
+            )
             selection_info = {**selection_info, **shape_info}
         if not selected_chunks:
-            metrics = {**self._base_metrics(track), **selection_info}
+            metrics = {**self._base_metrics(track), **selection_info, **self._motion_deskew_metrics()}
             return AggregateResult(track.track_id, np.zeros((0, 3), dtype=np.float32), [], "empty_selection", metrics)
+
+        selected_chunks, selected_intensity, motion_deskew_metrics = self._apply_motion_deskew(
+            track,
+            selected_chunks,
+            selected_intensity,
+            selected_centers,
+            selected_frame_ids,
+            selected_frame_timestamps_ns,
+            selected_point_timestamps_ns,
+            long_vehicle_mode_applied,
+        )
+        if not self.output_config.save_world:
+            selected_chunks = [
+                (np.asarray(points, dtype=np.float32) - np.asarray(center, dtype=np.float32)).astype(np.float32, copy=False)
+                for points, center in zip(selected_chunks, selected_centers)
+            ]
 
         selected_triplets = [
             (
@@ -97,7 +136,7 @@ class VoxelFusionAccumulator:
         selected_centers = [center for _, _, center, _ in selected_triplets]
         selected_frame_ids = [int(frame_id) for _, _, _, frame_id in selected_triplets]
         if not prepared_chunks:
-            metrics = {**self._base_metrics(track), **selection_info}
+            metrics = {**self._base_metrics(track), **selection_info, **motion_deskew_metrics}
             return AggregateResult(track.track_id, np.zeros((0, 3), dtype=np.float32), selected_frame_ids, "empty_prepared_chunks", metrics)
 
         accumulation_input, registration_metrics = self._prepare_for_fusion(prepared_chunks)
@@ -122,7 +161,7 @@ class VoxelFusionAccumulator:
             min_observations=self._required_observations(len(accumulation_input)),
         )
         if len(fused_xyz) == 0:
-            metrics = {**self._base_metrics(track), **selection_info, **registration_metrics}
+            metrics = {**self._base_metrics(track), **selection_info, **motion_deskew_metrics, **registration_metrics}
             return AggregateResult(track.track_id, np.zeros((0, 3), dtype=np.float32), selected_frame_ids, "empty_fused", metrics)
 
         filtered_xyz, filtered_intensity, prefilter_points, stat_filtered_points, final_points = self._post_filter(fused_xyz, fused_intensity)
@@ -137,6 +176,7 @@ class VoxelFusionAccumulator:
         metrics: dict[str, Any] = {
             **self._base_metrics(track),
             **selection_info,
+            **motion_deskew_metrics,
             **registration_metrics,
             "alignment_method": registration_metrics.get("alignment_method", "none"),
             "frame_selection_method": selection_info.get("strategy", self.config.frame_selection_method),
@@ -509,6 +549,239 @@ class VoxelFusionAccumulator:
             return []
         mapping = {int(frame_id): values[index] if index < len(values) else None for index, frame_id in enumerate(source_frame_ids)}
         return [mapping.get(int(frame_id)) for frame_id in target_frame_ids]
+
+    def _select_scalar_by_frame_ids(
+        self,
+        source_frame_ids: list[int],
+        values: list[int],
+        target_frame_ids: list[int],
+    ) -> list[int]:
+        if not target_frame_ids:
+            return []
+        mapping = {int(frame_id): int(values[index]) if index < len(values) else -1 for index, frame_id in enumerate(source_frame_ids)}
+        return [int(mapping.get(int(frame_id), -1)) for frame_id in target_frame_ids]
+
+    def _motion_deskew_metrics(self) -> dict[str, Any]:
+        return {
+            "motion_deskew_enabled": bool(self.config.motion_deskew),
+            "motion_deskew_applied": False,
+            "motion_deskew_skipped_reason": "disabled" if not self.config.motion_deskew else "not_run",
+            "motion_deskew_corrected_chunk_count": 0,
+            "motion_deskew_confident_chunk_count": 0,
+            "motion_deskew_mean_speed_mps": 0.0,
+            "motion_deskew_mean_abs_shift_m": 0.0,
+            "motion_deskew_mean_time_span_ms": 0.0,
+        }
+
+    def _apply_motion_deskew(
+        self,
+        track: Track,
+        chunks: list[np.ndarray],
+        intensity: list[np.ndarray | None],
+        centers: list[np.ndarray],
+        frame_ids: list[int],
+        frame_timestamps_ns: list[int],
+        point_timestamps_ns: list[np.ndarray | None],
+        long_vehicle_mode_applied: bool,
+    ) -> tuple[list[np.ndarray], list[np.ndarray | None], dict[str, Any]]:
+        metrics = self._motion_deskew_metrics()
+        if not self.config.motion_deskew:
+            return list(chunks), list(intensity), metrics
+        if not chunks:
+            metrics["motion_deskew_skipped_reason"] = "empty_selection"
+            return [], list(intensity), metrics
+        if not self._motion_deskew_candidate(track, long_vehicle_mode_applied):
+            metrics["motion_deskew_skipped_reason"] = "not_elongated_candidate"
+            return list(chunks), list(intensity), metrics
+        _ = centers, frame_timestamps_ns
+
+        axis_idx = axis_to_index(self.config.frame_selection_line_axis)
+        corrected_chunks: list[np.ndarray] = []
+        has_any_point_timestamps = False
+        has_any_velocity = False
+        corrected_chunk_count = 0
+        mean_speed_values: list[float] = []
+        mean_abs_shift_values: list[float] = []
+        mean_time_span_values: list[float] = []
+        for chunk, chunk_point_timestamps, frame_id in zip(chunks, point_timestamps_ns, frame_ids):
+            points = np.asarray(chunk, dtype=np.float32)
+            if len(points) == 0:
+                corrected_chunks.append(points)
+                continue
+            if chunk_point_timestamps is None:
+                corrected_chunks.append(points)
+                continue
+            point_times = np.asarray(chunk_point_timestamps, dtype=np.int64)
+            if len(point_times) != len(points):
+                corrected_chunks.append(points)
+                continue
+            has_any_point_timestamps = True
+            projected_speed_mps = self._track_velocity_along_axis(track, int(frame_id), axis_idx)
+            if projected_speed_mps is None:
+                corrected_chunks.append(points)
+                continue
+            has_any_velocity = True
+            if abs(float(projected_speed_mps)) < 1.0:
+                corrected_chunks.append(points)
+                continue
+            centered_time_ns = point_times.astype(np.float64) - float(np.median(point_times))
+            dt_seconds = centered_time_ns * 1e-9
+            corrected = points.copy()
+            corrected[:, axis_idx] = corrected[:, axis_idx] - (float(projected_speed_mps) * dt_seconds).astype(np.float32)
+            corrected_chunks.append(corrected.astype(np.float32, copy=False))
+            corrected_chunk_count += 1
+            mean_speed_values.append(abs(float(projected_speed_mps)))
+            mean_abs_shift_values.append(float(np.mean(np.abs(float(projected_speed_mps) * dt_seconds))))
+            mean_time_span_values.append(float((int(np.max(point_times)) - int(np.min(point_times))) * 1e-6))
+
+        metrics["motion_deskew_confident_chunk_count"] = int(corrected_chunk_count)
+        metrics["motion_deskew_corrected_chunk_count"] = int(corrected_chunk_count)
+        if corrected_chunk_count == 0:
+            if not has_any_point_timestamps:
+                metrics["motion_deskew_skipped_reason"] = "no_point_timestamps"
+            elif not has_any_velocity:
+                metrics["motion_deskew_skipped_reason"] = "no_velocity_estimate"
+            else:
+                metrics["motion_deskew_skipped_reason"] = "insufficient_velocity"
+            return corrected_chunks, list(intensity), metrics
+
+        metrics.update(
+            {
+                "motion_deskew_applied": True,
+                "motion_deskew_skipped_reason": "applied",
+                "motion_deskew_mean_speed_mps": float(np.mean(mean_speed_values)),
+                "motion_deskew_mean_abs_shift_m": float(np.mean(mean_abs_shift_values)),
+                "motion_deskew_mean_time_span_ms": float(np.mean(mean_time_span_values)),
+            }
+        )
+        return corrected_chunks, list(intensity), metrics
+
+    def _motion_deskew_candidate(self, track: Track, long_vehicle_mode_applied: bool) -> bool:
+        if long_vehicle_mode_applied or self.config.long_vehicle_mode:
+            return True
+        is_long_vehicle = track.quality_metrics.get("is_long_vehicle")
+        if bool(is_long_vehicle):
+            return True
+        extents = (
+            np.asarray(track.bbox_extents, dtype=np.float64)
+            if track.bbox_extents
+            else np.asarray([compute_extent(points) for points in track.world_points], dtype=np.float64)
+        )
+        if extents.size == 0:
+            return False
+        axis_idx = axis_to_index(self.config.frame_selection_line_axis)
+        max_extent = float(np.max(extents[:, axis_idx]))
+        return max_extent >= (0.85 * float(self.config.long_vehicle_length_threshold))
+
+    def _track_velocity_along_axis(self, track: Track, frame_id: int, axis_idx: int) -> float | None:
+        if len(track.centers) < 2 or len(track.frame_ids) != len(track.centers):
+            return None
+        if len(track.frame_timestamps_ns) != len(track.frame_ids):
+            return None
+        try:
+            observation_index = next(index for index, value in enumerate(track.frame_ids) if int(value) == int(frame_id))
+        except StopIteration:
+            return None
+        if observation_index <= 0:
+            return self._velocity_between(track, observation_index, min(observation_index + 1, len(track.centers) - 1), axis_idx)
+        if observation_index >= (len(track.centers) - 1):
+            return self._velocity_between(track, max(observation_index - 1, 0), observation_index, axis_idx)
+        return self._velocity_between(track, observation_index - 1, observation_index + 1, axis_idx)
+
+    def _velocity_between(self, track: Track, left_index: int, right_index: int, axis_idx: int) -> float | None:
+        if left_index == right_index:
+            return None
+        left_time_ns = int(track.frame_timestamps_ns[left_index])
+        right_time_ns = int(track.frame_timestamps_ns[right_index])
+        dt_ns = right_time_ns - left_time_ns
+        if dt_ns <= 0:
+            return None
+        displacement = np.asarray(track.centers[right_index], dtype=np.float64) - np.asarray(track.centers[left_index], dtype=np.float64)
+        return float(displacement[axis_idx] / (float(dt_ns) * 1e-9))
+
+    def _truncate_after_lane_end_touch(
+        self,
+        track: Track,
+        lane_box: LaneBox,
+        chunks: list[np.ndarray],
+        chunk_intensity: list[np.ndarray | None],
+        chunk_point_timestamps_ns: list[np.ndarray | None],
+    ) -> tuple[list[np.ndarray], list[np.ndarray | None], list[np.ndarray | None], list[np.ndarray], list[int], list[int], list[np.ndarray], dict[str, Any]]:
+        axis_idx = axis_to_index(self.config.frame_selection_line_axis)
+        lane_end_value, _ = self._lane_end_touch_bounds(lane_box, axis_idx)
+        frame_timestamps_ns = self._track_frame_timestamps(track)
+        metrics: dict[str, Any] = {
+            "lane_end_touch_filter_enabled": bool(self.config.truncate_after_lane_end_touch),
+            "lane_end_touch_found": False,
+            "lane_end_touch_frame_id": -1,
+            "lane_end_touch_index": -1,
+            "lane_end_touch_axis": ["x", "y", "z"][axis_idx],
+            "lane_end_touch_value": float(lane_end_value),
+            "lane_end_touch_kept_frame_count": int(len(track.frame_ids)),
+        }
+        if not self.config.truncate_after_lane_end_touch:
+            return (
+                list(chunks),
+                list(chunk_intensity),
+                list(chunk_point_timestamps_ns),
+                list(track.centers),
+                list(track.frame_ids),
+                list(frame_timestamps_ns),
+                self._chunk_extents_for_track(track, chunks),
+                metrics,
+            )
+
+        touch_idx = find_lane_end_touch_index(
+            list(track.world_points),
+            list(track.centers),
+            lane_box,
+            axis_idx,
+            self.config.frame_selection_touch_margin,
+        )
+        if touch_idx is None:
+            return (
+                list(chunks),
+                list(chunk_intensity),
+                list(chunk_point_timestamps_ns),
+                list(track.centers),
+                list(track.frame_ids),
+                list(frame_timestamps_ns),
+                self._chunk_extents_for_track(track, chunks),
+                metrics,
+            )
+
+        keep_count = max(0, int(touch_idx) + 1)
+        metrics.update(
+            {
+                "lane_end_touch_found": True,
+                "lane_end_touch_frame_id": int(track.frame_ids[touch_idx]) if touch_idx < len(track.frame_ids) else -1,
+                "lane_end_touch_index": int(touch_idx),
+                "lane_end_touch_kept_frame_count": int(keep_count),
+            }
+        )
+        kept_chunks = list(chunks[:keep_count])
+        return (
+            kept_chunks,
+            list(chunk_intensity[:keep_count]),
+            list(chunk_point_timestamps_ns[:keep_count]),
+            list(track.centers[:keep_count]),
+            list(track.frame_ids[:keep_count]),
+            list(frame_timestamps_ns[:keep_count]),
+            self._chunk_extents_for_track(track, kept_chunks),
+            metrics,
+        )
+
+    def _track_frame_timestamps(self, track: Track) -> list[int]:
+        if len(track.frame_timestamps_ns) == len(track.frame_ids):
+            return [int(value) for value in track.frame_timestamps_ns]
+        return [-1 for _ in track.frame_ids]
+
+    def _lane_end_touch_bounds(self, lane_box: LaneBox, axis_idx: int) -> tuple[float, float]:
+        if axis_idx == 0:
+            return float(lane_box.x_min), float(lane_box.x_max)
+        if axis_idx == 1:
+            return float(lane_box.y_min), float(lane_box.y_max)
+        return float(lane_box.z_min), float(lane_box.z_max)
 
     def _filter_chunks_by_quality_window(
         self,

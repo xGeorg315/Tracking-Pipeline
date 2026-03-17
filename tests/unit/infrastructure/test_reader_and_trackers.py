@@ -34,6 +34,10 @@ def _pack_u16(values: list[int]) -> bytes:
     return np.asarray(values, dtype="<u2").tobytes()
 
 
+def _pack_u64(values: list[int]) -> bytes:
+    return np.asarray(values, dtype="<u8").tobytes()
+
+
 def _write_object_list_fixture(path: Path) -> Path:
     calibration = common.SensorCalibration(sensor_name="sensor_a")
     frames = [
@@ -171,10 +175,41 @@ def test_a42_reader_reads_reflectivity_as_normalized_intensity(tmp_path: Path) -
     assert np.allclose(frames[0].scans[0].intensity, frames[0].point_intensity)
 
 
+def test_a42_reader_reads_absolute_point_timestamps_from_timestamp_offset(tmp_path: Path) -> None:
+    calibration = common.SensorCalibration(sensor_name="sensor_a")
+    fixture = tmp_path / "timestamp_offset.pb"
+    payload_frame = frame.Frame(
+        frame_timestamp_ns=1000,
+        frame_id=1,
+        lidars=[
+            sensors.LidarScan(
+                scan_timestamp_ns=5000,
+                pointcloud=data.PointCloud(
+                    cartesian=_pack_xyz([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]),
+                    timestamp_offset=_pack_u64([0, 10, 25]),
+                ),
+                calibration=calibration,
+            )
+        ],
+    )
+    with fixture.open("wb") as handle:
+        payload = bytes(payload_frame)
+        handle.write(struct.pack("<I", len(payload)))
+        handle.write(payload)
+
+    frames = A42PBReader(read_intensity=False).iter_frames([str(fixture)])
+
+    assert len(frames) == 1
+    assert frames[0].point_timestamp_ns is not None
+    assert np.array_equal(frames[0].point_timestamp_ns, np.array([5000, 5010, 5025], dtype=np.int64))
+    assert frames[0].scans[0].point_timestamp_ns is not None
+    assert np.array_equal(frames[0].scans[0].point_timestamp_ns, frames[0].point_timestamp_ns)
+
+
 def test_euclidean_tracker_keeps_same_track_for_close_detections() -> None:
     tracker = EuclideanNNTracker(TrackingConfig(algorithm="euclidean_nn", max_dist=2.0, max_missed=2))
-    tracker.step([_detection(0.0)], 0)
-    tracker.step([_detection(0.5)], 1)
+    tracker.step([_detection(0.0)], 0, 1000)
+    tracker.step([_detection(0.5)], 1, 2000)
     tracks = tracker.finalize()
     assert list(tracks.keys()) == [1]
     assert tracks[1].hit_count == 2
@@ -182,9 +217,9 @@ def test_euclidean_tracker_keeps_same_track_for_close_detections() -> None:
 
 def test_kalman_tracker_survives_short_gap() -> None:
     tracker = KalmanNNTracker(TrackingConfig(max_dist=2.0, max_missed=2, sticky_max_dist=3.0))
-    tracker.step([_detection(0.0)], 0)
-    tracker.step([], 1)
-    tracker.step([_detection(0.4)], 2)
+    tracker.step([_detection(0.0)], 0, 1000)
+    tracker.step([], 1, 2000)
+    tracker.step([_detection(0.4)], 2, 3000)
     tracks = tracker.finalize()
     assert list(tracks.keys()) == [1]
     assert tracks[1].hit_count == 2
@@ -194,8 +229,9 @@ def test_tracker_propagates_detection_intensity_to_active_state_and_track() -> N
     tracker = KalmanNNTracker(TrackingConfig(max_dist=2.0, max_missed=1, sticky_max_dist=3.0))
     detection = _detection(0.0)
     detection.intensity = np.array([0.2, 0.8], dtype=np.float32)
+    detection.point_timestamp_ns = np.array([1000, 1030], dtype=np.int64)
 
-    state = tracker.step([detection], 0)
+    state = tracker.step([detection], 0, 1000)
     tracks = tracker.finalize()
 
     assert state.active_tracks[0].intensity is not None
@@ -203,6 +239,9 @@ def test_tracker_propagates_detection_intensity_to_active_state_and_track() -> N
     assert tracks[1].world_intensity[0] is not None
     assert np.allclose(tracks[1].world_intensity[0], np.array([0.2, 0.8], dtype=np.float32))
     assert np.allclose(tracks[1].local_intensity[0], np.array([0.2, 0.8], dtype=np.float32))
+    assert tracks[1].point_timestamps_ns[0] is not None
+    assert np.array_equal(tracks[1].point_timestamps_ns[0], np.array([1000, 1030], dtype=np.int64))
+    assert tracks[1].frame_timestamps_ns == [1000]
 
 
 def test_assignment_hungarian_beats_greedy_on_ambiguous_cost_matrix() -> None:
@@ -224,8 +263,8 @@ def test_assignment_hungarian_beats_greedy_on_ambiguous_cost_matrix() -> None:
 
 def test_hungarian_kalman_reports_hungarian_assignment() -> None:
     tracker = HungarianKalmanTracker(TrackingConfig(max_dist=3.5, max_missed=1, sticky_max_dist=4.0))
-    tracker.step([_detection(0.0), _detection(5.0)], 0)
-    state = tracker.step([_detection(1.9), _detection(6.0)], 1)
+    tracker.step([_detection(0.0), _detection(5.0)], 0, 1000)
+    state = tracker.step([_detection(1.9), _detection(6.0)], 1, 2000)
     tracks = tracker.finalize()
     assert state.tracker_metrics["assignment_method"] == "hungarian"
     assert len(tracks) == 2

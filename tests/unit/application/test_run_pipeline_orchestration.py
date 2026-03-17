@@ -57,8 +57,9 @@ class _FakeTracker:
         self.track.world_points.append(np.array([[0.95, 0.0, 0.0]], dtype=np.float32))
         self.track.bbox_extents.append(np.array([0.1, 0.1, 0.1], dtype=np.float32))
 
-    def step(self, detections, frame_idx):
+    def step(self, detections, frame_idx, frame_timestamp_ns):
         _ = detections
+        _ = frame_timestamp_ns
         self.seen_frame_ids.append(int(frame_idx))
         return FrameTrackingState(frame_index=int(frame_idx), lane_points=np.zeros((0, 3), dtype=np.float32), detections=[], active_tracks=[])
 

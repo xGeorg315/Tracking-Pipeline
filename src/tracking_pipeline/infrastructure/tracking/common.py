@@ -38,15 +38,37 @@ class Kalman3D:
         return self.x[:3, 0].astype(np.float32)
 
 
-def initialize_track(track_id: int, detection: Detection, frame_idx: int, kalman: Kalman3D | None = None) -> Track:
+def initialize_track(
+    track_id: int,
+    detection: Detection,
+    frame_idx: int,
+    frame_timestamp_ns: int,
+    kalman: Kalman3D | None = None,
+) -> Track:
     track = Track(track_id=track_id, hit_count=1, age=1, source_track_ids=[track_id])
     if kalman is not None:
         track.state["kf"] = kalman
-    track.add_observation(detection.center, detection.points, frame_idx, detection.extent, intensity=detection.intensity)
+    track.add_observation(
+        detection.center,
+        detection.points,
+        frame_idx,
+        frame_timestamp_ns,
+        detection.extent,
+        intensity=detection.intensity,
+        point_timestamp_ns=detection.point_timestamp_ns,
+    )
     return track
 
 
-def append_detection(track: Track, detection: Detection, frame_idx: int, center: np.ndarray) -> None:
+def append_detection(track: Track, detection: Detection, frame_idx: int, frame_timestamp_ns: int, center: np.ndarray) -> None:
     track.missed = 0
     track.age += 1
-    track.add_observation(center, detection.points, frame_idx, detection.extent, intensity=detection.intensity)
+    track.add_observation(
+        center,
+        detection.points,
+        frame_idx,
+        frame_timestamp_ns,
+        detection.extent,
+        intensity=detection.intensity,
+        point_timestamp_ns=detection.point_timestamp_ns,
+    )

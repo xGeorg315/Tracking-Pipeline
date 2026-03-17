@@ -23,7 +23,8 @@ def _cluster_frame() -> FrameData:
     cluster_b = np.random.default_rng(5).normal(loc=[1.5, 1.5, 1.1], scale=0.03, size=(30, 3)).astype(np.float32)
     points = np.vstack([cluster_a, cluster_b]).astype(np.float32)
     point_intensity = np.linspace(0.0, 1.0, len(points), dtype=np.float32)
-    return FrameData(frame_index=0, timestamp_ns=1, points=points, point_intensity=point_intensity)
+    point_timestamp_ns = np.arange(10_000, 10_000 + len(points), dtype=np.int64)
+    return FrameData(frame_index=0, timestamp_ns=1, points=points, point_intensity=point_intensity, point_timestamp_ns=point_timestamp_ns)
 
 
 def _ground_frame() -> FrameData:
@@ -64,8 +65,16 @@ def _sensor_frame() -> FrameData:
         col_index=cols,
         calibration=calibration,
         intensity=np.linspace(0.1, 0.9, len(xyz), dtype=np.float32),
+        point_timestamp_ns=np.arange(20_000, 20_000 + len(xyz), dtype=np.int64),
     )
-    return FrameData(frame_index=0, timestamp_ns=1, points=xyz, point_intensity=np.linspace(0.1, 0.9, len(xyz), dtype=np.float32), scans=[scan])
+    return FrameData(
+        frame_index=0,
+        timestamp_ns=1,
+        points=xyz,
+        point_intensity=np.linspace(0.1, 0.9, len(xyz), dtype=np.float32),
+        point_timestamp_ns=np.arange(20_000, 20_000 + len(xyz), dtype=np.int64),
+        scans=[scan],
+    )
 
 
 def _track(track_id: int, frame_ids: list[int], centers: list[np.ndarray]) -> Track:
@@ -91,6 +100,7 @@ def test_euclidean_clusterer_detects_two_clusters() -> None:
     assert result.metrics["accepted_cluster_count"] == 2
     assert result.lane_intensity is not None
     assert all(detection.intensity is not None for detection in result.detections)
+    assert all(detection.point_timestamp_ns is not None for detection in result.detections)
 
 
 def test_ground_removed_dbscan_reports_removed_ground_points() -> None:

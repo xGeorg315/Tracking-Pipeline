@@ -22,7 +22,7 @@ SUPPORTED_ACCUMULATORS = {
     "weighted_voxel_fusion",
     "occupancy_consensus_fusion",
 }
-SUPPORTED_FRAME_SELECTION_METHODS = {"auto", "all_track_frames", "line_touch_last_k", "keyframe_motion", "length_coverage"}
+SUPPORTED_FRAME_SELECTION_METHODS = {"auto", "all_track_frames", "line_touch_last_k", "keyframe_motion", "length_coverage", "max_extent"}
 SUPPORTED_REGISTRATION_BACKENDS = {"small_gicp", "icp_point_to_plane", "generalized_icp", "feature_global_then_local"}
 SUPPORTED_FUSION_WEIGHT_MODES = {"uniform", "point_count", "quality"}
 
@@ -53,6 +53,10 @@ def validate_config(config: PipelineConfig) -> None:
         raise ConfigError(f"Unsupported fusion weight mode: {config.aggregation.fusion_weight_mode}")
     if not isinstance(config.aggregation.symmetry_completion, bool):
         raise ConfigError("aggregation.symmetry_completion must be a boolean")
+    if not isinstance(config.aggregation.motion_deskew, bool):
+        raise ConfigError("aggregation.motion_deskew must be a boolean")
+    if not isinstance(config.aggregation.truncate_after_lane_end_touch, bool):
+        raise ConfigError("aggregation.truncate_after_lane_end_touch must be a boolean")
     if len(config.preprocessing.lane_box) != 6:
         raise ConfigError("preprocessing.lane_box must contain exactly 6 values")
     if config.preprocessing.bootstrap_frames < 0:

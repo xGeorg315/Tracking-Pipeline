@@ -133,6 +133,13 @@ Top-Level-Felder:
 | `point_count_before_symmetry_completion` | Punktzahl vor Completion |
 | `symmetry_completion_generated_points` | neu erzeugte Spiegelpunkte |
 | `point_count_after_symmetry_completion` | Punktzahl nach Completion |
+| `motion_deskew_enabled` | Deskew-Toggle war aktiv |
+| `motion_deskew_applied` | Deskew wurde auf mindestens einen Chunk angewendet |
+| `motion_deskew_skipped_reason` | Debug-Grund fuer Skip oder `applied` |
+| `motion_deskew_corrected_chunk_count` | Anzahl wirklich korrigierter Chunks |
+| `motion_deskew_mean_speed_mps` | mittlere projizierte Lane-Geschwindigkeit der korrigierten Chunks |
+| `motion_deskew_mean_abs_shift_m` | mittlere absolute Punktverschiebung durch den Deskew |
+| `motion_deskew_mean_time_span_ms` | mittlere intra-chunk Zeitspanne der korrigierten Punkte |
 
 ## `aggregates/*.pcd`
 
