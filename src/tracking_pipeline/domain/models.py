@@ -212,6 +212,10 @@ class AggregateResult:
     status: str
     metrics: dict[str, Any] = field(default_factory=dict)
     intensity: np.ndarray | None = None
+    candidate_points_world: np.ndarray | None = None
+    candidate_intensity_world: np.ndarray | None = None
+    candidate_anchor_center_world: np.ndarray | None = None
+    candidate_status: str = ""
 
 
 @dataclass(slots=True)

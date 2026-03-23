@@ -197,6 +197,37 @@ def test_artifact_writer_writes_articulated_vehicle_fields(tmp_path: Path) -> No
     assert rows[0]["aggregation_metrics"]["articulated_rear_gap_std"] == 0.05
 
 
+def test_artifact_writer_writes_long_vehicle_anchor_fields(tmp_path: Path) -> None:
+    writer = JsonArtifactWriter(tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    track = Track(track_id=21, hit_count=5, age=5, ended_by_missed=True)
+    track.centers = [np.array([0.0, 12.0, 0.0], dtype=np.float32)]
+    track.frame_ids = [88]
+    result = AggregateResult(
+        track_id=21,
+        points=np.zeros((0, 3), dtype=np.float32),
+        selected_frame_ids=[88],
+        status="saved",
+        metrics={
+            "long_vehicle_local_anchor_mode": "lead_front",
+            "long_vehicle_local_anchor_axis": "y",
+            "long_vehicle_lead_track_id": 21,
+            "long_vehicle_local_anchor_value_world": 14.5,
+        },
+    )
+
+    writer.write_tracks(run_dir, {21: track}, [result])
+
+    rows = _load_jsonl(run_dir / "tracks.jsonl")
+
+    assert rows[0]["long_vehicle_local_anchor_mode"] == "lead_front"
+    assert rows[0]["long_vehicle_local_anchor_axis"] == "y"
+    assert rows[0]["long_vehicle_lead_track_id"] == 21
+    assert rows[0]["long_vehicle_local_anchor_value_world"] == 14.5
+
+
 def test_artifact_writer_writes_gt_matching_artifacts_and_track_fields(tmp_path: Path) -> None:
     writer = JsonArtifactWriter(tmp_path)
     run_dir = tmp_path / "run"

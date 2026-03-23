@@ -75,6 +75,10 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
         registration_attempts += int(metrics.get("registration_pairs", 0))
         registration_accepted += int(metrics.get("registration_accepted", 0))
         registration_rejected += int(metrics.get("registration_rejected", 0))
+    if hasattr(accumulator, "merge_long_vehicle_aggregates"):
+        with profiler.stage("accumulate_tracks"):
+            aggregate_results = accumulator.merge_long_vehicle_aggregates(tracks, aggregate_results, lane_box)
+    for result in aggregate_results:
         if result.status == "saved":
             with profiler.stage("write_aggregates"):
                 writer.write_aggregate(run_dir, result, save_intensity=config.output.save_aggregate_intensity)

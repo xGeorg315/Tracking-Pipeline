@@ -167,5 +167,27 @@ class JsonArtifactWriter:
                 object_kind = track.state.get("object_kind") or result_metrics.get("object_kind")
                 if object_kind:
                     row["object_kind"] = str(object_kind)
+            if result_metrics.get("long_vehicle_component_count") is not None:
+                row["long_vehicle_component_count"] = int(result_metrics.get("long_vehicle_component_count"))
+            if result_metrics.get("long_vehicle_component_roles") is not None:
+                row["long_vehicle_component_roles"] = [str(role) for role in result_metrics.get("long_vehicle_component_roles", [])]
+            if result_metrics.get("tail_candidate_frame_ids") is not None:
+                row["tail_candidate_frame_ids"] = [int(frame_id) for frame_id in result_metrics.get("tail_candidate_frame_ids", [])]
+            if result_metrics.get("tail_candidate_kept_count") is not None:
+                row["tail_candidate_kept_count"] = int(result_metrics.get("tail_candidate_kept_count"))
+            if result_metrics.get("rear_registration_rejected_count") is not None:
+                row["rear_registration_rejected_count"] = int(result_metrics.get("rear_registration_rejected_count"))
+            if result_metrics.get("rear_fallback_used") is not None:
+                row["rear_fallback_used"] = bool(result_metrics.get("rear_fallback_used"))
+            if result_metrics.get("post_merge_component_ids") is not None:
+                row["post_merge_component_ids"] = [int(track_id) for track_id in result_metrics.get("post_merge_component_ids", [])]
+            if result_metrics.get("long_vehicle_local_anchor_mode") is not None:
+                row["long_vehicle_local_anchor_mode"] = str(result_metrics.get("long_vehicle_local_anchor_mode"))
+            if result_metrics.get("long_vehicle_local_anchor_axis") is not None:
+                row["long_vehicle_local_anchor_axis"] = str(result_metrics.get("long_vehicle_local_anchor_axis"))
+            if result_metrics.get("long_vehicle_lead_track_id") is not None:
+                row["long_vehicle_lead_track_id"] = int(result_metrics.get("long_vehicle_lead_track_id"))
+            if result_metrics.get("long_vehicle_local_anchor_value_world") is not None:
+                row["long_vehicle_local_anchor_value_world"] = float(result_metrics.get("long_vehicle_local_anchor_value_world"))
             rows.append(row)
         self.manifest_writer.write_jsonl(run_dir / "tracks.jsonl", rows)

@@ -85,6 +85,7 @@ def build_track_postprocessors(config: PipelineConfig) -> list[TrackPostprocesso
             CoMovingTrackMergePostprocessor(
                 config.postprocessing,
                 config.aggregation.frame_selection_line_axis,
+                config.aggregation.long_vehicle_length_threshold,
             )
         )
     if config.postprocessing.enable_trajectory_smoothing:

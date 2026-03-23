@@ -48,9 +48,12 @@ def replay_run(config: PipelineConfig, project_root: Path) -> None:
         tracks = processor.process(tracks)
         if isinstance(processor, ArticulatedVehicleMergePostprocessor):
             articulated_merge_debug_events.extend(_build_articulated_merge_debug_events(states, processor.debug_records))
-    aggregate_results = {track_id: accumulator.accumulate(track, lane_box) for track_id, track in tracks.items()}
-    track_outcomes = build_track_outcomes(tracks, aggregate_results, states)
-    viewer.replay(states, lane_box, aggregate_results, track_outcomes, articulated_merge_debug_events)
+    aggregate_results = [accumulator.accumulate(track, lane_box) for track in tracks.values()]
+    if hasattr(accumulator, "merge_long_vehicle_aggregates"):
+        aggregate_results = accumulator.merge_long_vehicle_aggregates(tracks, aggregate_results, lane_box)
+    aggregate_result_map = {int(result.track_id): result for result in aggregate_results}
+    track_outcomes = build_track_outcomes(tracks, aggregate_result_map, states)
+    viewer.replay(states, lane_box, aggregate_result_map, track_outcomes, articulated_merge_debug_events)
 
 
 def _build_articulated_merge_debug_events(

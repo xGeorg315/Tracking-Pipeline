@@ -24,6 +24,10 @@ from tracking_pipeline.shared.geometry import ensure_aligned_optional
 
 class VoxelFusionAccumulator:
     fusion_method = "voxel_fusion"
+    _LONG_VEHICLE_TAIL_POINT_RATIO = 0.25
+    _LONG_VEHICLE_TAIL_EXTENT_RATIO = 0.20
+    _LONG_VEHICLE_TAIL_CANDIDATE_COUNT = 2
+    _LONG_VEHICLE_REJECTED_CHUNK_WEIGHT = 0.35
 
     def __init__(self, config: AggregationConfig, output_config: OutputConfig, tracking_config: TrackingConfig):
         self.config = config
@@ -62,6 +66,7 @@ class VoxelFusionAccumulator:
             list(track_centers),
             list(track_frame_ids),
             chunk_extents,
+            long_vehicle_mode_applied=long_vehicle_mode_applied,
         )
         chunk_intensity = self._select_optional_by_frame_ids(available_frame_ids, chunk_intensity, track_frame_ids)
         chunk_point_timestamps_ns = self._select_optional_by_frame_ids(available_frame_ids, chunk_point_timestamps_ns, track_frame_ids)
@@ -84,6 +89,24 @@ class VoxelFusionAccumulator:
         selected_point_timestamps_ns = self._select_optional_by_frame_ids(track_frame_ids, chunk_point_timestamps_ns, selected_frame_ids)
         selected_frame_timestamps_ns = self._select_scalar_by_frame_ids(track_frame_ids, track_frame_timestamps_ns, selected_frame_ids)
         selection_info = {**lane_end_touch_info, **chunk_quality_info, **selection_info}
+        (
+            selected_chunks,
+            selected_centers,
+            selected_frame_ids,
+            selection_info,
+        ) = self._enforce_long_vehicle_component_coverage(
+            selected_chunks,
+            selected_centers,
+            selected_frame_ids,
+            list(world_chunks),
+            list(track_centers),
+            list(track_frame_ids),
+            selection_info,
+            long_vehicle_mode_applied=long_vehicle_mode_applied,
+        )
+        selected_intensity = self._select_optional_by_frame_ids(track_frame_ids, chunk_intensity, selected_frame_ids)
+        selected_point_timestamps_ns = self._select_optional_by_frame_ids(track_frame_ids, chunk_point_timestamps_ns, selected_frame_ids)
+        selected_frame_timestamps_ns = self._select_scalar_by_frame_ids(track_frame_ids, track_frame_timestamps_ns, selected_frame_ids)
         if self.config.shape_consistency_filter:
             pre_shape_frame_ids = [int(frame_id) for frame_id in selected_frame_ids]
             selected_chunks, selected_centers, selected_frame_ids, shape_info = filter_chunks_by_shape_consistency(
@@ -122,6 +145,7 @@ class VoxelFusionAccumulator:
             selected_point_timestamps_ns,
             long_vehicle_mode_applied,
         )
+        candidate_anchor_center_world = self._candidate_anchor_center_world(selected_centers, track)
         if not self.output_config.save_world:
             selected_chunks = [
                 (np.asarray(points, dtype=np.float32) - np.asarray(center, dtype=np.float32)).astype(np.float32, copy=False)
@@ -154,6 +178,9 @@ class VoxelFusionAccumulator:
             )
 
         accumulation_input, registration_metrics = self._prepare_for_fusion(prepared_chunks)
+        pre_registration_centers = [np.asarray(center, dtype=np.float32).copy() for center in selected_centers]
+        pre_registration_frame_ids = [int(frame_id) for frame_id in selected_frame_ids]
+        pre_registration_intensity = [None if values is None else np.asarray(values, dtype=np.float32).copy() for values in prepared_intensity]
         (
             accumulation_input,
             prepared_intensity,
@@ -167,6 +194,26 @@ class VoxelFusionAccumulator:
             selected_centers,
             selected_frame_ids,
             registration_metrics,
+        )
+        (
+            accumulation_input,
+            prepared_intensity,
+            selected_centers,
+            selected_frame_ids,
+            registration_metrics,
+        ) = self._restore_long_vehicle_rejected_chunks(
+            track,
+            accumulation_input,
+            prepared_chunks,
+            prepared_intensity,
+            selected_centers,
+            selected_frame_ids,
+            pre_registration_intensity,
+            pre_registration_centers,
+            pre_registration_frame_ids,
+            registration_metrics,
+            selection_info,
+            long_vehicle_mode_applied=long_vehicle_mode_applied,
         )
         chunk_weights = self._chunk_weights(track, accumulation_input, registration_metrics, long_vehicle_mode_applied)
         confidence_chunk_weights = self._confidence_chunk_weights(accumulation_input, chunk_weights, registration_metrics)
@@ -187,6 +234,10 @@ class VoxelFusionAccumulator:
                 "empty_fused",
                 metrics,
                 prepared_chunk_count=len(accumulation_input),
+                candidate_points_world=None,
+                candidate_intensity_world=None,
+                candidate_anchor_center_world=candidate_anchor_center_world,
+                candidate_status="missing",
             )
 
         filtered_xyz, filtered_intensity, filtered_confidence, prefilter_points, stat_filtered_points, final_points = self._post_filter(
@@ -239,35 +290,10 @@ class VoxelFusionAccumulator:
                 point_count_after_downsample=0,
                 point_count_before_confidence_cap=0,
                 point_count_after_confidence_cap=0,
-            )
-        if final_points < int(self.config.min_saved_aggregate_points):
-            return self._result(
-                track,
-                lane_box,
-                np.zeros((0, 3), dtype=np.float32),
-                selected_frame_ids,
-                "skipped_min_saved_points",
-                metrics,
-                prepared_chunk_count=len(accumulation_input),
-                point_count_after_downsample=final_points,
-                point_count_before_confidence_cap=final_points,
-                point_count_after_confidence_cap=final_points,
-            )
-        quality_threshold = self._quality_threshold(long_vehicle_mode_applied)
-        if float(track.quality_score or 0.0) < quality_threshold:
-            metrics["quality_threshold"] = quality_threshold
-            return self._result(
-                track,
-                lane_box,
-                np.zeros((0, 3), dtype=np.float32),
-                selected_frame_ids,
-                "skipped_quality_threshold",
-                metrics,
-                prepared_chunk_count=len(accumulation_input),
-                point_count_after_downsample=final_points,
-                quality_threshold=quality_threshold,
-                point_count_before_confidence_cap=final_points,
-                point_count_after_confidence_cap=final_points,
+                candidate_points_world=None,
+                candidate_intensity_world=None,
+                candidate_anchor_center_world=candidate_anchor_center_world,
+                candidate_status="missing",
             )
         point_count_before_confidence_cap = int(len(filtered_xyz))
         capped_xyz, capped_intensity, capped_confidence, confidence_cap_applied = self._apply_confidence_point_cap(
@@ -284,7 +310,51 @@ class VoxelFusionAccumulator:
         )
         metrics.update(symmetry_metrics)
         metrics.update(self._vehicle_dimension_metrics(completed_xyz))
+        candidate_points_world, candidate_intensity_world = self._candidate_world_outputs(
+            completed_xyz,
+            completed_intensity,
+            candidate_anchor_center_world,
+        )
         metrics["point_count_after_downsample"] = int(len(completed_xyz))
+        if final_points < int(self.config.min_saved_aggregate_points):
+            return self._result(
+                track,
+                lane_box,
+                np.zeros((0, 3), dtype=np.float32),
+                selected_frame_ids,
+                "skipped_min_saved_points",
+                metrics,
+                prepared_chunk_count=len(accumulation_input),
+                point_count_after_downsample=final_points,
+                point_count_before_confidence_cap=point_count_before_confidence_cap,
+                point_count_after_confidence_cap=len(capped_xyz),
+                confidence_point_cap_applied=confidence_cap_applied,
+                candidate_points_world=candidate_points_world,
+                candidate_intensity_world=candidate_intensity_world,
+                candidate_anchor_center_world=candidate_anchor_center_world,
+                candidate_status="available",
+            )
+        quality_threshold = self._quality_threshold(long_vehicle_mode_applied)
+        if float(track.quality_score or 0.0) < quality_threshold:
+            metrics["quality_threshold"] = quality_threshold
+            return self._result(
+                track,
+                lane_box,
+                np.zeros((0, 3), dtype=np.float32),
+                selected_frame_ids,
+                "skipped_quality_threshold",
+                metrics,
+                prepared_chunk_count=len(accumulation_input),
+                point_count_after_downsample=final_points,
+                quality_threshold=quality_threshold,
+                point_count_before_confidence_cap=point_count_before_confidence_cap,
+                point_count_after_confidence_cap=len(capped_xyz),
+                confidence_point_cap_applied=confidence_cap_applied,
+                candidate_points_world=candidate_points_world,
+                candidate_intensity_world=candidate_intensity_world,
+                candidate_anchor_center_world=candidate_anchor_center_world,
+                candidate_status="available",
+            )
         return self._result(
             track,
             lane_box,
@@ -299,6 +369,10 @@ class VoxelFusionAccumulator:
             point_count_before_confidence_cap=point_count_before_confidence_cap,
             point_count_after_confidence_cap=len(capped_xyz),
             confidence_point_cap_applied=confidence_cap_applied,
+            candidate_points_world=candidate_points_world,
+            candidate_intensity_world=candidate_intensity_world,
+            candidate_anchor_center_world=candidate_anchor_center_world,
+            candidate_status="available",
         )
 
     def _base_metrics(self, track: Track) -> dict[str, Any]:
@@ -339,6 +413,10 @@ class VoxelFusionAccumulator:
         point_count_before_confidence_cap: int | None = None,
         point_count_after_confidence_cap: int | None = None,
         confidence_point_cap_applied: bool = False,
+        candidate_points_world: np.ndarray | None = None,
+        candidate_intensity_world: np.ndarray | None = None,
+        candidate_anchor_center_world: np.ndarray | None = None,
+        candidate_status: str = "",
     ) -> AggregateResult:
         cap_before = int(len(points)) if point_count_before_confidence_cap is None else int(point_count_before_confidence_cap)
         cap_after = int(len(points)) if point_count_after_confidence_cap is None else int(point_count_after_confidence_cap)
@@ -366,6 +444,14 @@ class VoxelFusionAccumulator:
             status,
             merged_metrics,
             intensity=None if intensity is None else np.asarray(intensity, dtype=np.float32),
+            candidate_points_world=None if candidate_points_world is None else np.asarray(candidate_points_world, dtype=np.float32),
+            candidate_intensity_world=None
+            if candidate_intensity_world is None
+            else np.asarray(candidate_intensity_world, dtype=np.float32),
+            candidate_anchor_center_world=None
+            if candidate_anchor_center_world is None
+            else np.asarray(candidate_anchor_center_world, dtype=np.float32),
+            candidate_status=str(candidate_status),
         )
 
     def _confidence_point_cap_metrics(
@@ -1125,6 +1211,8 @@ class VoxelFusionAccumulator:
         centers: list[np.ndarray],
         frame_ids: list[int],
         chunk_extents: list[np.ndarray],
+        *,
+        long_vehicle_mode_applied: bool,
     ) -> tuple[list[np.ndarray], list[np.ndarray], list[int], dict[str, Any]]:
         total = len(chunks)
         empty_metrics = {
@@ -1135,12 +1223,19 @@ class VoxelFusionAccumulator:
             "chunk_quality_segment_end_frame": -1 if not frame_ids else int(frame_ids[-1]),
             "peak_chunk_point_count": 0,
             "peak_chunk_extent_norm": 0.0,
+            "tail_candidate_frame_ids": [],
+            "tail_candidate_kept_count": 0,
         }
         if not chunks:
             return [], [], [], empty_metrics
         if not self.config.chunk_quality_filter:
             return list(chunks), list(centers), list(frame_ids), empty_metrics
 
+        tail_candidate_indices = (
+            self._long_vehicle_tail_candidate_indices(chunks, centers, frame_ids)
+            if long_vehicle_mode_applied
+            else []
+        )
         point_counts = np.asarray([len(chunk) for chunk in chunks], dtype=np.int32)
         extent_norms = np.asarray(
             [float(np.linalg.norm(np.asarray(extent, dtype=np.float64))) for extent in chunk_extents],
@@ -1183,14 +1278,27 @@ class VoxelFusionAccumulator:
                 start_idx, end_idx = self._expand_segment_around_peak(peak_index, total)
 
         kept_indices = list(range(start_idx, end_idx + 1))
+        if long_vehicle_mode_applied and tail_candidate_indices:
+            tail_point_ratio = min(float(self.config.chunk_min_points_ratio_to_peak), self._LONG_VEHICLE_TAIL_POINT_RATIO)
+            tail_extent_ratio = min(float(self.config.chunk_min_extent_ratio_to_peak), self._LONG_VEHICLE_TAIL_EXTENT_RATIO)
+            tail_point_threshold = tail_point_ratio * float(max(peak_point_count, 1))
+            tail_extent_threshold = tail_extent_ratio * float(max(peak_extent_norm, 1e-6))
+            tail_keep_indices = [
+                int(index)
+                for index in tail_candidate_indices
+                if float(point_counts[index]) >= tail_point_threshold and float(extent_norms[index]) >= tail_extent_threshold
+            ]
+            kept_indices = sorted(set(kept_indices).union(tail_keep_indices))
         metrics = {
             "chunk_quality_filter_enabled": True,
             "chunk_quality_total": total,
             "chunk_quality_kept": len(kept_indices),
-            "chunk_quality_segment_start_frame": int(frame_ids[start_idx]),
-            "chunk_quality_segment_end_frame": int(frame_ids[end_idx]),
+            "chunk_quality_segment_start_frame": int(frame_ids[min(kept_indices)]),
+            "chunk_quality_segment_end_frame": int(frame_ids[max(kept_indices)]),
             "peak_chunk_point_count": peak_point_count,
             "peak_chunk_extent_norm": peak_extent_norm,
+            "tail_candidate_frame_ids": [int(frame_ids[index]) for index in tail_candidate_indices],
+            "tail_candidate_kept_count": int(sum(1 for index in tail_candidate_indices if index in set(kept_indices))),
         }
         return (
             [chunks[index] for index in kept_indices],
@@ -1198,6 +1306,200 @@ class VoxelFusionAccumulator:
             [frame_ids[index] for index in kept_indices],
             metrics,
         )
+
+    def _long_vehicle_tail_candidate_indices(
+        self,
+        chunks: list[np.ndarray],
+        centers: list[np.ndarray],
+        frame_ids: list[int],
+    ) -> list[int]:
+        _ = frame_ids
+        if not chunks:
+            return []
+        axis_idx = axis_to_index(self.config.frame_selection_line_axis)
+        direction = self._track_motion_direction(centers)
+        candidate_count = min(len(chunks), max(1, self._LONG_VEHICLE_TAIL_CANDIDATE_COUNT))
+        scored: list[tuple[float, float, int]] = []
+        for index, (chunk, center) in enumerate(zip(chunks, centers)):
+            points = np.asarray(chunk, dtype=np.float32)
+            if len(points) == 0:
+                continue
+            local_points = points - np.asarray(center, dtype=np.float32)
+            signed = np.asarray(local_points[:, axis_idx], dtype=np.float64) * float(direction)
+            rear_span = abs(float(np.min(signed))) if len(signed) else 0.0
+            front_span = max(0.0, float(np.max(signed))) if len(signed) else 0.0
+            total_span = rear_span + front_span
+            rear_ratio = 0.0 if total_span <= 1e-6 else rear_span / total_span
+            scored.append((rear_ratio, rear_span, int(index)))
+        if not scored:
+            return []
+        scored.sort(key=lambda item: (item[0], item[1], -item[2]), reverse=True)
+        return sorted(int(index) for _, _, index in scored[:candidate_count])
+
+    def _enforce_long_vehicle_component_coverage(
+        self,
+        selected_chunks: list[np.ndarray],
+        selected_centers: list[np.ndarray],
+        selected_frame_ids: list[int],
+        filtered_chunks: list[np.ndarray],
+        filtered_centers: list[np.ndarray],
+        filtered_frame_ids: list[int],
+        selection_info: dict[str, Any],
+        *,
+        long_vehicle_mode_applied: bool,
+    ) -> tuple[list[np.ndarray], list[np.ndarray], list[int], dict[str, Any]]:
+        if not long_vehicle_mode_applied or not filtered_chunks:
+            return selected_chunks, selected_centers, selected_frame_ids, selection_info
+
+        frame_to_index = {int(frame_id): index for index, frame_id in enumerate(filtered_frame_ids)}
+        selected_indices = {frame_to_index[int(frame_id)] for frame_id in selected_frame_ids if int(frame_id) in frame_to_index}
+        axis_idx = axis_to_index(self.config.frame_selection_line_axis)
+        positions = np.asarray([float(center[axis_idx]) for center in filtered_centers], dtype=np.float64)
+        if len(positions) == 0:
+            return selected_chunks, selected_centers, selected_frame_ids, selection_info
+        minimum = float(np.min(positions))
+        maximum = float(np.max(positions))
+        if maximum - minimum > 1e-6:
+            thresholds = np.linspace(minimum, maximum, 4, dtype=np.float64)
+            bin_masks = [
+                (positions >= thresholds[index]) & (positions <= thresholds[index + 1] if index == 2 else positions < thresholds[index + 1])
+                for index in range(3)
+            ]
+            point_counts = np.asarray([len(chunk) for chunk in filtered_chunks], dtype=np.int32)
+            for mask in bin_masks:
+                candidate_indices = np.flatnonzero(mask)
+                if len(candidate_indices) == 0:
+                    continue
+                best_index = int(max(candidate_indices.tolist(), key=lambda idx: (int(point_counts[idx]), -idx)))
+                selected_indices.add(best_index)
+        tail_candidate_frame_ids = [int(frame_id) for frame_id in selection_info.get("tail_candidate_frame_ids", [])]
+        for frame_id in tail_candidate_frame_ids:
+            index = frame_to_index.get(int(frame_id))
+            if index is not None:
+                selected_indices.add(int(index))
+        ordered_indices = sorted(selected_indices)
+        augmented_info = dict(selection_info)
+        augmented_info["tail_candidate_kept_count"] = int(
+            sum(1 for frame_id in tail_candidate_frame_ids if int(frame_id) in {int(filtered_frame_ids[index]) for index in ordered_indices})
+        )
+        augmented_info["long_vehicle_coverage_bins_selected"] = 3
+        return (
+            [filtered_chunks[index] for index in ordered_indices],
+            [filtered_centers[index] for index in ordered_indices],
+            [int(filtered_frame_ids[index]) for index in ordered_indices],
+            augmented_info,
+        )
+
+    def _restore_long_vehicle_rejected_chunks(
+        self,
+        track: Track,
+        accumulation_input: list[np.ndarray],
+        prepared_chunks: list[np.ndarray],
+        kept_intensity: list[np.ndarray | None],
+        kept_centers: list[np.ndarray],
+        kept_frame_ids: list[int],
+        prepared_intensity: list[np.ndarray | None],
+        selected_centers: list[np.ndarray],
+        selected_frame_ids: list[int],
+        registration_metrics: dict[str, Any],
+        selection_info: dict[str, Any],
+        *,
+        long_vehicle_mode_applied: bool,
+    ) -> tuple[list[np.ndarray], list[np.ndarray | None], list[np.ndarray], list[int], dict[str, Any]]:
+        metrics = dict(registration_metrics)
+        metrics.setdefault("rear_registration_rejected_count", 0)
+        metrics.setdefault("rear_fallback_used", False)
+        if not long_vehicle_mode_applied or len(prepared_chunks) <= len(accumulation_input):
+            return accumulation_input, kept_intensity, kept_centers, kept_frame_ids, metrics
+
+        keep_indices = [int(index) for index in metrics.get("registration_keep_indices", [])]
+        if not keep_indices:
+            keep_indices = list(range(len(accumulation_input)))
+        dropped_indices = [index for index in range(len(prepared_chunks)) if index not in set(keep_indices)]
+        if not dropped_indices:
+            return accumulation_input, prepared_intensity, selected_centers, selected_frame_ids, metrics
+
+        tail_candidate_frame_ids = {int(frame_id) for frame_id in selection_info.get("tail_candidate_frame_ids", [])}
+        role = str(track.state.get("long_vehicle_component_role") or track.state.get("articulated_role") or "")
+        should_fallback = bool(role in {"rear", "fragment"}) or any(
+            int(selected_frame_ids[index]) in tail_candidate_frame_ids for index in dropped_indices if index < len(selected_frame_ids)
+        )
+        if not should_fallback:
+            metrics["rear_registration_rejected_count"] = int(len(dropped_indices))
+            return accumulation_input, prepared_intensity, selected_centers, selected_frame_ids, metrics
+
+        kept_set = set(keep_indices)
+        restored_chunks = list(accumulation_input)
+        restored_intensity = list(kept_intensity)
+        restored_centers = list(kept_centers)
+        restored_frame_ids = list(kept_frame_ids)
+        restored_weights = list(metrics.get("registration_chunk_weights", [1.0 for _ in accumulation_input]))
+        if len(restored_weights) != len(restored_chunks):
+            restored_weights = [1.0 for _ in restored_chunks]
+        for index in dropped_indices:
+            if index in kept_set:
+                continue
+            restored_chunks.append(np.asarray(prepared_chunks[index], dtype=np.float32).copy())
+            restored_intensity.append(None if prepared_intensity[index] is None else np.asarray(prepared_intensity[index], dtype=np.float32).copy())
+            restored_centers.append(np.asarray(selected_centers[index], dtype=np.float32).copy())
+            restored_frame_ids.append(int(selected_frame_ids[index]))
+            restored_weights.append(float(self._LONG_VEHICLE_REJECTED_CHUNK_WEIGHT))
+        metrics["registration_chunk_weights"] = restored_weights
+        metrics["registration_keep_indices"] = list(range(len(restored_chunks)))
+        metrics["registration_output_chunk_count"] = int(len(restored_chunks))
+        metrics["registration_dropped_count"] = max(0, int(len(prepared_chunks) - len(restored_chunks)))
+        metrics["rear_registration_rejected_count"] = int(len(dropped_indices))
+        metrics["rear_fallback_used"] = True
+        return restored_chunks, restored_intensity, restored_centers, restored_frame_ids, metrics
+
+    def _track_motion_direction(self, centers: list[np.ndarray]) -> float:
+        axis_idx = axis_to_index(self.config.frame_selection_line_axis)
+        if len(centers) < 2:
+            return 1.0
+        displacement = float(np.asarray(centers[-1], dtype=np.float64)[axis_idx] - np.asarray(centers[0], dtype=np.float64)[axis_idx])
+        if abs(displacement) <= 1e-6:
+            return 1.0
+        return 1.0 if displacement >= 0.0 else -1.0
+
+    def _candidate_anchor_center_world(self, selected_centers: list[np.ndarray], track: Track) -> np.ndarray:
+        if selected_centers:
+            return np.asarray(np.median(np.asarray(selected_centers, dtype=np.float32), axis=0), dtype=np.float32)
+        if track.centers:
+            return np.asarray(np.median(np.asarray(track.centers, dtype=np.float32), axis=0), dtype=np.float32)
+        return np.zeros((3,), dtype=np.float32)
+
+    def _candidate_world_outputs(
+        self,
+        points: np.ndarray,
+        intensity: np.ndarray | None,
+        anchor_center_world: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        candidate_points = np.asarray(points, dtype=np.float32)
+        if not self.output_config.save_world:
+            candidate_points = (candidate_points + np.asarray(anchor_center_world, dtype=np.float32)).astype(np.float32, copy=False)
+        candidate_intensity = None if intensity is None else np.asarray(intensity, dtype=np.float32)
+        return candidate_points, candidate_intensity
+
+    def _long_vehicle_front_anchor_world(
+        self,
+        points_world: np.ndarray,
+        track: Track,
+        fallback_anchor_world: np.ndarray,
+    ) -> np.ndarray:
+        anchor = np.asarray(fallback_anchor_world, dtype=np.float32).copy()
+        points = np.asarray(points_world, dtype=np.float32)
+        if len(points) == 0:
+            return anchor
+        axis_idx = axis_to_index(self.config.frame_selection_line_axis)
+        direction = self._track_motion_direction(track.centers)
+        axis_values = points[:, axis_idx].astype(np.float64)
+        if len(axis_values) == 0:
+            return anchor
+        anchor[axis_idx] = np.float32(np.max(axis_values) if direction >= 0.0 else np.min(axis_values))
+        lateral_idx, vertical_idx = orthogonal_axes(axis_idx)
+        anchor[lateral_idx] = np.float32(np.median(points[:, lateral_idx]))
+        anchor[vertical_idx] = np.float32(np.median(points[:, vertical_idx]))
+        return anchor
 
     def _expand_segment_around_peak(self, peak_index: int, total: int) -> tuple[int, int]:
         window = min(total, max(1, int(self.config.chunk_min_segment_length)))
@@ -1731,3 +2033,459 @@ class VoxelFusionAccumulator:
         axis_idx = axis_to_index(self.config.frame_selection_line_axis)
         values = np.asarray(xyz, dtype=np.float64)[:, axis_idx]
         return float(np.max(values) - np.min(values))
+
+    def merge_long_vehicle_aggregates(
+        self,
+        tracks: dict[int, Track],
+        aggregate_results: list[AggregateResult],
+        lane_box: LaneBox,
+    ) -> list[AggregateResult]:
+        by_track_id = {int(result.track_id): result for result in aggregate_results}
+        for group_id, component_ids in self._long_vehicle_component_groups(tracks).items():
+            merged_results = self._merge_long_vehicle_group(group_id, component_ids, tracks, by_track_id, lane_box)
+            if merged_results is None:
+                continue
+            lead_result, component_results = merged_results
+            by_track_id[int(lead_result.track_id)] = lead_result
+            for result in component_results:
+                by_track_id[int(result.track_id)] = result
+        return [by_track_id[track_id] for track_id in sorted(by_track_id)]
+
+    def _long_vehicle_component_groups(self, tracks: dict[int, Track]) -> dict[int, list[int]]:
+        groups: dict[int, list[int]] = {}
+        for track_id, track in sorted(tracks.items()):
+            group_id = track.state.get("long_vehicle_component_group_id")
+            if group_id is None:
+                continue
+            groups.setdefault(int(group_id), []).append(int(track_id))
+        return {group_id: sorted(component_ids) for group_id, component_ids in groups.items() if len(component_ids) >= 2}
+
+    def _merge_long_vehicle_group(
+        self,
+        group_id: int,
+        component_ids: list[int],
+        tracks: dict[int, Track],
+        aggregate_results: dict[int, AggregateResult],
+        lane_box: LaneBox,
+    ) -> tuple[AggregateResult, list[AggregateResult]] | None:
+        component_tracks = [tracks[track_id] for track_id in component_ids if track_id in tracks]
+        if len(component_tracks) < 2:
+            return None
+        lead_track = self._lead_component_track(component_tracks, group_id)
+        lead_result = aggregate_results.get(int(lead_track.track_id))
+        if lead_result is None or lead_result.candidate_points_world is None or len(lead_result.candidate_points_world) == 0:
+            return None
+
+        mergeable_track_ids = [
+            int(track.track_id)
+            for track in component_tracks
+            if aggregate_results.get(int(track.track_id)) is not None
+            and aggregate_results[int(track.track_id)].candidate_points_world is not None
+            and len(aggregate_results[int(track.track_id)].candidate_points_world) > 0
+        ]
+        if len(mergeable_track_ids) < 2:
+            return None
+
+        aligned_world_chunks: dict[int, np.ndarray] = {}
+        aligned_intensity_chunks: dict[int, np.ndarray | None] = {}
+        lead_points_world = np.asarray(lead_result.candidate_points_world, dtype=np.float32).copy()
+        lead_intensity_world = (
+            None
+            if lead_result.candidate_intensity_world is None
+            else np.asarray(lead_result.candidate_intensity_world, dtype=np.float32).copy()
+        )
+        aligned_world_chunks[int(lead_track.track_id)] = lead_points_world
+        aligned_intensity_chunks[int(lead_track.track_id)] = lead_intensity_world
+        component_axis_shifts_world: dict[str, float] = {}
+        overlap_correction_applied = False
+        for track_id in mergeable_track_ids:
+            if int(track_id) == int(lead_track.track_id):
+                continue
+            base_result = aggregate_results[int(track_id)]
+            component_points_world = np.asarray(base_result.candidate_points_world, dtype=np.float32).copy()
+            component_intensity_world = (
+                None
+                if base_result.candidate_intensity_world is None
+                else np.asarray(base_result.candidate_intensity_world, dtype=np.float32).copy()
+            )
+            component_points_world, axis_shift_world, shifted = self._align_component_behind_lead_if_needed(
+                lead_points_world,
+                component_points_world,
+                lead_track,
+                tracks[int(track_id)],
+            )
+            if shifted:
+                overlap_correction_applied = True
+            component_axis_shifts_world[str(int(track_id))] = float(axis_shift_world)
+            aligned_world_chunks[int(track_id)] = component_points_world
+            aligned_intensity_chunks[int(track_id)] = component_intensity_world
+
+        world_chunks = [aligned_world_chunks[int(track_id)] for track_id in mergeable_track_ids]
+        intensity_chunks = [aligned_intensity_chunks[int(track_id)] for track_id in mergeable_track_ids]
+        merged_world_points = np.vstack(world_chunks).astype(np.float32, copy=False)
+        merged_world_intensity = None
+        if all(values is not None for values in intensity_chunks):
+            merged_world_intensity = np.concatenate(
+                [np.asarray(values, dtype=np.float32) for values in intensity_chunks if values is not None],
+                axis=0,
+            ).astype(np.float32, copy=False)
+
+        merged_world_points, merged_world_intensity = self._post_filter_long_vehicle_merge(
+            merged_world_points,
+            merged_world_intensity,
+        )
+        (
+            merged_world_points,
+            merged_world_intensity,
+            _,
+            component_count_post_fusion,
+            tail_bridge_count,
+            longitudinal_extent,
+        ) = self._apply_tail_bridge(
+            merged_world_points,
+            merged_world_intensity,
+            None,
+            True,
+        )
+
+        merged_track = self._build_long_vehicle_group_track(component_tracks)
+        merged_track.quality_score = max(float(track.quality_score or 0.0) for track in component_tracks)
+        merged_track.quality_metrics = dict(lead_track.quality_metrics)
+        merged_track.quality_metrics["is_long_vehicle"] = True
+        merged_track.state.update(
+            {
+                "articulated_vehicle": bool(any(track.state.get("articulated_vehicle") for track in component_tracks)),
+                "object_kind": str(lead_track.state.get("object_kind") or "long_vehicle"),
+                "long_vehicle_component_group_id": int(group_id),
+                "long_vehicle_component_track_ids": list(component_ids),
+            }
+        )
+        lead_anchor_center_world = (
+            np.asarray(lead_result.candidate_anchor_center_world, dtype=np.float32).copy()
+            if lead_result.candidate_anchor_center_world is not None
+            else np.asarray(lead_track.current_center(), dtype=np.float32).copy()
+        )
+        lead_front_anchor_world = self._long_vehicle_front_anchor_world(
+            np.asarray(lead_result.candidate_points_world, dtype=np.float32),
+            lead_track,
+            lead_anchor_center_world,
+        )
+
+        merged_metrics = {
+            **self._base_metrics(merged_track),
+            "alignment_method": "post_aggregation_concat",
+            "frame_selection_method": "component_then_merge",
+            "fusion_method": self.fusion_method,
+            "longitudinal_extent": float(longitudinal_extent),
+            "component_count_post_fusion": int(component_count_post_fusion),
+            "tail_bridge_count": int(tail_bridge_count),
+            "long_vehicle_mode_applied": True,
+            "merged_post_aggregation": True,
+            "long_vehicle_component_count": int(len(component_ids)),
+            "long_vehicle_component_roles": [self._component_role(tracks[track_id]) for track_id in component_ids],
+            "post_merge_component_ids": [int(track_id) for track_id in component_ids],
+            "tail_candidate_frame_ids": sorted(
+                {
+                    int(frame_id)
+                    for track_id in component_ids
+                    for frame_id in aggregate_results[track_id].metrics.get("tail_candidate_frame_ids", [])
+                }
+            ),
+            "tail_candidate_kept_count": int(
+                sum(int(aggregate_results[track_id].metrics.get("tail_candidate_kept_count", 0)) for track_id in component_ids)
+            ),
+            "rear_registration_rejected_count": int(
+                sum(
+                    int(aggregate_results[track_id].metrics.get("rear_registration_rejected_count", 0))
+                    for track_id in component_ids
+                    if self._component_role(tracks[track_id]) != "lead"
+                )
+            ),
+            "rear_fallback_used": bool(
+                any(bool(aggregate_results[track_id].metrics.get("rear_fallback_used")) for track_id in component_ids)
+            ),
+            "registration_pairs": int(sum(int(aggregate_results[track_id].metrics.get("registration_pairs", 0)) for track_id in component_ids)),
+            "registration_accepted": int(sum(int(aggregate_results[track_id].metrics.get("registration_accepted", 0)) for track_id in component_ids)),
+            "registration_rejected": int(sum(int(aggregate_results[track_id].metrics.get("registration_rejected", 0)) for track_id in component_ids)),
+            "mode": "world" if self.output_config.save_world else "local",
+            "long_vehicle_local_anchor_mode": "lead_front",
+            "long_vehicle_local_anchor_axis": str(self.config.frame_selection_line_axis),
+            "long_vehicle_lead_track_id": int(lead_track.track_id),
+            "long_vehicle_local_anchor_value_world": float(lead_front_anchor_world[axis_to_index(self.config.frame_selection_line_axis)]),
+            "long_vehicle_rear_axis_shifts_world": component_axis_shifts_world,
+            "long_vehicle_overlap_correction_applied": bool(overlap_correction_applied),
+        }
+
+        render_points = np.asarray(merged_world_points, dtype=np.float32)
+        if not self.output_config.save_world:
+            render_points = (render_points - lead_front_anchor_world).astype(np.float32, copy=False)
+        selected_frame_ids = sorted(
+            {
+                int(frame_id)
+                for track_id in component_ids
+                for frame_id in aggregate_results[track_id].selected_frame_ids
+            }
+        )
+        final_quality_threshold = self._quality_threshold(True)
+        final_quality_score = max(float(track.quality_score or 0.0) for track in component_tracks)
+        lead_aggregate_result = self._result(
+            merged_track,
+            lane_box,
+            render_points,
+            selected_frame_ids,
+            "saved",
+            {**merged_metrics, **self._vehicle_dimension_metrics(render_points)},
+            intensity=merged_world_intensity,
+            prepared_chunk_count=len(world_chunks),
+            point_count_after_downsample=len(merged_world_points),
+            quality_threshold=final_quality_threshold,
+            point_count_before_confidence_cap=len(merged_world_points),
+            point_count_after_confidence_cap=len(merged_world_points),
+            confidence_point_cap_applied=False,
+            candidate_points_world=np.asarray(merged_world_points, dtype=np.float32),
+            candidate_intensity_world=merged_world_intensity,
+            candidate_anchor_center_world=lead_front_anchor_world,
+            candidate_status="available",
+        )
+        if self.output_config.require_track_exit and not track_exited_lane_box(
+            merged_track,
+            lane_box,
+            edge_margin=self.output_config.track_exit_edge_margin,
+            axis=self.config.frame_selection_line_axis,
+        ):
+            lead_aggregate_result.status = "skipped_track_exit"
+            lead_aggregate_result.points = np.zeros((0, 3), dtype=np.float32)
+            lead_aggregate_result.intensity = None
+            lead_aggregate_result.metrics.update(
+                self._decision_metrics(
+                    merged_track,
+                    lane_box,
+                    "skipped_track_exit",
+                    selected_frame_ids,
+                    prepared_chunk_count=len(world_chunks),
+                    point_count_after_downsample=len(merged_world_points),
+                    quality_threshold=final_quality_threshold,
+                )
+            )
+        elif len(merged_world_points) < int(self.config.min_saved_aggregate_points):
+            lead_aggregate_result.status = "skipped_min_saved_points"
+            lead_aggregate_result.points = np.zeros((0, 3), dtype=np.float32)
+            lead_aggregate_result.intensity = None
+            lead_aggregate_result.metrics.update(
+                self._decision_metrics(
+                    merged_track,
+                    lane_box,
+                    "skipped_min_saved_points",
+                    selected_frame_ids,
+                    prepared_chunk_count=len(world_chunks),
+                    point_count_after_downsample=len(merged_world_points),
+                    quality_threshold=final_quality_threshold,
+                )
+            )
+        elif final_quality_score < final_quality_threshold:
+            lead_aggregate_result.status = "skipped_quality_threshold"
+            lead_aggregate_result.points = np.zeros((0, 3), dtype=np.float32)
+            lead_aggregate_result.intensity = None
+            lead_aggregate_result.metrics.update(
+                self._decision_metrics(
+                    merged_track,
+                    lane_box,
+                    "skipped_quality_threshold",
+                    selected_frame_ids,
+                    prepared_chunk_count=len(world_chunks),
+                    point_count_after_downsample=len(merged_world_points),
+                    quality_threshold=final_quality_threshold,
+                )
+            )
+            lead_aggregate_result.metrics["quality_score"] = float(final_quality_score)
+        component_results: list[AggregateResult] = []
+        for track_id in component_ids:
+            if int(track_id) == int(lead_track.track_id):
+                continue
+            base = aggregate_results[int(track_id)]
+            component_metrics = dict(base.metrics)
+            component_metrics.update(
+                {
+                    "merged_post_aggregation": True,
+                    "merged_target_track_id": int(lead_track.track_id),
+                    "post_merge_component_ids": [int(component_id) for component_id in component_ids],
+                }
+            )
+            component_results.append(
+                AggregateResult(
+                    track_id=int(track_id),
+                    points=np.zeros((0, 3), dtype=np.float32),
+                    selected_frame_ids=list(base.selected_frame_ids),
+                    status="merged_into_long_vehicle_group",
+                    metrics=component_metrics,
+                    intensity=None,
+                    candidate_points_world=base.candidate_points_world,
+                    candidate_intensity_world=base.candidate_intensity_world,
+                    candidate_anchor_center_world=base.candidate_anchor_center_world,
+                    candidate_status=base.candidate_status,
+                )
+            )
+        return lead_aggregate_result, component_results
+
+    def _align_component_behind_lead_if_needed(
+        self,
+        lead_points_world: np.ndarray,
+        component_points_world: np.ndarray,
+        lead_track: Track,
+        component_track: Track,
+    ) -> tuple[np.ndarray, float, bool]:
+        role = self._component_role(component_track)
+        if role != "rear":
+            return np.asarray(component_points_world, dtype=np.float32), 0.0, False
+        aligned_points, axis_shift_world = self._shift_rear_component_behind_lead(
+            lead_points_world,
+            component_points_world,
+            lead_track,
+            component_track,
+        )
+        return aligned_points, axis_shift_world, bool(abs(axis_shift_world) > 1e-6)
+
+    def _shift_rear_component_behind_lead(
+        self,
+        lead_points_world: np.ndarray,
+        rear_points_world: np.ndarray,
+        lead_track: Track,
+        rear_track: Track,
+    ) -> tuple[np.ndarray, float]:
+        lead_points = np.asarray(lead_points_world, dtype=np.float32)
+        rear_points = np.asarray(rear_points_world, dtype=np.float32)
+        if len(lead_points) == 0 or len(rear_points) == 0:
+            return rear_points, 0.0
+        axis_idx = axis_to_index(self.config.frame_selection_line_axis)
+        direction = self._track_motion_direction(lead_track.centers)
+        clearance = max(0.05, float(max(self.config.aggregate_voxel, self.config.fusion_voxel_size)))
+        target_gap = max(0.0, self._articulated_target_gap(lead_track, rear_track)) + clearance
+        shifted_points = rear_points.copy()
+        if direction >= 0.0:
+            lead_rear_edge = float(np.min(lead_points[:, axis_idx]))
+            rear_front_edge = float(np.max(rear_points[:, axis_idx]))
+            target_front_edge = lead_rear_edge - target_gap
+            axis_shift_world = float(target_front_edge - rear_front_edge)
+            if axis_shift_world >= 0.0:
+                return shifted_points, 0.0
+        else:
+            lead_rear_edge = float(np.max(lead_points[:, axis_idx]))
+            rear_front_edge = float(np.min(rear_points[:, axis_idx]))
+            target_front_edge = lead_rear_edge + target_gap
+            axis_shift_world = float(target_front_edge - rear_front_edge)
+            if axis_shift_world <= 0.0:
+                return shifted_points, 0.0
+        shifted_points[:, axis_idx] = shifted_points[:, axis_idx] + np.float32(axis_shift_world)
+        return shifted_points, axis_shift_world
+
+    def _articulated_target_gap(self, lead_track: Track, rear_track: Track) -> float:
+        for track in (lead_track, rear_track):
+            pair_metrics = track.state.get("articulated_pair_metrics")
+            if isinstance(pair_metrics, dict) and pair_metrics.get("gap_mean") is not None:
+                return float(pair_metrics["gap_mean"])
+            gap_mean = track.state.get("articulated_rear_gap_mean")
+            if gap_mean is not None:
+                return float(gap_mean)
+        return 0.0
+
+    def _lead_component_track(self, component_tracks: list[Track], group_id: int) -> Track:
+        for track in component_tracks:
+            if int(track.track_id) == int(group_id):
+                return track
+        for track in component_tracks:
+            if self._component_role(track) == "lead":
+                return track
+        return min(component_tracks, key=lambda track: int(track.track_id))
+
+    def _component_role(self, track: Track) -> str:
+        return str(track.state.get("long_vehicle_component_role") or track.state.get("articulated_role") or "component")
+
+    def _build_long_vehicle_group_track(self, component_tracks: list[Track]) -> Track:
+        lead_track = self._lead_component_track(component_tracks, int(component_tracks[0].state.get("long_vehicle_component_group_id", component_tracks[0].track_id)))
+        merged = Track(track_id=int(lead_track.track_id))
+        merged.source_track_ids = list(
+            dict.fromkeys(
+                component_id
+                for track in component_tracks
+                for component_id in (track.source_track_ids or [track.track_id])
+            )
+        )
+        by_frame: dict[int, list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None, int]]] = {}
+        for track in component_tracks:
+            intensities = track.world_intensity if len(track.world_intensity) == len(track.world_points) else [None for _ in track.world_points]
+            point_timestamps = track.point_timestamps_ns if len(track.point_timestamps_ns) == len(track.world_points) else [None for _ in track.world_points]
+            frame_timestamps = track.frame_timestamps_ns if len(track.frame_timestamps_ns) == len(track.frame_ids) else [-1 for _ in track.frame_ids]
+            for frame_id, points, intensity, point_timestamp_ns, frame_timestamp_ns in zip(
+                track.frame_ids,
+                track.world_points,
+                intensities,
+                point_timestamps,
+                frame_timestamps,
+            ):
+                by_frame.setdefault(int(frame_id), []).append(
+                    (
+                        np.asarray(points, dtype=np.float32),
+                        None if intensity is None else np.asarray(intensity, dtype=np.float32),
+                        None if point_timestamp_ns is None else np.asarray(point_timestamp_ns, dtype=np.int64),
+                        int(frame_timestamp_ns),
+                    )
+                )
+        for frame_id in sorted(by_frame):
+            observations = by_frame[frame_id]
+            world_points = np.concatenate([values[0] for values in observations], axis=0).astype(np.float32, copy=False)
+            world_intensity = None
+            if all(values[1] is not None for values in observations):
+                world_intensity = np.concatenate([values[1] for values in observations if values[1] is not None], axis=0).astype(np.float32, copy=False)
+            point_timestamps_ns = None
+            if all(values[2] is not None for values in observations):
+                point_timestamps_ns = np.concatenate([values[2] for values in observations if values[2] is not None], axis=0).astype(np.int64, copy=False)
+            center = np.mean(world_points, axis=0).astype(np.float32)
+            merged.add_observation(
+                center,
+                world_points,
+                int(frame_id),
+                int(observations[0][3]),
+                compute_extent(world_points),
+                intensity=world_intensity,
+                point_timestamp_ns=point_timestamps_ns,
+            )
+        merged.age = max(track.age for track in component_tracks)
+        merged.missed = min(track.missed for track in component_tracks)
+        merged.ended_by_missed = any(bool(track.ended_by_missed) for track in component_tracks)
+        merged.state = {
+            "articulated_vehicle": bool(any(track.state.get("articulated_vehicle") for track in component_tracks)),
+            "articulated_component_track_ids": [int(track.track_id) for track in component_tracks],
+            "long_vehicle_component_group_id": int(lead_track.track_id),
+            "long_vehicle_component_track_ids": [int(track.track_id) for track in component_tracks],
+            "object_kind": str(lead_track.state.get("object_kind") or "long_vehicle"),
+        }
+        return merged
+
+    def _post_filter_long_vehicle_merge(
+        self,
+        xyz: np.ndarray,
+        intensity: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        points = np.asarray(xyz, dtype=np.float32)
+        intensity_values = None if intensity is None else np.asarray(intensity, dtype=np.float32)
+        if len(points) == 0:
+            return np.zeros((0, 3), dtype=np.float32), None if intensity is None else np.zeros((0,), dtype=np.float32)
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
+        if len(points) >= max(6, int(self.config.post_filter_stat_nb_neighbors) // 2):
+            pcd, keep_indices = pcd.remove_statistical_outlier(
+                nb_neighbors=max(6, int(self.config.post_filter_stat_nb_neighbors) // 2),
+                std_ratio=float(self.config.post_filter_stat_std_ratio) * 1.25,
+            )
+            keep = np.asarray(keep_indices, dtype=np.int32)
+            if intensity_values is not None:
+                intensity_values = intensity_values[keep]
+        filtered_points = np.asarray(pcd.points, dtype=np.float32)
+        if self.config.aggregate_voxel > 0 and len(filtered_points) > 0:
+            filtered_points, intensity_values, _ = self._aggregate_per_voxel(
+                filtered_points,
+                intensity_values,
+                None,
+                max(0.04, float(self.config.aggregate_voxel) * 0.75),
+            )
+        return filtered_points, intensity_values

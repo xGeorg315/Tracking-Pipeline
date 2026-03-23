@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from tracking_pipeline.config.models import AggregationConfig, OutputConfig, TrackingConfig
-from tracking_pipeline.domain.models import Track
+from tracking_pipeline.domain.models import AggregateResult, Track
 from tracking_pipeline.domain.rules import compute_extent
 from tracking_pipeline.domain.value_objects import LaneBox
 from tracking_pipeline.infrastructure.aggregation.occupancy_consensus_fusion import OccupancyConsensusFusionAccumulator
@@ -910,10 +910,13 @@ def test_symmetry_completion_does_not_change_min_saved_points_status() -> None:
 
     assert result.status == "skipped_min_saved_points"
     assert len(result.points) == 0
+    assert result.candidate_status == "available"
+    assert result.candidate_points_world is not None
+    assert len(result.candidate_points_world) == 2
     assert result.metrics["symmetry_completion_enabled"] is True
-    assert result.metrics["symmetry_completion_applied"] is False
+    assert result.metrics["symmetry_completion_applied"] is True
     assert result.metrics["point_count_before_symmetry_completion"] == 1
-    assert result.metrics["point_count_after_symmetry_completion"] == 1
+    assert result.metrics["point_count_after_symmetry_completion"] == 2
 
 
 def test_symmetry_completion_prefers_more_extended_half_when_counts_match() -> None:
@@ -1785,3 +1788,303 @@ def test_confidence_point_cap_prefers_points_with_higher_weighted_support() -> N
     assert result.status == "saved"
     assert len(result.points) == 2
     assert np.all(np.asarray(result.points[:, 1], dtype=np.float32) >= 1.0)
+
+
+def test_long_vehicle_tail_candidate_frames_are_kept_for_selection() -> None:
+    track = _track_from_profile(
+        [45, 48, 50, 20, 18, 16],
+        [4.2, 4.1, 4.0, 2.0, 1.8, 1.7],
+        start_frame=300,
+    )
+    track.quality_metrics = {"is_long_vehicle": True}
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            frame_selection_method="length_coverage",
+            use_all_frames=False,
+            keyframe_keep=3,
+            chunk_quality_filter=True,
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.1,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            long_vehicle_mode=True,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-2.0, 2.0, 0.0, 20.0, 0.0, 2.0]))
+
+    assert result.status == "saved"
+    assert result.metrics["tail_candidate_frame_ids"] != []
+    assert result.metrics["tail_candidate_kept_count"] >= 1
+    assert any(frame_id in result.selected_frame_ids for frame_id in result.metrics["tail_candidate_frame_ids"])
+
+
+def test_long_vehicle_rear_registration_fallback_restores_rejected_chunks() -> None:
+    chunks = [_constant_chunk(0.0), _constant_chunk(0.6), _constant_chunk(1.2)]
+    track = _track_from_chunks(chunks, track_id=88)
+    track.quality_metrics = {"is_long_vehicle": True}
+    track.state["long_vehicle_component_role"] = "rear"
+    accumulator = _ScriptedPrepareAccumulator(
+        AggregationConfig(
+            algorithm="registration_voxel_fusion",
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.05,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            long_vehicle_mode=True,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+        keep_indices=[0],
+        chunk_weights=[1.0],
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-2.0, 2.0, -1.0, 4.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert result.metrics["rear_fallback_used"] is True
+    assert result.metrics["rear_registration_rejected_count"] == 2
+    assert result.metrics["registration_output_chunk_count"] == 3
+
+
+def test_merge_long_vehicle_aggregates_keeps_rear_component_behind_lead_anchor() -> None:
+    lead_chunks = [
+        np.array([[0.0, 10.0, 0.0], [0.2, 10.4, 0.0], [-0.2, 9.6, 0.0]], dtype=np.float32),
+        np.array([[0.0, 11.0, 0.0], [0.2, 11.4, 0.0], [-0.2, 10.6, 0.0]], dtype=np.float32),
+        np.array([[0.0, 12.0, 0.0], [0.2, 12.4, 0.0], [-0.2, 11.6, 0.0]], dtype=np.float32),
+    ]
+    rear_chunks = [
+        np.array([[0.1, 5.5, 0.0], [0.3, 5.9, 0.0], [-0.1, 5.1, 0.0]], dtype=np.float32),
+        np.array([[0.1, 6.5, 0.0], [0.3, 6.9, 0.0], [-0.1, 6.1, 0.0]], dtype=np.float32),
+        np.array([[0.1, 7.5, 0.0], [0.3, 7.9, 0.0], [-0.1, 7.1, 0.0]], dtype=np.float32),
+    ]
+    lead_track = _track_from_chunks(lead_chunks, track_id=101)
+    rear_track = _track_from_chunks(rear_chunks, track_id=102)
+    for track, role in ((lead_track, "lead"), (rear_track, "rear")):
+        track.quality_score = 0.9
+        track.quality_metrics = {"is_long_vehicle": True, "is_articulated_vehicle": True}
+        track.state.update(
+            {
+                "articulated_vehicle": True,
+                "object_kind": "truck_with_trailer",
+                "long_vehicle_component_group_id": 101,
+                "long_vehicle_component_role": role,
+                "long_vehicle_component_track_ids": [101, 102],
+            }
+        )
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.05,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            long_vehicle_mode=True,
+        ),
+        OutputConfig(require_track_exit=False, save_world=False),
+        TrackingConfig(min_track_hits=1),
+    )
+    lead_result = AggregateResult(
+        track_id=101,
+        points=np.zeros((0, 3), dtype=np.float32),
+        selected_frame_ids=[0, 1, 2],
+        status="saved",
+        metrics={"registration_pairs": 1, "registration_accepted": 1, "registration_rejected": 0},
+        candidate_points_world=np.array([[0.0, 10.0, 0.0], [0.0, 11.0, 0.0]], dtype=np.float32),
+        candidate_anchor_center_world=np.array([0.0, 11.0, 0.0], dtype=np.float32),
+        candidate_status="available",
+    )
+    rear_result = AggregateResult(
+        track_id=102,
+        points=np.zeros((0, 3), dtype=np.float32),
+        selected_frame_ids=[0, 1, 2],
+        status="skipped_min_saved_points",
+        metrics={"registration_pairs": 1, "registration_accepted": 0, "registration_rejected": 1, "rear_fallback_used": True},
+        candidate_points_world=np.array([[0.0, 6.0, 0.0], [0.0, 7.0, 0.0]], dtype=np.float32),
+        candidate_anchor_center_world=np.array([0.0, 6.5, 0.0], dtype=np.float32),
+        candidate_status="available",
+    )
+
+    merged_results = accumulator.merge_long_vehicle_aggregates(
+        {101: lead_track, 102: rear_track},
+        [lead_result, rear_result],
+        LaneBox.from_values([-2.0, 2.0, 0.0, 20.0, -1.0, 1.0]),
+    )
+
+    by_track_id = {int(result.track_id): result for result in merged_results}
+    assert by_track_id[101].status == "saved"
+    assert by_track_id[102].status == "merged_into_long_vehicle_group"
+    assert by_track_id[101].metrics["post_merge_component_ids"] == [101, 102]
+    assert by_track_id[101].metrics["rear_fallback_used"] is True
+    assert float(np.min(np.asarray(by_track_id[101].points, dtype=np.float32)[:, 1])) <= -5.0
+
+
+def test_merge_long_vehicle_aggregates_uses_lead_front_anchor_for_local_export() -> None:
+    lead_track = _track_from_chunks(
+        [
+            np.array([[0.0, 8.0, 0.0], [0.0, 10.0, 0.0], [0.0, 12.0, 0.0]], dtype=np.float32),
+            np.array([[0.0, 9.0, 0.0], [0.0, 11.0, 0.0], [0.0, 14.0, 0.0]], dtype=np.float32),
+        ],
+        track_id=201,
+    )
+    rear_track = _track_from_chunks(
+        [
+            np.array([[0.0, 2.0, 0.0], [0.0, 4.0, 0.0], [0.0, 6.0, 0.0]], dtype=np.float32),
+            np.array([[0.0, 3.0, 0.0], [0.0, 5.0, 0.0], [0.0, 7.0, 0.0]], dtype=np.float32),
+        ],
+        track_id=202,
+    )
+    for track, role in ((lead_track, "lead"), (rear_track, "rear")):
+        track.quality_score = 0.9
+        track.quality_metrics = {"is_long_vehicle": True, "is_articulated_vehicle": True}
+        track.state.update(
+            {
+                "articulated_vehicle": True,
+                "object_kind": "truck_with_trailer",
+                "long_vehicle_component_group_id": 201,
+                "long_vehicle_component_role": role,
+                "long_vehicle_component_track_ids": [201, 202],
+            }
+        )
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.05,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            long_vehicle_mode=True,
+        ),
+        OutputConfig(require_track_exit=False, save_world=False),
+        TrackingConfig(min_track_hits=1),
+    )
+    lead_result = AggregateResult(
+        track_id=201,
+        points=np.zeros((0, 3), dtype=np.float32),
+        selected_frame_ids=[0, 1],
+        status="saved",
+        metrics={},
+        candidate_points_world=np.array([[0.0, 8.0, 0.0], [0.0, 14.0, 0.0]], dtype=np.float32),
+        candidate_anchor_center_world=np.array([0.0, 11.0, 0.0], dtype=np.float32),
+        candidate_status="available",
+    )
+    rear_result = AggregateResult(
+        track_id=202,
+        points=np.zeros((0, 3), dtype=np.float32),
+        selected_frame_ids=[0, 1],
+        status="skipped_min_saved_points",
+        metrics={},
+        candidate_points_world=np.array([[0.0, 3.0, 0.0], [0.0, 7.0, 0.0]], dtype=np.float32),
+        candidate_anchor_center_world=np.array([0.0, 5.0, 0.0], dtype=np.float32),
+        candidate_status="available",
+    )
+
+    merged_results = accumulator.merge_long_vehicle_aggregates(
+        {201: lead_track, 202: rear_track},
+        [lead_result, rear_result],
+        LaneBox.from_values([-2.0, 2.0, 0.0, 20.0, -1.0, 1.0]),
+    )
+
+    merged = {int(result.track_id): result for result in merged_results}[201]
+    assert np.isclose(float(np.max(np.asarray(merged.points, dtype=np.float32)[:, 1])), 0.0)
+    assert float(np.max(np.asarray(merged.points, dtype=np.float32)[:, 1][np.asarray(merged.points, dtype=np.float32)[:, 1] < 0.0])) <= -6.0
+
+
+def test_merge_long_vehicle_aggregates_pushes_articulated_rear_behind_lead_without_overlap() -> None:
+    lead_track = _track_from_chunks(
+        [
+            np.array([[0.0, 8.0, 0.0], [0.0, 10.0, 0.0], [0.0, 14.0, 0.0]], dtype=np.float32),
+            np.array([[0.0, 8.5, 0.0], [0.0, 11.0, 0.0], [0.0, 14.5, 0.0]], dtype=np.float32),
+        ],
+        track_id=301,
+    )
+    rear_track = _track_from_chunks(
+        [
+            np.array([[1.0, 5.0, 0.0], [1.0, 8.0, 0.0], [1.0, 11.0, 0.0]], dtype=np.float32),
+            np.array([[1.0, 5.5, 0.0], [1.0, 8.5, 0.0], [1.0, 11.5, 0.0]], dtype=np.float32),
+        ],
+        track_id=302,
+    )
+    lead_track.quality_score = 0.9
+    rear_track.quality_score = 0.9
+    lead_track.quality_metrics = {"is_long_vehicle": True, "is_articulated_vehicle": True}
+    rear_track.quality_metrics = {"is_long_vehicle": True, "is_articulated_vehicle": True}
+    lead_track.state.update(
+        {
+            "articulated_vehicle": True,
+            "articulated_role": "lead",
+            "articulated_pair_metrics": {"gap_mean": 0.4},
+            "object_kind": "truck_with_trailer",
+            "long_vehicle_component_group_id": 301,
+            "long_vehicle_component_role": "lead",
+            "long_vehicle_component_track_ids": [301, 302],
+        }
+    )
+    rear_track.state.update(
+        {
+            "articulated_vehicle": True,
+            "articulated_role": "rear",
+            "articulated_pair_metrics": {"gap_mean": 0.4},
+            "object_kind": "truck_with_trailer",
+            "long_vehicle_component_group_id": 301,
+            "long_vehicle_component_role": "rear",
+            "long_vehicle_component_track_ids": [301, 302],
+        }
+    )
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.05,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            long_vehicle_mode=True,
+        ),
+        OutputConfig(require_track_exit=False, save_world=False),
+        TrackingConfig(min_track_hits=1),
+    )
+    lead_result = AggregateResult(
+        track_id=301,
+        points=np.zeros((0, 3), dtype=np.float32),
+        selected_frame_ids=[0, 1],
+        status="saved",
+        metrics={},
+        candidate_points_world=np.array([[0.0, 8.0, 0.0], [0.0, 14.0, 0.0]], dtype=np.float32),
+        candidate_anchor_center_world=np.array([0.0, 11.0, 0.0], dtype=np.float32),
+        candidate_status="available",
+    )
+    rear_result = AggregateResult(
+        track_id=302,
+        points=np.zeros((0, 3), dtype=np.float32),
+        selected_frame_ids=[0, 1],
+        status="skipped_min_saved_points",
+        metrics={},
+        candidate_points_world=np.array([[1.0, 5.0, 0.0], [1.0, 11.0, 0.0]], dtype=np.float32),
+        candidate_anchor_center_world=np.array([1.0, 8.0, 0.0], dtype=np.float32),
+        candidate_status="available",
+    )
+
+    merged_results = accumulator.merge_long_vehicle_aggregates(
+        {301: lead_track, 302: rear_track},
+        [lead_result, rear_result],
+        LaneBox.from_values([-2.0, 2.0, 0.0, 20.0, -1.0, 1.0]),
+    )
+
+    merged = {int(result.track_id): result for result in merged_results}[301]
+    merged_points = np.asarray(merged.points, dtype=np.float32)
+    lead_points = merged_points[np.isclose(merged_points[:, 0], 0.0)]
+    rear_points = merged_points[np.isclose(merged_points[:, 0], 1.0)]
+    assert len(lead_points) == 2
+    assert len(rear_points) == 2
+    assert np.isclose(float(np.max(lead_points[:, 1])), 0.0)
+    assert float(np.max(rear_points[:, 1])) < float(np.min(lead_points[:, 1]))
+    assert merged.metrics["long_vehicle_overlap_correction_applied"] is True
+    assert merged.metrics["long_vehicle_rear_axis_shifts_world"]["302"] < 0.0

@@ -120,6 +120,30 @@ class _FakeStateAwareAccumulator:
             metrics=metrics,
         )
 
+    def merge_long_vehicle_aggregates(self, tracks: dict[int, Track], aggregate_results: list[AggregateResult], lane_box):
+        _ = lane_box
+        by_track_id = {int(result.track_id): result for result in aggregate_results}
+        for track_id, track in tracks.items():
+            if str(track.state.get("articulated_role") or "") != "lead":
+                continue
+            component_ids = [int(component_id) for component_id in track.state.get("articulated_component_track_ids", [])]
+            if len(component_ids) < 2:
+                continue
+            lead_result = by_track_id[int(track_id)]
+            lead_result.metrics["merged_post_aggregation"] = True
+            lead_result.metrics["post_merge_component_ids"] = list(component_ids)
+            lead_result.metrics["long_vehicle_component_count"] = len(component_ids)
+            lead_result.metrics["long_vehicle_component_roles"] = ["lead", "rear"]
+            for component_id in component_ids:
+                if int(component_id) == int(track_id):
+                    continue
+                component_result = by_track_id[int(component_id)]
+                component_result.status = "merged_into_long_vehicle_group"
+                component_result.metrics["merged_post_aggregation"] = True
+                component_result.metrics["merged_target_track_id"] = int(track_id)
+                component_result.metrics["post_merge_component_ids"] = list(component_ids)
+        return [by_track_id[track_id] for track_id in sorted(by_track_id)]
+
 
 class _FakeWriter:
     def __init__(self, base: Path):
@@ -465,19 +489,30 @@ def test_run_pipeline_merges_articulated_vehicle_tracks(monkeypatch, tmp_path: P
 
     summary = run_pipeline(config, tmp_path)
 
-    assert summary.finished_track_count == 1
+    assert summary.finished_track_count == 2
     assert summary.saved_aggregates == 1
     assert summary.postprocessing_methods == ["articulated_vehicle_merge", "track_quality_scoring"]
     assert fake_tracker.seen_frame_ids == [0, 1, 2, 3]
-    assert set(fake_writer.written_tracks.keys()) == {11}
-    merged_track = fake_writer.written_tracks[11]
-    assert merged_track.state["articulated_vehicle"] is True
-    assert merged_track.state["articulated_component_track_ids"] == [11, 12]
-    assert merged_track.quality_metrics["is_articulated_vehicle"] is True
-    assert merged_track.quality_metrics["object_kind"] == "truck_with_trailer"
-    assert len(fake_writer.written_aggregate_results) == 1
-    assert fake_writer.written_aggregate_results[0].metrics["articulated_vehicle"] is True
-    assert fake_writer.written_aggregate_results[0].metrics["articulated_component_track_ids"] == [11, 12]
+    assert set(fake_writer.written_tracks.keys()) == {11, 12}
+    lead_track = fake_writer.written_tracks[11]
+    rear_track = fake_writer.written_tracks[12]
+    assert lead_track.state["articulated_vehicle"] is True
+    assert rear_track.state["articulated_vehicle"] is True
+    assert lead_track.state["articulated_role"] == "lead"
+    assert rear_track.state["articulated_role"] == "rear"
+    assert lead_track.state["articulated_component_track_ids"] == [11, 12]
+    assert rear_track.state["articulated_component_track_ids"] == [11, 12]
+    assert lead_track.quality_metrics["is_articulated_vehicle"] is True
+    assert rear_track.quality_metrics["is_articulated_vehicle"] is True
+    assert lead_track.quality_metrics["object_kind"] == "truck_with_trailer"
+    assert rear_track.quality_metrics["object_kind"] == "truck_with_trailer"
+    assert len(fake_writer.written_aggregate_results) == 2
+    lead_result = next(result for result in fake_writer.written_aggregate_results if int(result.track_id) == 11)
+    rear_result = next(result for result in fake_writer.written_aggregate_results if int(result.track_id) == 12)
+    assert lead_result.status == "saved"
+    assert rear_result.status == "merged_into_long_vehicle_group"
+    assert lead_result.metrics["post_merge_component_ids"] == [11, 12]
+    assert rear_result.metrics["merged_target_track_id"] == 11
 
 
 def test_replay_run_uses_multi_file_input_without_tracker_reset(monkeypatch, tmp_path: Path) -> None:

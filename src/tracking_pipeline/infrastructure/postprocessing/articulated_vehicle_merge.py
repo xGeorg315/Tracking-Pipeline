@@ -6,7 +6,7 @@ import numpy as np
 
 from tracking_pipeline.config.models import PostprocessingConfig
 from tracking_pipeline.domain.models import Track
-from tracking_pipeline.domain.rules import axis_to_index, compute_extent, orthogonal_axes
+from tracking_pipeline.domain.rules import axis_to_index, orthogonal_axes
 
 
 @dataclass(slots=True)
@@ -55,42 +55,31 @@ class ArticulatedVehicleMergePostprocessor:
     def process(self, tracks: dict[int, Track]) -> dict[int, Track]:
         self.debug_records = []
         ordered = list(sorted(tracks.values(), key=lambda track: (track.first_frame, track.track_id)))
-        changed = True
-        while changed:
-            changed = False
-            merged: list[Track] = []
-            skip_indices: set[int] = set()
-            for index, track in enumerate(ordered):
-                if index in skip_indices:
-                    continue
-                if bool(track.state.get("articulated_vehicle")):
-                    merged.append(track)
-                    continue
+        linked_track_ids: set[int] = set()
+        for index, track in enumerate(ordered):
+            if int(track.track_id) in linked_track_ids or bool(track.state.get("articulated_vehicle")):
+                continue
 
-                best_next_index = None
-                best_pair_metrics = None
-                for next_index in range(index + 1, len(ordered)):
-                    if next_index in skip_indices:
-                        continue
-                    candidate = ordered[next_index]
-                    if bool(candidate.state.get("articulated_vehicle")):
-                        continue
-                    evaluation = self._pair_metrics(track, candidate)
-                    if evaluation.debug is not None:
-                        self.debug_records.append(evaluation.debug)
-                    if evaluation.metrics is None:
-                        continue
-                    pair_metrics = evaluation.metrics
-                    if best_pair_metrics is None or self._score(pair_metrics) > self._score(best_pair_metrics):
-                        best_next_index = next_index
-                        best_pair_metrics = pair_metrics
+            best_next_index = None
+            best_pair_metrics = None
+            for next_index in range(index + 1, len(ordered)):
+                candidate = ordered[next_index]
+                if int(candidate.track_id) in linked_track_ids or bool(candidate.state.get("articulated_vehicle")):
+                    continue
+                evaluation = self._pair_metrics(track, candidate)
+                if evaluation.debug is not None:
+                    self.debug_records.append(evaluation.debug)
+                if evaluation.metrics is None:
+                    continue
+                pair_metrics = evaluation.metrics
+                if best_pair_metrics is None or self._score(pair_metrics) > self._score(best_pair_metrics):
+                    best_next_index = next_index
+                    best_pair_metrics = pair_metrics
 
-                if best_next_index is not None and best_pair_metrics is not None:
-                    track = self._merge_tracks(track, ordered[best_next_index], best_pair_metrics)
-                    skip_indices.add(best_next_index)
-                    changed = True
-                merged.append(track)
-            ordered = merged
+            if best_next_index is not None and best_pair_metrics is not None:
+                self._link_tracks(track, ordered[best_next_index], best_pair_metrics)
+                linked_track_ids.add(int(track.track_id))
+                linked_track_ids.add(int(ordered[best_next_index].track_id))
         return {track.track_id: track for track in ordered}
 
     def _score(self, metrics: _PairMetrics) -> tuple[int, float, float, float]:
@@ -423,60 +412,62 @@ class ArticulatedVehicleMergePostprocessor:
             mean_vertical_offset=float(mean_vertical_offset),
         )
 
-    def _merge_tracks(self, left: Track, right: Track, metrics: _PairMetrics) -> Track:
+    def _link_tracks(self, left: Track, right: Track, metrics: _PairMetrics) -> None:
         lead = left if left.track_id == metrics.lead_track_id else right
         rear = right if lead is left else left
-        merged = Track(track_id=lead.track_id)
-        by_frame = {}
-        for frame_id, values in self._by_frame(left).items():
-            by_frame.setdefault(frame_id, []).append(values)
-        for frame_id, values in self._by_frame(right).items():
-            by_frame.setdefault(frame_id, []).append(values)
+        component_track_ids = list(dict.fromkeys((lead.source_track_ids or [lead.track_id]) + (rear.source_track_ids or [rear.track_id])))
+        group_id = int(lead.track_id)
 
-        for frame_id in sorted(by_frame):
-            observations = by_frame[frame_id]
-            world_points = np.concatenate([np.asarray(values[1], dtype=np.float32) for values in observations], axis=0)
-            world_intensity = None
-            if all(values[2] is not None for values in observations):
-                world_intensity = np.concatenate(
-                    [np.asarray(values[2], dtype=np.float32) for values in observations if values[2] is not None],
-                    axis=0,
-                ).astype(np.float32, copy=False)
-            point_timestamps_ns = None
-            if all(values[6] is not None for values in observations):
-                point_timestamps_ns = np.concatenate(
-                    [np.asarray(values[6], dtype=np.int64) for values in observations if values[6] is not None],
-                    axis=0,
-                ).astype(np.int64, copy=False)
-            center = np.mean(world_points, axis=0).astype(np.float32)
-            extent = compute_extent(world_points)
-            frame_timestamp_ns = int(observations[0][7])
-            merged.add_observation(
-                center,
-                world_points,
-                int(frame_id),
-                frame_timestamp_ns,
-                extent,
-                intensity=world_intensity,
-                point_timestamp_ns=point_timestamps_ns,
-            )
-
-        merged.age = max(left.age, right.age, merged.last_frame - merged.first_frame + 1)
-        merged.missed = min(left.missed, right.missed)
-        merged.ended_by_missed = left.ended_by_missed or right.ended_by_missed
-        merged.source_track_ids = list(dict.fromkeys((left.source_track_ids or [left.track_id]) + (right.source_track_ids or [right.track_id])))
-        merged.quality_score = None
-        merged.quality_metrics = {}
-        merged.state = {
-            **lead.state,
-            **rear.state,
-            "articulated_vehicle": True,
-            "articulated_component_track_ids": list(dict.fromkeys((lead.source_track_ids or [lead.track_id]) + (rear.source_track_ids or [rear.track_id]))),
-            "articulated_rear_gap_mean": float(metrics.gap_mean),
-            "articulated_rear_gap_std": float(metrics.gap_std),
-            "object_kind": "truck_with_trailer",
-        }
-        return merged
+        lead.state.update(
+            {
+                "articulated_vehicle": True,
+                "articulated_pair_id": group_id,
+                "articulated_partner_track_id": int(rear.track_id),
+                "articulated_role": "lead",
+                "articulated_component_track_ids": component_track_ids,
+                "articulated_pair_metrics": {
+                    "lead_track_id": int(metrics.lead_track_id),
+                    "rear_track_id": int(metrics.rear_track_id),
+                    "gap_mean": float(metrics.gap_mean),
+                    "gap_std": float(metrics.gap_std),
+                    "combined_length_p75": float(metrics.combined_length_p75),
+                    "overlap_count": int(metrics.overlap_count),
+                    "overlap_ratio": float(metrics.overlap_ratio),
+                },
+                "articulated_rear_gap_mean": float(metrics.gap_mean),
+                "articulated_rear_gap_std": float(metrics.gap_std),
+                "object_kind": "truck_with_trailer",
+                "long_vehicle_component_group_id": group_id,
+                "long_vehicle_component_group_kind": "articulated",
+                "long_vehicle_component_role": "lead",
+                "long_vehicle_component_track_ids": component_track_ids,
+            }
+        )
+        rear.state.update(
+            {
+                "articulated_vehicle": True,
+                "articulated_pair_id": group_id,
+                "articulated_partner_track_id": int(lead.track_id),
+                "articulated_role": "rear",
+                "articulated_component_track_ids": component_track_ids,
+                "articulated_pair_metrics": {
+                    "lead_track_id": int(metrics.lead_track_id),
+                    "rear_track_id": int(metrics.rear_track_id),
+                    "gap_mean": float(metrics.gap_mean),
+                    "gap_std": float(metrics.gap_std),
+                    "combined_length_p75": float(metrics.combined_length_p75),
+                    "overlap_count": int(metrics.overlap_count),
+                    "overlap_ratio": float(metrics.overlap_ratio),
+                },
+                "articulated_rear_gap_mean": float(metrics.gap_mean),
+                "articulated_rear_gap_std": float(metrics.gap_std),
+                "object_kind": "truck_with_trailer",
+                "long_vehicle_component_group_id": group_id,
+                "long_vehicle_component_group_kind": "articulated",
+                "long_vehicle_component_role": "rear",
+                "long_vehicle_component_track_ids": component_track_ids,
+            }
+        )
 
     def _by_frame(
         self,

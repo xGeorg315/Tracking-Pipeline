@@ -1,6 +1,6 @@
 input:
   paths:
-    - ../data/medium_2/20260319_093156_01201-01400.pb # 115 Vehicles
+    - ../data/medium_2 # 115 Vehicles
     # - ../data/medium_energy # 159 Vehicles
 tracking:
   algorithm: kalman_nn

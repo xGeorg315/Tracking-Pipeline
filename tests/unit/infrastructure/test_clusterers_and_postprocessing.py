@@ -335,24 +335,71 @@ def test_co_moving_track_merge_rejects_large_lateral_offset() -> None:
     assert set(merged.keys()) == {12, 13}
 
 
-def test_articulated_vehicle_merge_merges_front_and_rear_tracks() -> None:
+def test_co_moving_track_merge_links_long_vehicle_fragments_instead_of_early_merge() -> None:
+    left = _articulated_track(14, [0, 1, 2, 3], [10.0, 11.0, 12.0, 13.0], lateral_center=0.0, length=4.2)
+    right = _articulated_track(15, [0, 1, 2, 3], [9.2, 10.2, 11.2, 12.2], lateral_center=0.3, length=2.6)
+    processor = CoMovingTrackMergePostprocessor(
+        PostprocessingConfig(
+            enable_co_moving_track_merge=True,
+            parallel_merge_min_overlap_frames=3,
+            parallel_merge_min_overlap_ratio=0.7,
+            parallel_merge_max_lateral_offset=0.8,
+            parallel_merge_max_longitudinal_gap=1.2,
+        ),
+        longitudinal_axis="y",
+        long_vehicle_length_threshold=4.5,
+    )
+
+    linked = processor.process({left.track_id: left, right.track_id: right})
+
+    assert set(linked.keys()) == {14, 15}
+    assert linked[14].state["long_vehicle_component_group_id"] == 14
+    assert linked[15].state["long_vehicle_component_group_id"] == 14
+    assert linked[14].state["long_vehicle_component_role"] == "lead"
+    assert linked[15].state["long_vehicle_component_role"] == "fragment"
+
+
+def test_co_moving_track_merge_chooses_front_component_as_lead_for_long_vehicle_link() -> None:
+    front = _articulated_track(41, [0, 1, 2, 3], [10.0, 11.0, 12.0, 13.0], lateral_center=0.0, length=2.4)
+    rear = _articulated_track(42, [0, 1, 2, 3], [6.0, 7.0, 8.0, 9.0], lateral_center=0.2, length=3.6)
+    processor = CoMovingTrackMergePostprocessor(
+        PostprocessingConfig(
+            enable_co_moving_track_merge=True,
+            parallel_merge_min_overlap_frames=3,
+            parallel_merge_min_overlap_ratio=0.7,
+            parallel_merge_max_lateral_offset=0.8,
+            parallel_merge_max_longitudinal_gap=4.5,
+        ),
+        longitudinal_axis="y",
+        long_vehicle_length_threshold=4.5,
+    )
+
+    linked = processor.process({front.track_id: front, rear.track_id: rear})
+
+    assert set(linked.keys()) == {41, 42}
+    assert linked[41].state["long_vehicle_component_role"] == "lead"
+    assert linked[42].state["long_vehicle_component_role"] == "fragment"
+
+
+def test_articulated_vehicle_merge_links_front_and_rear_tracks() -> None:
     front = _articulated_track(21, [0, 1, 2, 3], [10.0, 11.0, 12.0, 13.0], lateral_center=0.0)
     rear = _articulated_track(22, [0, 1, 2, 3], [6.8, 7.8, 8.8, 9.8], lateral_center=0.1)
     processor = ArticulatedVehicleMergePostprocessor(PostprocessingConfig(enable_articulated_vehicle_merge=True), longitudinal_axis="y")
 
     merged = processor.process({front.track_id: front, rear.track_id: rear})
 
-    assert list(merged.keys()) == [21]
-    merged_track = merged[21]
-    assert merged_track.source_track_ids == [21, 22]
-    assert merged_track.hit_count == 4
-    assert merged_track.state["articulated_vehicle"] is True
-    assert merged_track.state["articulated_component_track_ids"] == [21, 22]
-    assert merged_track.state["object_kind"] == "truck_with_trailer"
-    assert merged_track.state["articulated_rear_gap_mean"] >= -0.5
-    assert merged_track.state["articulated_rear_gap_mean"] <= 0.1
-    assert merged_track.state["articulated_rear_gap_std"] < 0.1
-    assert all(len(points) == 16 for points in merged_track.world_points)
+    assert set(merged.keys()) == {21, 22}
+    assert merged[21].state["articulated_vehicle"] is True
+    assert merged[22].state["articulated_vehicle"] is True
+    assert merged[21].state["articulated_role"] == "lead"
+    assert merged[22].state["articulated_role"] == "rear"
+    assert merged[21].state["articulated_component_track_ids"] == [21, 22]
+    assert merged[22].state["articulated_component_track_ids"] == [21, 22]
+    assert merged[21].state["object_kind"] == "truck_with_trailer"
+    assert merged[22].state["object_kind"] == "truck_with_trailer"
+    assert merged[21].state["articulated_rear_gap_mean"] >= -0.5
+    assert merged[21].state["articulated_rear_gap_mean"] <= 0.1
+    assert merged[21].state["articulated_rear_gap_std"] < 0.1
     assert processor.debug_records[-1].accepted is True
     assert processor.debug_records[-1].rejection_reason == "tail_gap"
 
@@ -406,7 +453,7 @@ def test_articulated_vehicle_merge_uses_tail_window_for_gap_acceptance() -> None
 
     merged = processor.process({front.track_id: front, rear.track_id: rear})
 
-    assert list(merged.keys()) == [32]
+    assert set(merged.keys()) == {32, 33}
     debug = processor.debug_records[-1]
     assert debug.accepted is True
     assert debug.rejection_reason == "tail_gap"
@@ -468,12 +515,18 @@ def test_articulated_vehicle_merge_recomputes_quality_metrics() -> None:
     score_processor = TrackQualityScoringPostprocessor(PostprocessingConfig(enable_track_quality_scoring=True), longitudinal_axis="y")
 
     merged_tracks = merge_processor.process({front.track_id: front, rear.track_id: rear})
-    scored_track = score_processor.process(merged_tracks)[30]
+    scored_tracks = score_processor.process(merged_tracks)
+    scored_front = scored_tracks[30]
+    scored_rear = scored_tracks[31]
 
-    assert scored_track.quality_score is not None
-    assert scored_track.quality_metrics["is_articulated_vehicle"] is True
-    assert scored_track.quality_metrics["is_long_vehicle"] is True
-    assert scored_track.quality_metrics["object_kind"] == "truck_with_trailer"
+    assert scored_front.quality_score is not None
+    assert scored_rear.quality_score is not None
+    assert scored_front.quality_metrics["is_articulated_vehicle"] is True
+    assert scored_rear.quality_metrics["is_articulated_vehicle"] is True
+    assert scored_front.quality_metrics["is_long_vehicle"] is True
+    assert scored_rear.quality_metrics["is_long_vehicle"] is True
+    assert scored_front.quality_metrics["object_kind"] == "truck_with_trailer"
+    assert scored_rear.quality_metrics["object_kind"] == "truck_with_trailer"
 
 
 def test_track_quality_scoring_populates_quality_fields() -> None:
