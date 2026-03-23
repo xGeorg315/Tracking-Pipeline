@@ -7,6 +7,18 @@ clustering:
   vehicle_min_points: 8
 tracking:
   algorithm: kalman_nn
+  max_dist: 8.5
+  max_missed: 20
+  sticky_extra_dist_per_missed: 1.0
+  sticky_max_dist: 13.5
+  association_size_weight: 0.02
+  fragment_parent_min_length: 3.8
+  fragment_max_lateral_offset: 1.2
+  fragment_max_vertical_offset: 0.9
+  fragment_child_max_length_ratio: 0.95
+  fragment_child_max_point_ratio: 1.0
+  fragment_max_rear_gap: 3.2
+  fragment_child_max_age: 6
 aggregation:
   algorithm: weighted_voxel_fusion
   frame_selection_method: length_coverage

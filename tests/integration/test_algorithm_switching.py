@@ -6,7 +6,6 @@ from pathlib import Path
 from tracking_pipeline.application.run_pipeline import run_pipeline
 from tracking_pipeline.config.loader import load_config
 
-
 def test_algorithm_switching_produces_distinct_runs(tmp_path: Path) -> None:
     project_root = Path(__file__).resolve().parents[2]
 

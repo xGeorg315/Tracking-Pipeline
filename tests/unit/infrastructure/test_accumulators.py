@@ -61,6 +61,30 @@ def _single_chunk_track(
     return track
 
 
+def _track_from_chunks(
+    chunks: list[np.ndarray],
+    *,
+    intensities: list[np.ndarray | None] | None = None,
+    start_frame: int = 0,
+    track_id: int = 52,
+) -> Track:
+    track = Track(track_id=track_id, hit_count=len(chunks), age=len(chunks), missed=0, ended_by_missed=True)
+    intensity_values = intensities if intensities is not None else [None for _ in chunks]
+    for offset, (chunk, chunk_intensity) in enumerate(zip(chunks, intensity_values)):
+        world_points = np.asarray(chunk, dtype=np.float32)
+        center = np.mean(world_points, axis=0).astype(np.float32) if len(world_points) > 0 else np.zeros((3,), dtype=np.float32)
+        track.centers.append(center.copy())
+        track.frame_ids.append(int(start_frame + offset))
+        track.world_points.append(world_points.copy())
+        track.local_points.append((world_points - center).astype(np.float32))
+        if chunk_intensity is not None:
+            scalar = np.asarray(chunk_intensity, dtype=np.float32)
+            track.world_intensity.append(scalar.copy())
+            track.local_intensity.append(scalar.copy())
+        track.bbox_extents.append(compute_extent(world_points))
+    return track
+
+
 def _symmetry_accumulator(
     *,
     enabled: bool = True,
@@ -201,6 +225,43 @@ class _SubsetRegistrationAccumulator(VoxelFusionAccumulator):
         }
 
 
+class _ScriptedPrepareAccumulator(VoxelFusionAccumulator):
+    fusion_method = "registration_voxel_fusion"
+
+    def __init__(
+        self,
+        config: AggregationConfig,
+        output_config: OutputConfig,
+        tracking_config: TrackingConfig,
+        *,
+        keep_indices: list[int],
+        chunk_weights: list[float] | None = None,
+    ):
+        super().__init__(config, output_config, tracking_config)
+        self.keep_indices = list(keep_indices)
+        self.chunk_weights = None if chunk_weights is None else [float(weight) for weight in chunk_weights]
+
+    def _prepare_for_fusion(self, chunks: list[np.ndarray]) -> tuple[list[np.ndarray], dict[str, object]]:
+        keep_indices = [int(index) for index in self.keep_indices if 0 <= int(index) < len(chunks)]
+        kept_chunks = [chunks[index] for index in keep_indices]
+        chunk_weights = self.chunk_weights if self.chunk_weights is not None and len(self.chunk_weights) == len(keep_indices) else [1.0 for _ in keep_indices]
+        pair_count = max(0, len(chunks) - 1)
+        accepted = max(0, len(keep_indices) - (1 if 0 in keep_indices else 0))
+        return kept_chunks, {
+            "alignment_method": "scripted",
+            "registration_backend": "scripted",
+            "registration_pairs": pair_count,
+            "registration_accepted": accepted,
+            "registration_rejected": max(0, pair_count - accepted),
+            "registration_input_chunk_count": len(chunks),
+            "registration_output_chunk_count": len(keep_indices),
+            "registration_dropped_count": max(0, len(chunks) - len(keep_indices)),
+            "registration_keep_indices": keep_indices,
+            "registration_chunk_weights": chunk_weights,
+            "registration_skipped": False,
+        }
+
+
 class _CapturingAccumulator(VoxelFusionAccumulator):
     def __init__(self, config: AggregationConfig, output_config: OutputConfig, tracking_config: TrackingConfig):
         super().__init__(config, output_config, tracking_config)
@@ -209,6 +270,7 @@ class _CapturingAccumulator(VoxelFusionAccumulator):
     def _apply_registration_subset(
         self,
         accumulation_input: list[np.ndarray],
+        prepared_chunks: list[np.ndarray],
         prepared_intensity: list[np.ndarray | None],
         selected_centers: list[np.ndarray],
         selected_frame_ids: list[int],
@@ -221,6 +283,7 @@ class _CapturingAccumulator(VoxelFusionAccumulator):
         self.captured["selected_frame_ids"] = list(selected_frame_ids)
         return super()._apply_registration_subset(
             accumulation_input,
+            prepared_chunks,
             prepared_intensity,
             selected_centers,
             selected_frame_ids,
@@ -229,10 +292,17 @@ class _CapturingAccumulator(VoxelFusionAccumulator):
 
 
 def test_voxel_fusion_accumulator_saves_track() -> None:
-    accumulator = VoxelFusionAccumulator(AggregationConfig(min_saved_aggregate_points=0), OutputConfig(), TrackingConfig())
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(min_saved_aggregate_points=0),
+        OutputConfig(require_track_exit=False),
+        TrackingConfig(),
+    )
     result = accumulator.accumulate(_track(), LaneBox.from_values([-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]))
     assert result.status == "saved"
     assert len(result.points) > 0
+    assert result.metrics["decision_stage"] == "saved"
+    assert result.metrics["decision_reason_code"] == "saved"
+    assert result.metrics["decision_summary"].startswith("saved points=")
     extent = compute_extent(result.points)
     assert result.metrics["vehicle_length_axis"] == "y"
     assert result.metrics["vehicle_width_axis"] == "x"
@@ -243,6 +313,132 @@ def test_voxel_fusion_accumulator_saves_track() -> None:
     assert np.isclose(result.metrics["extent_x"], float(extent[0]))
     assert np.isclose(result.metrics["extent_y"], float(extent[1]))
     assert np.isclose(result.metrics["extent_z"], float(extent[2]))
+
+
+def test_voxel_fusion_accumulator_reports_min_hits_decision() -> None:
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(min_saved_aggregate_points=0),
+        OutputConfig(require_track_exit=False),
+        TrackingConfig(min_track_hits=6),
+    )
+
+    result = accumulator.accumulate(_track(), LaneBox.from_values([-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]))
+
+    assert result.status == "skipped_min_hits"
+    assert result.metrics["decision_stage"] == "tracking_gate"
+    assert result.metrics["decision_reason_code"] == "min_hits"
+    assert result.metrics["decision_summary"] == "min_hits 5/6"
+    assert result.metrics["hit_count"] == 5
+    assert result.metrics["min_track_hits"] == 6
+
+
+def test_voxel_fusion_accumulator_reports_track_exit_decision() -> None:
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(min_saved_aggregate_points=0),
+        OutputConfig(require_track_exit=True, track_exit_edge_margin=0.9),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(_track(), LaneBox.from_values([-10.0, 10.0, -10.0, 10.0, 0.0, 2.0]))
+
+    assert result.status == "skipped_track_exit"
+    assert result.metrics["decision_stage"] == "exit_gate"
+    assert result.metrics["decision_reason_code"] == "track_exit"
+    assert result.metrics["decision_summary"] == "track_exit line=-9.10 center=3.00"
+    assert result.metrics["track_exited"] is False
+    assert result.metrics["track_exit_line_axis"] == "y"
+    assert result.metrics["track_exit_line_side"] == "min"
+    assert result.metrics["track_exit_line_value"] == -9.1
+    assert result.metrics["track_center_line_coordinate"] == 3.0
+    assert result.metrics["track_passed_exit_line"] is False
+    assert result.metrics["distance_to_exit_line"] == 12.1
+    assert result.metrics["closest_edge_distance"] == 12.1
+
+
+def test_voxel_fusion_accumulator_reports_empty_selection_decision() -> None:
+    track = Track(track_id=99, hit_count=1, age=1, missed=1, ended_by_missed=True)
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(min_saved_aggregate_points=0),
+        OutputConfig(require_track_exit=False),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]))
+
+    assert result.status == "empty_selection"
+    assert result.metrics["decision_stage"] == "selection"
+    assert result.metrics["decision_reason_code"] == "empty_selection"
+    assert result.metrics["decision_summary"] == "empty_selection selected=0"
+    assert result.metrics["selected_frame_count"] == 0
+
+
+def test_voxel_fusion_accumulator_reports_min_saved_points_decision() -> None:
+    track = _single_chunk_track(
+        np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [0.01, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+    )
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            min_saved_aggregate_points=5,
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.1,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, -1.0, 1.0, -1.0, 1.0]))
+
+    assert result.status == "skipped_min_saved_points"
+    assert result.metrics["decision_stage"] == "save_gate"
+    assert result.metrics["decision_reason_code"] == "min_saved_points"
+    assert result.metrics["decision_summary"] == "min_saved_points 1/5"
+    assert result.metrics["point_count_after_downsample"] == 1
+    assert result.metrics["min_saved_aggregate_points"] == 5
+
+
+def test_voxel_fusion_accumulator_reports_quality_threshold_decision() -> None:
+    track = _single_chunk_track(
+        np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [0.1, 0.0, 0.0],
+                [0.2, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+    )
+    track.quality_score = 0.2
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            min_saved_aggregate_points=0,
+            min_track_quality_for_save=0.5,
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.1,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, -1.0, 1.0, -1.0, 1.0]))
+
+    assert result.status == "skipped_quality_threshold"
+    assert result.metrics["decision_stage"] == "quality_gate"
+    assert result.metrics["decision_reason_code"] == "quality_threshold"
+    assert result.metrics["decision_summary"] == "quality 0.20<0.50"
+    assert result.metrics["quality_score"] == 0.2
+    assert result.metrics["quality_threshold"] == 0.5
 
 
 def test_voxel_fusion_accumulator_averages_intensity_per_voxel() -> None:
@@ -484,6 +680,50 @@ def test_lane_end_touch_filter_limits_length_coverage_to_prefix() -> None:
     assert result.metrics["lane_end_touch_found"] is True
     assert result.metrics["lane_end_touch_frame_id"] == 202
     assert 203 not in result.selected_frame_ids
+
+
+def test_lane_end_touch_filter_limits_tail_coverage_to_prefix() -> None:
+    track = Track(track_id=91, hit_count=4, age=4, missed=1, ended_by_missed=True)
+    for frame_id, center_y in ((10, 3.0), (11, 1.8), (12, 0.05), (13, -0.6)):
+        points = np.array(
+            [
+                [0.0, center_y - 0.15, 0.0],
+                [0.0, center_y + 0.15, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        center = np.mean(points, axis=0).astype(np.float32)
+        track.centers.append(center)
+        track.frame_ids.append(frame_id)
+        track.world_points.append(points.copy())
+        track.local_points.append((points - center).astype(np.float32))
+        track.bbox_extents.append(compute_extent(points))
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            frame_selection_method="tail_coverage",
+            use_all_frames=False,
+            top_k_frames=2,
+            keyframe_keep=2,
+            length_coverage_bins=4,
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.1,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            truncate_after_lane_end_touch=True,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, 0.0, 10.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert result.selected_frame_ids == [11, 12]
+    assert result.metrics["lane_end_touch_found"] is True
+    assert result.metrics["tail_window_start_index"] == 1
+    assert result.metrics["tail_window_size"] == 2
+    assert 13 not in result.selected_frame_ids
 
 
 def test_motion_deskew_disabled_leaves_distorted_local_extent_unchanged() -> None:
@@ -729,8 +969,13 @@ def test_symmetry_completion_skips_when_all_points_stay_in_center_strip() -> Non
 
 def test_registration_voxel_fusion_accumulator_falls_back_without_backend() -> None:
     accumulator = RegistrationVoxelFusionAccumulator(
-        AggregationConfig(algorithm="registration_voxel_fusion", min_saved_aggregate_points=0),
-        OutputConfig(),
+        AggregationConfig(
+            algorithm="registration_voxel_fusion",
+            min_saved_aggregate_points=0,
+            enable_registration_underfill_fallback=True,
+            registration_min_kept_chunks=4,
+        ),
+        OutputConfig(require_track_exit=False),
         TrackingConfig(),
     )
     if hasattr(accumulator.backend, "_small_gicp"):
@@ -742,6 +987,12 @@ def test_registration_voxel_fusion_accumulator_falls_back_without_backend() -> N
     assert result.metrics["registration_input_chunk_count"] == 3
     assert result.metrics["registration_output_chunk_count"] == 3
     assert result.metrics["registration_dropped_count"] == 0
+    assert result.metrics["registration_fallback_applied"] is False
+    assert result.metrics["registration_fallback_min_kept_chunks"] == 4
+    assert result.metrics["registration_attempt_output_chunk_count"] == 3
+    assert result.metrics["registration_attempt_dropped_count"] == 0
+    assert result.metrics["registration_attempt_keep_indices"] == [0, 1, 2]
+    assert result.metrics["registration_attempt_chunk_weights"] == [1.0, 1.0, 1.0]
 
 
 def test_registration_backend_keeps_only_anchor_and_accepted_chunks() -> None:
@@ -803,6 +1054,111 @@ def test_registration_subset_keeps_frame_ids_intensity_and_chunk_weights_aligned
     assert result.intensity is not None
     assert len(result.intensity) == 2
     assert np.allclose(np.sort(result.intensity), np.array([0.1, 0.9], dtype=np.float32))
+
+
+def test_registration_underfill_fallback_restores_all_selected_chunks_and_attempt_metrics() -> None:
+    chunks = [_constant_chunk(float(x_value)) for x_value in (0.0, 10.0, 20.0, 30.0)]
+    intensities = [np.full((len(chunk),), value, dtype=np.float32) for chunk, value in zip(chunks, (0.1, 0.2, 0.3, 0.4))]
+    track = _track_from_chunks(chunks, intensities=intensities, start_frame=200, track_id=71)
+    accumulator = _ScriptedPrepareAccumulator(
+        AggregationConfig(
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.1,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            enable_registration_underfill_fallback=True,
+            registration_min_kept_chunks=4,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+        keep_indices=[0],
+        chunk_weights=[1.0],
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 31.0, -1.0, 1.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert result.selected_frame_ids == [200, 201, 202, 203]
+    assert result.metrics["registration_fallback_applied"] is True
+    assert result.metrics["registration_fallback_min_kept_chunks"] == 4
+    assert result.metrics["registration_input_chunk_count"] == 4
+    assert result.metrics["registration_output_chunk_count"] == 4
+    assert result.metrics["registration_dropped_count"] == 0
+    assert result.metrics["registration_keep_indices"] == [0, 1, 2, 3]
+    assert result.metrics["registration_chunk_weights"] == [1.0, 1.0, 1.0, 1.0]
+    assert result.metrics["registration_attempt_output_chunk_count"] == 1
+    assert result.metrics["registration_attempt_dropped_count"] == 3
+    assert result.metrics["registration_attempt_keep_indices"] == [0]
+    assert result.metrics["registration_attempt_chunk_weights"] == [1.0]
+    assert result.intensity is not None
+    assert np.allclose(np.unique(np.round(result.intensity, decimals=1)), np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32))
+
+
+def test_registration_underfill_fallback_does_not_apply_when_threshold_is_met() -> None:
+    chunks = [_constant_chunk(float(x_value)) for x_value in (0.0, 10.0, 20.0, 30.0)]
+    track = _track_from_chunks(chunks, start_frame=300, track_id=72)
+    accumulator = _ScriptedPrepareAccumulator(
+        AggregationConfig(
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.1,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            enable_registration_underfill_fallback=True,
+            registration_min_kept_chunks=4,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+        keep_indices=[0, 1, 2, 3],
+        chunk_weights=[1.0, 0.9, 0.8, 0.7],
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 31.0, -1.0, 1.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert result.selected_frame_ids == [300, 301, 302, 303]
+    assert result.metrics["registration_fallback_applied"] is False
+    assert result.metrics["registration_output_chunk_count"] == 4
+    assert result.metrics["registration_keep_indices"] == [0, 1, 2, 3]
+    assert result.metrics["registration_chunk_weights"] == [1.0, 0.9, 0.8, 0.7]
+    assert result.metrics["registration_attempt_output_chunk_count"] == 4
+    assert result.metrics["registration_attempt_keep_indices"] == [0, 1, 2, 3]
+    assert result.metrics["registration_attempt_chunk_weights"] == [1.0, 0.9, 0.8, 0.7]
+
+
+def test_registration_underfill_fallback_restores_all_preselected_chunks_even_below_threshold() -> None:
+    chunks = [_constant_chunk(float(x_value)) for x_value in (0.0, 10.0, 20.0)]
+    track = _track_from_chunks(chunks, start_frame=400, track_id=73)
+    accumulator = _ScriptedPrepareAccumulator(
+        AggregationConfig(
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.1,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            enable_registration_underfill_fallback=True,
+            registration_min_kept_chunks=4,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+        keep_indices=[0],
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 21.0, -1.0, 1.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert result.selected_frame_ids == [400, 401, 402]
+    assert result.metrics["registration_fallback_applied"] is True
+    assert result.metrics["registration_output_chunk_count"] == 3
+    assert result.metrics["registration_dropped_count"] == 0
+    assert result.metrics["registration_keep_indices"] == [0, 1, 2]
+    assert result.metrics["registration_chunk_weights"] == [1.0, 1.0, 1.0]
+    assert result.metrics["registration_attempt_output_chunk_count"] == 1
+    assert result.metrics["registration_attempt_keep_indices"] == [0]
 
 
 def test_voxel_fusion_stat_filter_keeps_intensity_aligned() -> None:
@@ -924,6 +1280,28 @@ def test_long_vehicle_quality_threshold_uses_long_vehicle_override() -> None:
     result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]))
     assert result.status == "saved"
     assert result.metrics["long_vehicle_mode_applied"] is True
+
+
+def test_explicit_center_diversity_selection_is_not_overridden_for_long_vehicle() -> None:
+    track = _track_from_profile([80, 90, 100, 110], [5.0, 5.2, 5.4, 5.6], start_frame=500)
+    accumulator = WeightedVoxelFusionAccumulator(
+        AggregationConfig(
+            algorithm="weighted_voxel_fusion",
+            frame_selection_method="center_diversity",
+            keyframe_keep=3,
+            long_vehicle_mode=True,
+            frame_downsample_voxel=0.0,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+    )
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, 0.0, 20.0, 0.0, 2.0]))
+    assert result.status == "saved"
+    assert result.metrics["long_vehicle_mode_applied"] is True
+    assert result.metrics["frame_selection_method"] == "center_diversity"
 
 
 def test_weighted_voxel_fusion_long_vehicle_quality_mode_ignores_longitudinal_extent_variation() -> None:
@@ -1071,6 +1449,37 @@ def test_chunk_quality_filter_removes_weak_tail_before_keyframe_motion() -> None
     assert max(result.selected_frame_ids) <= 104
 
 
+def test_chunk_quality_filter_removes_weak_tail_before_quality_coverage() -> None:
+    track = _track_from_profile(
+        point_counts=[35, 70, 120, 130, 125, 30, 20, 15],
+        extent_ys=[1.0, 2.0, 4.0, 4.2, 4.1, 0.9, 0.7, 0.5],
+    )
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            frame_selection_method="quality_coverage",
+            keyframe_keep=3,
+            length_coverage_bins=4,
+            frame_downsample_voxel=0.0,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, 0.0, 20.0, 0.0, 2.0]))
+
+    assert result.status == "saved"
+    assert result.metrics["frame_selection_method"] == "quality_coverage"
+    assert result.metrics["chunk_quality_total"] == 8
+    assert result.metrics["chunk_quality_kept"] == 4
+    assert result.metrics["chunk_quality_segment_start_frame"] == 101
+    assert result.metrics["chunk_quality_segment_end_frame"] == 104
+    assert 107 not in result.selected_frame_ids
+    assert max(result.selected_frame_ids) <= 104
+
+
 def test_chunk_quality_filter_expands_short_peak_segment() -> None:
     track = _track_from_profile(
         point_counts=[15, 20, 25, 100, 28, 18, 12],
@@ -1139,3 +1548,240 @@ def test_min_saved_aggregate_points_keeps_large_artifacts() -> None:
 
     assert result.status == "saved"
     assert result.metrics["point_count_after_downsample"] >= 180
+
+
+def test_confidence_point_cap_disabled_leaves_saved_aggregate_unclipped() -> None:
+    points = np.stack(
+        [
+            np.zeros((32,), dtype=np.float32),
+            np.linspace(0.0, 3.1, 32, dtype=np.float32),
+            np.zeros((32,), dtype=np.float32),
+        ],
+        axis=1,
+    ).astype(np.float32)
+    track = _single_chunk_track(points)
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.01,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            enable_confidence_point_cap=False,
+            confidence_point_cap_max_points=8,
+            confidence_point_cap_bins=4,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, -1.0, 5.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert len(result.points) == 32
+    assert result.metrics["confidence_point_cap_enabled"] is False
+    assert result.metrics["confidence_point_cap_applied"] is False
+    assert result.metrics["point_count_before_confidence_cap"] == 32
+    assert result.metrics["point_count_after_confidence_cap"] == 32
+
+
+def test_confidence_point_cap_limits_saved_aggregate_to_target_points() -> None:
+    points = np.stack(
+        [
+            np.zeros((32,), dtype=np.float32),
+            np.linspace(0.0, 3.1, 32, dtype=np.float32),
+            np.zeros((32,), dtype=np.float32),
+        ],
+        axis=1,
+    ).astype(np.float32)
+    track = _single_chunk_track(points)
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.01,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            enable_confidence_point_cap=True,
+            confidence_point_cap_max_points=8,
+            confidence_point_cap_bins=4,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, -1.0, 5.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert len(result.points) == 8
+    assert result.metrics["confidence_point_cap_enabled"] is True
+    assert result.metrics["confidence_point_cap_applied"] is True
+    assert result.metrics["confidence_point_cap_target"] == 8
+    assert result.metrics["confidence_point_cap_bins"] == 4
+    assert result.metrics["point_count_before_confidence_cap"] == 32
+    assert result.metrics["point_count_after_confidence_cap"] == 8
+    assert result.metrics["point_count_after_downsample"] == 8
+
+
+def test_confidence_point_cap_does_not_fill_when_aggregate_is_under_budget() -> None:
+    points = np.stack(
+        [
+            np.zeros((6,), dtype=np.float32),
+            np.linspace(0.0, 1.0, 6, dtype=np.float32),
+            np.zeros((6,), dtype=np.float32),
+        ],
+        axis=1,
+    ).astype(np.float32)
+    track = _single_chunk_track(points)
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.01,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            enable_confidence_point_cap=True,
+            confidence_point_cap_max_points=8,
+            confidence_point_cap_bins=4,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, -1.0, 5.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert len(result.points) == 6
+    assert result.metrics["confidence_point_cap_applied"] is False
+    assert result.metrics["point_count_before_confidence_cap"] == 6
+    assert result.metrics["point_count_after_confidence_cap"] == 6
+
+
+def test_confidence_point_cap_runs_before_symmetry_completion() -> None:
+    track = _single_chunk_track(
+        np.array(
+            [
+                [0.22, 0.00, 1.0],
+                [0.22, 0.12, 1.0],
+                [0.22, 0.24, 1.0],
+                [0.22, 0.36, 1.0],
+            ],
+            dtype=np.float32,
+        ),
+        center=np.zeros((3,), dtype=np.float32),
+    )
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            symmetry_completion=True,
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.01,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            enable_confidence_point_cap=True,
+            confidence_point_cap_max_points=2,
+            confidence_point_cap_bins=1,
+        ),
+        OutputConfig(require_track_exit=False, save_world=False),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, -1.0, 1.0, 0.0, 2.0]))
+
+    assert result.status == "saved"
+    assert result.metrics["confidence_point_cap_applied"] is True
+    assert result.metrics["point_count_before_confidence_cap"] == 4
+    assert result.metrics["point_count_after_confidence_cap"] == 2
+    assert result.metrics["symmetry_completion_applied"] is True
+    assert result.metrics["point_count_before_symmetry_completion"] == 2
+    assert result.metrics["point_count_after_symmetry_completion"] == 4
+    assert result.metrics["point_count_after_downsample"] == 4
+    assert len(result.points) == 4
+
+
+def test_confidence_point_cap_preserves_longitudinal_coverage_with_bins_plus_rest() -> None:
+    first_bin = np.stack(
+        [np.zeros((12,), dtype=np.float32), np.linspace(0.0, 0.9, 12, dtype=np.float32), np.zeros((12,), dtype=np.float32)],
+        axis=1,
+    ).astype(np.float32)
+    second_bin = np.stack(
+        [np.zeros((3,), dtype=np.float32), np.linspace(2.0, 2.2, 3, dtype=np.float32), np.zeros((3,), dtype=np.float32)],
+        axis=1,
+    ).astype(np.float32)
+    third_bin = np.stack(
+        [np.zeros((3,), dtype=np.float32), np.linspace(4.0, 4.2, 3, dtype=np.float32), np.zeros((3,), dtype=np.float32)],
+        axis=1,
+    ).astype(np.float32)
+    fourth_bin = np.stack(
+        [np.zeros((3,), dtype=np.float32), np.linspace(6.0, 6.2, 3, dtype=np.float32), np.zeros((3,), dtype=np.float32)],
+        axis=1,
+    ).astype(np.float32)
+    track = _single_chunk_track(np.vstack([first_bin, second_bin, third_bin, fourth_bin]).astype(np.float32))
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            frame_selection_method="all_track_frames",
+            frame_selection_line_axis="y",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.01,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            enable_confidence_point_cap=True,
+            confidence_point_cap_max_points=8,
+            confidence_point_cap_bins=4,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, -1.0, 8.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert len(result.points) == 8
+    selected_y = np.asarray(result.points[:, 1], dtype=np.float32)
+    assert np.sum(selected_y < 1.5) == 2
+    assert np.sum((selected_y >= 1.5) & (selected_y < 3.0)) == 2
+    assert np.sum((selected_y >= 3.0) & (selected_y < 5.0)) == 2
+    assert np.sum(selected_y >= 5.0) == 2
+
+
+def test_confidence_point_cap_prefers_points_with_higher_weighted_support() -> None:
+    weak_chunk = np.array([[0.0, 0.2, 0.0]], dtype=np.float32)
+    strong_chunk = np.array(
+        [
+            [0.0, 1.0, 0.0],
+            [0.0, 1.1, 0.0],
+            [0.0, 1.2, 0.0],
+            [0.0, 1.3, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    track = _track_from_chunks([weak_chunk, strong_chunk], track_id=77)
+    accumulator = WeightedVoxelFusionAccumulator(
+        AggregationConfig(
+            algorithm="weighted_voxel_fusion",
+            fusion_weight_mode="point_count",
+            frame_selection_method="all_track_frames",
+            frame_selection_line_axis="y",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.01,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            enable_confidence_point_cap=True,
+            confidence_point_cap_max_points=2,
+            confidence_point_cap_bins=1,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 1.0, -1.0, 4.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert len(result.points) == 2
+    assert np.all(np.asarray(result.points[:, 1], dtype=np.float32) >= 1.0)

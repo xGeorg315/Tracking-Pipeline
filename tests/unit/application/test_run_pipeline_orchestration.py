@@ -12,11 +12,24 @@ from tracking_pipeline.config.models import (
     InputConfig,
     OutputConfig,
     PipelineConfig,
+    PostprocessingConfig,
     PreprocessingConfig,
     TrackingConfig,
     VisualizationConfig,
 )
-from tracking_pipeline.domain.models import AggregateResult, ClusterResult, Detection, FrameData, FrameTrackingState, ObjectLabelData, Track
+from tracking_pipeline.domain.models import (
+    ActiveTrackState,
+    AggregateResult,
+    ClusterResult,
+    Detection,
+    FrameData,
+    FrameTrackerDebug,
+    FrameTrackingState,
+    ObjectLabelData,
+    Track,
+    TrackOutcomeDebug,
+)
+from tracking_pipeline.infrastructure.postprocessing.articulated_vehicle_merge import ArticulatedVehicleMergePostprocessor
 
 
 class _FakeReader:
@@ -25,7 +38,8 @@ class _FakeReader:
             FrameData(
                 frame_index=index,
                 timestamp_ns=index + 1,
-                points=np.zeros((1, 3), dtype=np.float32),
+                points=np.array([[float(index), 0.0, 0.0]], dtype=np.float32),
+                point_intensity=np.array([0.25 + 0.25 * float(index)], dtype=np.float32),
                 source_path=input_path,
                 source_frame_index=0,
                 source_sequence_index=index,
@@ -61,7 +75,14 @@ class _FakeTracker:
         _ = detections
         _ = frame_timestamp_ns
         self.seen_frame_ids.append(int(frame_idx))
-        return FrameTrackingState(frame_index=int(frame_idx), lane_points=np.zeros((0, 3), dtype=np.float32), detections=[], active_tracks=[])
+        return FrameTrackingState(
+            frame_index=int(frame_idx),
+            lane_points=np.zeros((0, 3), dtype=np.float32),
+            detections=[],
+            active_tracks=[],
+            tracker_metrics={"assignment_method": "fake", "matched_count": 0},
+            tracker_debug=FrameTrackerDebug(assignment_method="fake"),
+        )
 
     def finalize(self):
         return {1: self.track}
@@ -79,11 +100,34 @@ class _FakeAccumulator:
         )
 
 
+class _FakeStateAwareAccumulator:
+    def accumulate(self, track: Track, lane_box):
+        _ = lane_box
+        metrics = {}
+        if bool(track.state.get("articulated_vehicle")):
+            metrics["articulated_vehicle"] = True
+            metrics["articulated_component_track_ids"] = list(track.state.get("articulated_component_track_ids") or [])
+            metrics["articulated_rear_gap_mean"] = float(track.state.get("articulated_rear_gap_mean", 0.0))
+            metrics["articulated_rear_gap_std"] = float(track.state.get("articulated_rear_gap_std", 0.0))
+            metrics["object_kind"] = str(track.state.get("object_kind") or "truck_with_trailer")
+        return AggregateResult(
+            track_id=track.track_id,
+            points=np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+            selected_frame_ids=list(track.frame_ids),
+            status="saved",
+            metrics=metrics,
+        )
+
+
 class _FakeWriter:
     def __init__(self, base: Path):
         self.base = base
         self.object_labels = None
         self.aggregate_write_intensity_flags: list[bool] = []
+        self.tracker_debug_states = None
+        self.track_outcomes = None
+        self.written_tracks = None
+        self.written_aggregate_results = None
 
     def prepare_run_dir(self, config):
         _ = config
@@ -104,8 +148,17 @@ class _FakeWriter:
         (run_dir / "summary.txt").write_text(str(summary.saved_aggregates), encoding="utf-8")
 
     def write_tracks(self, run_dir, tracks, aggregate_results):
-        _ = tracks, aggregate_results
+        self.written_tracks = tracks
+        self.written_aggregate_results = aggregate_results
         (run_dir / "tracks.txt").write_text("tracks\n", encoding="utf-8")
+
+    def write_tracker_debug(self, run_dir, states):
+        self.tracker_debug_states = states
+        (run_dir / "tracker_debug.txt").write_text(str(len(states)), encoding="utf-8")
+
+    def write_track_outcomes(self, run_dir, track_outcomes):
+        self.track_outcomes = track_outcomes
+        (run_dir / "track_outcomes.txt").write_text(str(len(track_outcomes)), encoding="utf-8")
 
     def write_object_list(self, run_dir, object_labels):
         self.object_labels = object_labels
@@ -116,11 +169,15 @@ class _FakeViewer:
     def __init__(self):
         self.states = None
         self.aggregate_results = None
+        self.track_outcomes = None
+        self.articulated_merge_debug_events = None
 
-    def replay(self, states, lane_box, aggregate_results):
+    def replay(self, states, lane_box, aggregate_results, track_outcomes, articulated_merge_debug_events):
         _ = lane_box
         self.states = states
         self.aggregate_results = aggregate_results
+        self.track_outcomes = track_outcomes
+        self.articulated_merge_debug_events = articulated_merge_debug_events
 
 
 class _FakeObjectReader:
@@ -196,6 +253,82 @@ class _FakeObjectReader:
         ]
 
 
+def _box_points(center: np.ndarray, *, width: float, length: float, height: float) -> np.ndarray:
+    signs = np.asarray(
+        [
+            [-1.0, -1.0, -1.0],
+            [-1.0, -1.0, 1.0],
+            [-1.0, 1.0, -1.0],
+            [-1.0, 1.0, 1.0],
+            [1.0, -1.0, -1.0],
+            [1.0, -1.0, 1.0],
+            [1.0, 1.0, -1.0],
+            [1.0, 1.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    scale = np.asarray([width * 0.5, length * 0.5, height * 0.5], dtype=np.float32)
+    return center.astype(np.float32) + signs * scale
+
+
+def _articulated_track(
+    track_id: int,
+    frame_ids: list[int],
+    longitudinal_centers: list[float],
+    *,
+    lateral_center: float = 0.0,
+    vertical_center: float = 1.0,
+    width: float = 0.9,
+    length: float = 3.4,
+    height: float = 1.4,
+) -> Track:
+    track = Track(track_id=track_id, age=len(frame_ids), hit_count=len(frame_ids), ended_by_missed=True, source_track_ids=[track_id])
+    extent = np.asarray([width, length, height], dtype=np.float32)
+    for frame_id, longitudinal_center in zip(frame_ids, longitudinal_centers):
+        center = np.asarray([lateral_center, longitudinal_center, vertical_center], dtype=np.float32)
+        points = _box_points(center, width=width, length=length, height=height)
+        track.add_observation(center, points, frame_id, frame_id * 1_000_000, extent)
+    track.age = max(track.age, track.last_frame - track.first_frame + 1)
+    track.hit_count = len(track.frame_ids)
+    return track
+
+
+class _FakeArticulatedTracker:
+    def __init__(self):
+        self.seen_frame_ids: list[int] = []
+        self.front = _articulated_track(11, [0, 1, 2, 3], [10.0, 11.0, 12.0, 13.0], lateral_center=0.0)
+        self.rear = _articulated_track(12, [0, 1, 2, 3], [6.8, 7.8, 8.8, 9.8], lateral_center=0.1)
+
+    def step(self, detections, frame_idx, frame_timestamp_ns):
+        _ = detections
+        _ = frame_timestamp_ns
+        self.seen_frame_ids.append(int(frame_idx))
+        active_tracks: list[ActiveTrackState] = []
+        for track in (self.front, self.rear):
+            if int(frame_idx) not in track.frame_ids:
+                continue
+            observation_index = track.frame_ids.index(int(frame_idx))
+            active_tracks.append(
+                ActiveTrackState(
+                    track_id=int(track.track_id),
+                    points=np.asarray(track.world_points[observation_index], dtype=np.float32).copy(),
+                    center=np.asarray(track.centers[observation_index], dtype=np.float32).copy(),
+                    intensity=None if observation_index >= len(track.world_intensity) else track.world_intensity[observation_index],
+                )
+            )
+        return FrameTrackingState(
+            frame_index=int(frame_idx),
+            lane_points=np.zeros((0, 3), dtype=np.float32),
+            detections=[],
+            active_tracks=active_tracks,
+            tracker_metrics={"assignment_method": "fake", "matched_count": 0},
+            tracker_debug=FrameTrackerDebug(assignment_method="fake"),
+        )
+
+    def finalize(self):
+        return {self.front.track_id: self.front, self.rear.track_id: self.rear}
+
+
 def test_run_pipeline_orchestrates_dependencies(monkeypatch, tmp_path: Path) -> None:
     config = PipelineConfig(
         input=InputConfig(paths=["ignored_a.pb", "ignored_b.pb"]),
@@ -224,6 +357,11 @@ def test_run_pipeline_orchestrates_dependencies(monkeypatch, tmp_path: Path) -> 
     assert fake_tracker.seen_frame_ids == [0, 1]
     assert fake_writer.aggregate_write_intensity_flags == [False]
     assert (tmp_path / "run" / "summary.txt").exists()
+    assert (tmp_path / "run" / "tracker_debug.txt").exists()
+    assert (tmp_path / "run" / "track_outcomes.txt").exists()
+    assert len(fake_writer.tracker_debug_states) == 2
+    assert isinstance(fake_writer.track_outcomes[1], TrackOutcomeDebug)
+    assert fake_writer.track_outcomes[1].status == "saved"
 
 
 def test_run_pipeline_exports_latest_object_list_observation(monkeypatch, tmp_path: Path) -> None:
@@ -281,6 +419,43 @@ def test_run_pipeline_passes_aggregate_intensity_flag_to_writer(monkeypatch, tmp
     assert fake_writer.aggregate_write_intensity_flags == [True]
 
 
+def test_run_pipeline_merges_articulated_vehicle_tracks(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(paths=["ignored_a.pb", "ignored_b.pb", "ignored_c.pb", "ignored_d.pb"]),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(frame_selection_line_axis="y"),
+        postprocessing=PostprocessingConfig(enable_articulated_vehicle_merge=True, enable_track_quality_scoring=True),
+        output=OutputConfig(root_dir=str(tmp_path)),
+        visualization=VisualizationConfig(),
+    )
+
+    fake_writer = _FakeWriter(tmp_path)
+    fake_tracker = _FakeArticulatedTracker()
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_reader", lambda cfg: _FakeReader())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: fake_tracker)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeStateAwareAccumulator())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda root: fake_writer)
+
+    summary = run_pipeline(config, tmp_path)
+
+    assert summary.finished_track_count == 1
+    assert summary.saved_aggregates == 1
+    assert summary.postprocessing_methods == ["articulated_vehicle_merge", "track_quality_scoring"]
+    assert fake_tracker.seen_frame_ids == [0, 1, 2, 3]
+    assert set(fake_writer.written_tracks.keys()) == {11}
+    merged_track = fake_writer.written_tracks[11]
+    assert merged_track.state["articulated_vehicle"] is True
+    assert merged_track.state["articulated_component_track_ids"] == [11, 12]
+    assert merged_track.quality_metrics["is_articulated_vehicle"] is True
+    assert merged_track.quality_metrics["object_kind"] == "truck_with_trailer"
+    assert len(fake_writer.written_aggregate_results) == 1
+    assert fake_writer.written_aggregate_results[0].metrics["articulated_vehicle"] is True
+    assert fake_writer.written_aggregate_results[0].metrics["articulated_component_track_ids"] == [11, 12]
+
+
 def test_replay_run_uses_multi_file_input_without_tracker_reset(monkeypatch, tmp_path: Path) -> None:
     config = PipelineConfig(
         input=InputConfig(paths=["ignored_a.pb", "ignored_b.pb"]),
@@ -305,4 +480,45 @@ def test_replay_run_uses_multi_file_input_without_tracker_reset(monkeypatch, tmp
 
     assert fake_tracker.seen_frame_ids == [0, 1]
     assert [state.frame_index for state in fake_viewer.states] == [0, 1]
+    assert np.allclose(fake_viewer.states[0].full_frame_points, np.array([[0.0, 0.0, 0.0]], dtype=np.float32))
+    assert np.allclose(fake_viewer.states[1].full_frame_points, np.array([[1.0, 0.0, 0.0]], dtype=np.float32))
+    assert np.allclose(fake_viewer.states[0].full_frame_intensity, np.array([0.25], dtype=np.float32))
+    assert np.allclose(fake_viewer.states[1].full_frame_intensity, np.array([0.5], dtype=np.float32))
     assert set(fake_viewer.aggregate_results.keys()) == {1}
+    assert set(fake_viewer.track_outcomes.keys()) == {1}
+    assert fake_viewer.articulated_merge_debug_events == []
+
+
+def test_replay_run_passes_articulated_merge_debug_events_to_viewer(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(paths=["ignored_a.pb", "ignored_b.pb", "ignored_c.pb", "ignored_d.pb"]),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(frame_selection_line_axis="y"),
+        postprocessing=PostprocessingConfig(enable_articulated_vehicle_merge=True),
+        output=OutputConfig(root_dir=str(tmp_path)),
+        visualization=VisualizationConfig(show_articulated_merge_debug=True),
+    )
+
+    fake_tracker = _FakeArticulatedTracker()
+    fake_viewer = _FakeViewer()
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_reader", lambda cfg: _FakeReader())
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_tracker", lambda cfg: fake_tracker)
+    monkeypatch.setattr(
+        "tracking_pipeline.application.replay_run.build_track_postprocessors",
+        lambda cfg: [ArticulatedVehicleMergePostprocessor(cfg.postprocessing, longitudinal_axis=cfg.aggregation.frame_selection_line_axis)],
+    )
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_accumulator", lambda cfg: _FakeAccumulator())
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_viewer", lambda cfg: fake_viewer)
+
+    replay_run(config, tmp_path)
+
+    assert len(fake_viewer.articulated_merge_debug_events) == 1
+    event = fake_viewer.articulated_merge_debug_events[0]
+    assert event.accepted is True
+    assert (event.lead_track_id, event.rear_track_id) == (11, 12)
+    assert event.rejection_reason == "tail_gap"
+    assert event.center is not None
+    assert np.all(np.isfinite(event.center))

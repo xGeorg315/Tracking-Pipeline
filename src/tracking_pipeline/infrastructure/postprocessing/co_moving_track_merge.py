@@ -126,6 +126,19 @@ class CoMovingTrackMergePostprocessor:
         merged.source_track_ids = list(dict.fromkeys((left.source_track_ids or [left.track_id]) + (right.source_track_ids or [right.track_id])))
         merged.quality_score = None
         merged.quality_metrics = {}
+        merged.state = {**left.state, **right.state}
+        if bool(left.state.get("articulated_vehicle")) or bool(right.state.get("articulated_vehicle")):
+            merged.state["articulated_vehicle"] = True
+            component_ids = []
+            for track in (left, right):
+                component_ids.extend(track.state.get("articulated_component_track_ids") or track.source_track_ids or [track.track_id])
+            merged.state["articulated_component_track_ids"] = list(dict.fromkeys(component_ids))
+            for key in ("articulated_rear_gap_mean", "articulated_rear_gap_std", "object_kind"):
+                value = left.state.get(key)
+                if value is None:
+                    value = right.state.get(key)
+                if value is not None:
+                    merged.state[key] = value
         return merged
 
     def _by_frame(

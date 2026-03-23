@@ -15,6 +15,13 @@ def _pack_xyz(points: list[list[float]]) -> bytes:
     return np.asarray(points, dtype="<f4").reshape(-1, 3).tobytes()
 
 
+def _copy_sample_pb(path: Path) -> Path:
+    fixture = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "sample_a42.pb"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(fixture.read_bytes())
+    return path
+
+
 def _write_object_list_fixture(path: Path) -> Path:
     calibration = common.SensorCalibration(sensor_name="sensor_a")
     frames = [
@@ -76,7 +83,7 @@ def _write_object_list_fixture(path: Path) -> Path:
 
 def test_run_pipeline_creates_run_artifacts(tmp_path: Path) -> None:
     project_root = Path(__file__).resolve().parents[2]
-    config = load_config(project_root / "configs" / "kalman_voxel.yaml")
+    config = load_config(project_root / "configs" / "euclidean_voxel.yaml")
     config.output.root_dir = str(tmp_path)
 
     summary = run_pipeline(config, project_root)
@@ -87,7 +94,7 @@ def test_run_pipeline_creates_run_artifacts(tmp_path: Path) -> None:
     assert (run_dir / "summary.json").exists()
     assert (run_dir / "tracks.jsonl").exists()
     payload = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-    assert payload["tracker_algorithm"] == "kalman_nn"
+    assert payload["tracker_algorithm"] == "euclidean_nn"
     assert payload["accumulator_algorithm"] == "voxel_fusion"
     assert payload["input_paths"] == config.input.paths
     assert "performance" in payload
@@ -109,6 +116,44 @@ def test_run_pipeline_accepts_multiple_input_files_as_one_sequence(tmp_path: Pat
     assert summary.frame_count == 20
     assert payload["frame_count"] == 20
     assert payload["input_paths"] == [str(fixture), str(fixture)]
+
+
+def test_run_pipeline_expands_directory_input_to_sorted_pb_sequence(tmp_path: Path) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    sequence_dir = tmp_path / "sequence"
+    first = _copy_sample_pb(sequence_dir / "02_second.pb")
+    second = _copy_sample_pb(sequence_dir / "01_first.pb")
+    (sequence_dir / "ignore.txt").write_text("not a sequence file", encoding="utf-8")
+
+    config_path = tmp_path / "dir_input.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - sequence",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-2.10, 1.80, 4.0, 35.30, 0.12, 5.15]",
+                "tracking:",
+                "  algorithm: euclidean_nn",
+                "output:",
+                f"  root_dir: {tmp_path / 'dir_runs'}",
+                "  require_track_exit: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+
+    summary = run_pipeline(config, project_root)
+    payload = json.loads((Path(summary.output_dir) / "summary.json").read_text(encoding="utf-8"))
+
+    assert summary.frame_count == 20
+    assert payload["frame_count"] == 20
+    assert payload["input_paths"] == [str(second.resolve()), str(first.resolve())]
+    assert payload["input_path"] == str(second.resolve())
 
 
 def test_run_pipeline_exports_latest_object_list_artifacts(tmp_path: Path) -> None:

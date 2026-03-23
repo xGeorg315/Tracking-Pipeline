@@ -22,7 +22,17 @@ SUPPORTED_ACCUMULATORS = {
     "weighted_voxel_fusion",
     "occupancy_consensus_fusion",
 }
-SUPPORTED_FRAME_SELECTION_METHODS = {"auto", "all_track_frames", "line_touch_last_k", "keyframe_motion", "length_coverage", "max_extent"}
+SUPPORTED_FRAME_SELECTION_METHODS = {
+    "auto",
+    "all_track_frames",
+    "line_touch_last_k",
+    "keyframe_motion",
+    "length_coverage",
+    "quality_coverage",
+    "tail_coverage",
+    "center_diversity",
+    "max_extent",
+}
 SUPPORTED_REGISTRATION_BACKENDS = {"small_gicp", "icp_point_to_plane", "generalized_icp", "feature_global_then_local"}
 SUPPORTED_FUSION_WEIGHT_MODES = {"uniform", "point_count", "quality"}
 
@@ -57,6 +67,18 @@ def validate_config(config: PipelineConfig) -> None:
         raise ConfigError("aggregation.motion_deskew must be a boolean")
     if not isinstance(config.aggregation.truncate_after_lane_end_touch, bool):
         raise ConfigError("aggregation.truncate_after_lane_end_touch must be a boolean")
+    if not isinstance(config.aggregation.enable_registration_underfill_fallback, bool):
+        raise ConfigError("aggregation.enable_registration_underfill_fallback must be a boolean")
+    if not isinstance(config.aggregation.enable_confidence_point_cap, bool):
+        raise ConfigError("aggregation.enable_confidence_point_cap must be a boolean")
+    if not isinstance(config.visualization.show_full_frame_pcd, bool):
+        raise ConfigError("visualization.show_full_frame_pcd must be a boolean")
+    if not isinstance(config.visualization.show_tracker_debug, bool):
+        raise ConfigError("visualization.show_tracker_debug must be a boolean")
+    if not isinstance(config.visualization.show_track_outcome_debug, bool):
+        raise ConfigError("visualization.show_track_outcome_debug must be a boolean")
+    if not isinstance(config.visualization.show_articulated_merge_debug, bool):
+        raise ConfigError("visualization.show_articulated_merge_debug must be a boolean")
     if len(config.preprocessing.lane_box) != 6:
         raise ConfigError("preprocessing.lane_box must contain exactly 6 values")
     if config.preprocessing.bootstrap_frames < 0:
@@ -73,10 +95,34 @@ def validate_config(config: PipelineConfig) -> None:
         raise ConfigError("aggregation.chunk_min_segment_length must be >= 1")
     if config.aggregation.min_saved_aggregate_points < 0:
         raise ConfigError("aggregation.min_saved_aggregate_points must be >= 0")
+    if config.aggregation.registration_min_kept_chunks < 1:
+        raise ConfigError("aggregation.registration_min_kept_chunks must be >= 1")
+    if config.aggregation.confidence_point_cap_max_points < 1:
+        raise ConfigError("aggregation.confidence_point_cap_max_points must be >= 1")
+    if config.aggregation.confidence_point_cap_bins < 1:
+        raise ConfigError("aggregation.confidence_point_cap_bins must be >= 1")
     if config.tracking.min_track_hits < 1:
         raise ConfigError("tracking.min_track_hits must be >= 1")
     if config.postprocessing.stitching_max_gap < 0:
         raise ConfigError("postprocessing.stitching_max_gap must be >= 0")
+    if config.postprocessing.articulated_gap_eval_window_frames < 1:
+        raise ConfigError("postprocessing.articulated_gap_eval_window_frames must be >= 1")
+    if config.postprocessing.articulated_min_overlap_frames < 1:
+        raise ConfigError("postprocessing.articulated_min_overlap_frames must be >= 1")
+    if config.postprocessing.articulated_min_overlap_ratio < 0 or config.postprocessing.articulated_min_overlap_ratio > 1:
+        raise ConfigError("postprocessing.articulated_min_overlap_ratio must be within [0, 1]")
+    if config.postprocessing.articulated_max_lateral_offset < 0:
+        raise ConfigError("postprocessing.articulated_max_lateral_offset must be >= 0")
+    if config.postprocessing.articulated_max_vertical_offset < 0:
+        raise ConfigError("postprocessing.articulated_max_vertical_offset must be >= 0")
+    if config.postprocessing.articulated_max_hitch_gap < 0:
+        raise ConfigError("postprocessing.articulated_max_hitch_gap must be >= 0")
+    if config.postprocessing.articulated_max_hitch_gap_std < 0:
+        raise ConfigError("postprocessing.articulated_max_hitch_gap_std must be >= 0")
+    if config.postprocessing.articulated_max_speed_delta < 0:
+        raise ConfigError("postprocessing.articulated_max_speed_delta must be >= 0")
+    if config.postprocessing.articulated_min_combined_length < 0:
+        raise ConfigError("postprocessing.articulated_min_combined_length must be >= 0")
     if config.postprocessing.parallel_merge_min_overlap_frames < 1:
         raise ConfigError("postprocessing.parallel_merge_min_overlap_frames must be >= 1")
     if config.postprocessing.parallel_merge_min_overlap_ratio < 0 or config.postprocessing.parallel_merge_min_overlap_ratio > 1:

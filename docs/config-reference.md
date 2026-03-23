@@ -7,7 +7,9 @@ Diese Seite beschreibt die YAML-Konfiguration der Pipeline auf Basis der aktuell
 - `tracking-pipeline run -c <preset>.yaml` laedt das angegebene YAML und merged es automatisch mit `base.yaml` im selben Verzeichnis.
 - Der Merge ist ein **Deep Merge**: nur ueberschriebene Schluessel werden ersetzt.
 - Relative `input.paths` werden relativ zur Config-Datei aufgeloest.
+- `input.paths` akzeptiert Dateien und Ordner. Ordner werden nicht rekursiv durchsucht; alle direkten `.pb`-Dateien werden lexikographisch nach Dateiname als eine Multi-File-Sequenz expandiert.
 - Benchmark-Configs loesen `sequences` und `presets` ebenfalls relativ zur Manifestdatei auf.
+- `benchmark.sequences` akzeptiert ebenfalls Dateien und Ordner. Ein Ordner repraesentiert genau eine Sequenz und wird erst pro Benchmark-Lauf zu seinen direkten `.pb`-Dateien expandiert.
 
 ## Unterstuetzte Werte
 
@@ -15,7 +17,7 @@ Diese Seite beschreibt die YAML-Konfiguration der Pipeline auf Basis der aktuell
 - `clustering.algorithm`: `dbscan`, `euclidean_clustering`, `ground_removed_dbscan`, `hdbscan`, `range_image_connected_components`, `range_image_depth_jump`, `beam_neighbor_region_growing`
 - `tracking.algorithm`: `euclidean_nn`, `kalman_nn`, `hungarian_kalman`
 - `aggregation.algorithm`: `voxel_fusion`, `registration_voxel_fusion`, `weighted_voxel_fusion`, `occupancy_consensus_fusion`
-- `aggregation.frame_selection_method`: `auto`, `all_track_frames`, `line_touch_last_k`, `keyframe_motion`, `length_coverage`
+- `aggregation.frame_selection_method`: `auto`, `all_track_frames`, `line_touch_last_k`, `keyframe_motion`, `length_coverage`, `quality_coverage`, `tail_coverage`, `center_diversity`, `max_extent`
 - `aggregation.registration_backend`: `small_gicp`, `icp_point_to_plane`, `generalized_icp`, `feature_global_then_local`
 - `aggregation.fusion_weight_mode`: `uniform`, `point_count`, `quality`
 
@@ -24,7 +26,7 @@ Diese Seite beschreibt die YAML-Konfiguration der Pipeline auf Basis der aktuell
 ```yaml
 input:
   paths:
-    - ../data/3.pb
+    - ../data/sequence_dir
 preprocessing:
   lane_box: [-2.10, 1.80, 4.0, 35.30, 0.12, 5.15]
 clustering:
@@ -41,7 +43,7 @@ output:
 
 | Feld | Default | Bedeutung |
 | --- | --- | --- |
-| `paths` | kein Default | Eingabedateien oder Sequenzen |
+| `paths` | kein Default | Eingabedateien oder Ordner; Ordner werden zu direkten `.pb`-Dateien in Namensreihenfolge expandiert |
 | `format` | `a42_pb` | Reader-Auswahl |
 
 ## `preprocessing`
@@ -117,7 +119,7 @@ output:
 | `symmetry_completion` | `false` | optionale lokale Symmetrievervollstaendigung |
 | `motion_deskew` | `false` | objektrelativer intra-scan Deskew fuer elongierte Tracks anhand von `timestamp_offset` |
 | `truncate_after_lane_end_touch` | `false` | verwirft alle Folgeframes nach erstem Touch am Lane-Ende (`frame_selection_line_axis`-Min-Seite) |
-| `frame_selection_method` | `auto` | Strategie zur Chunk-/Frame-Auswahl |
+| `frame_selection_method` | `auto` | Strategie zur Chunk-/Frame-Auswahl: `all_track_frames`, `line_touch_last_k`, `keyframe_motion`, `length_coverage`, `quality_coverage`, `tail_coverage`, `center_diversity`, `max_extent`, `auto` |
 | `use_all_frames` | `true` | alle Track-Frames verwenden statt nur Auswahl |
 | `top_k_frames` | `10` | Limit fuer `line_touch_last_k` / Top-K-Auswahl |
 | `keyframe_keep` | `8` | Anzahl Keyframes bei Keyframe-Auswahl |
@@ -146,6 +148,8 @@ output:
 | `registration_max_iter` | `80` | Iterationslimit fuer lokales Alignment |
 | `registration_min_fitness` | `0.25` | Mindestfitness fuer akzeptierte Registrierung |
 | `registration_max_translation` | `3.2` | Obergrenze fuer akzeptierte Translation |
+| `enable_registration_underfill_fallback` | `false` | faellt bei zu wenigen behaltenen Registration-Chunks auf die unregistrierten selektierten Chunks zurueck |
+| `registration_min_kept_chunks` | `4` | Mindestanzahl an Registration-Chunks vor dem optionalen Underfill-Fallback |
 | `global_registration_voxel` | `0.12` | Downsampling fuer globales Feature-Matching |
 
 ### Fusion und Save-Gating
@@ -158,6 +162,9 @@ output:
 | `consensus_ratio` | `0.35` | Konsensschwelle bei `occupancy_consensus_fusion` |
 | `min_track_quality_for_save` | `0.0` | Mindestqualitaet fuer normale Tracks |
 | `min_saved_aggregate_points` | `180` | Untergrenze fuer gespeicherte Aggregate |
+| `enable_confidence_point_cap` | `false` | kappt das finale gespeicherte Aggregate optional auf die confidentesten Punkte |
+| `confidence_point_cap_max_points` | `2048` | maximales Punktbudget fuer das finale Aggregate bei aktivem Confidence-Cap |
+| `confidence_point_cap_bins` | `16` | Anzahl Longitudinal-Bins fuer die verteilte Confidence-Auswahl |
 | `aggregate_voxel` | `0.06` | finales Downsampling nach dem Post-Filter |
 
 ### Long-Vehicle-Modus
@@ -186,6 +193,16 @@ output:
 | `enable_tracklet_stitching` | `false` | aktiviert Tracklet-Stitching |
 | `stitching_max_gap` | `4` | maximaler zeitlicher Gap fuer Stitching |
 | `stitching_max_center_dist` | `2.5` | maximaler Mittelpunktabstand fuer Stitching |
+| `enable_articulated_vehicle_merge` | `false` | merged stabile Front-/Rear-Teiltracks von Zugfahrzeug und Anhaenger im finalen Output |
+| `articulated_gap_eval_window_frames` | `5` | bewertet den Hitch-Gap ueber die letzten gemeinsamen Frames; bei weniger als 3 Frames faellt der Merge auf die volle Ueberlappung zurueck |
+| `articulated_min_overlap_frames` | `4` | Mindestueberlappung in Frames fuer Trailer-Merge |
+| `articulated_min_overlap_ratio` | `0.5` | Mindestueberlappung als Anteil fuer Trailer-Merge |
+| `articulated_max_lateral_offset` | `0.9` | maximaler mittlerer lateraler Offset zwischen Zugfahrzeug und Anhaenger |
+| `articulated_max_vertical_offset` | `0.6` | maximaler mittlerer Hoehenoffset zwischen Zugfahrzeug und Anhaenger |
+| `articulated_max_hitch_gap` | `2.5` | maximaler mittlerer Hitch-/Rear-Gap entlang der Laengsachse |
+| `articulated_max_hitch_gap_std` | `0.6` | maximal zulaessige Gap-Schwankung fuer Trailer-Merge |
+| `articulated_max_speed_delta` | `0.5` | maximaler Unterschied der Longitudinalgeschwindigkeit |
+| `articulated_min_combined_length` | `6.5` | minimale kombinierte Laengsausdehnung fuer artikulierte Fahrzeuge |
 | `enable_co_moving_track_merge` | `false` | aktiviert Merge paralleler Co-Moving-Tracks |
 | `parallel_merge_max_lateral_offset` | `0.8` | maximaler lateraler Offset fuer Merge |
 | `parallel_merge_max_longitudinal_gap` | `4.0` | maximaler Laengsgap fuer Merge |
@@ -201,16 +218,20 @@ output:
 | --- | --- | --- |
 | `root_dir` | `runs` | Zielverzeichnis fuer Run-Artefakte |
 | `save_world` | `false` | speichert Aggregate in Welt- statt Lokalkoordinaten |
-| `save_aggregate_intensity` | `false` | schreibt `intensity` als PCD-Feld mit |
+| `save_aggregate_intensity` | `false` | schreibt range-korrigierte Reflectivity als PCD-Feld `reflectivity` mit |
 | `require_track_exit` | `true` | speichert nur Tracks, die die Lane-Box verlassen haben |
-| `track_exit_edge_margin` | `0.9` | Randtoleranz fuer Track-Exit-Check |
+| `track_exit_edge_margin` | `0.9` | Offset der Exit-Linie von der Min-Seite der Lane-Laengsachse; der letzte Track-Center muss diese Linie passiert haben |
 
 ## `visualization`
 
 | Feld | Default | Bedeutung |
 | --- | --- | --- |
 | `enabled` | `true` | aktiviert Replay-Visualisierung |
-| `color_by_intensity` | `false` | faerbt Lane/Cluster/Aggregate nach Intensitaet |
+| `color_by_intensity` | `false` | faerbt Lane/Cluster/Aggregate nach range-korrigierter Reflectivity; nur fuer die Anzeige robust normalisiert |
+| `show_full_frame_pcd` | `false` | blendet die komplette rohe Frame-Punktwolke als Hintergrund-Layer im Replay ein |
+| `show_tracker_debug` | `false` | zeigt Tracker-Predictions, Match-/Miss-/Spawn-Overlay und HUD im Replay |
+| `show_track_outcome_debug` | `false` | zeigt Save-/Skip-Beacons, Failure-Tails und Outcome-HUD fuer finalisierte Tracks |
+| `show_articulated_merge_debug` | `false` | zeigt Trailer-Merge-Paare, Tail-/Full-Gap-HUD und Outcome-Beacons im Replay; per Taste `M` umschaltbar |
 | `max_points` | `120000` | Punktlimit fuer den Viewer |
 | `max_cluster_points` | `15000` | Punktlimit pro Cluster im Viewer |
 | `max_assoc_dist` | `4.2` | Darstellungsdistanz fuer Assoziationshilfen |
@@ -219,7 +240,7 @@ output:
 
 ```yaml
 sequences:
-  - ../data/3.pb
+  - ../data/sequence_dir
 presets:
   - ./kalman_voxel.yaml
   - ./kalman_small_gicp.yaml
@@ -231,7 +252,7 @@ measure_runs: 3
 
 | Feld | Default | Bedeutung |
 | --- | --- | --- |
-| `sequences` | kein Default | Eingabesequenzen fuer den Benchmark |
+| `sequences` | kein Default | Eingabedateien oder Ordner; jeder Ordner ist genau eine Benchmark-Sequenz aus seinen direkten `.pb`-Dateien in Namensreihenfolge |
 | `presets` | kein Default | Presets, die gegeneinander verglichen werden |
 | `output_root` | `benchmarks` | Zielverzeichnis fuer Benchmark-Artefakte |
 | `name` | `curated_proxy` | Suffix im Benchmark-Ordnernamen |
@@ -253,5 +274,6 @@ measure_runs: 3
 
 - Fuer normale Einstiege ist `kalman_voxel.yaml` die einfachste stabile Basis.
 - `registration_voxel_fusion` lohnt sich nur, wenn Chunks ohne Registrierung sichtbar versetzt bleiben.
+- `enable_articulated_vehicle_merge` wirkt nur auf finale Tracks und Aggregate; im normalen Replay-Layer bleiben die Originaltracks sichtbar. Optional kann `show_articulated_merge_debug` zusaetzlich das Merge-Debug-Overlay einblenden.
 - `motion_deskew`, `symmetry_completion` und `save_aggregate_intensity` sind additive Features auf dem finalen Aggregate-Output.
 - Wenn ein Preset nicht explizit alle Werte setzt, kommen sie aus `configs/base.yaml`.

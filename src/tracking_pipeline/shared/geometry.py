@@ -36,8 +36,22 @@ def clamp_visual_scalar(values: np.ndarray | None, indices: np.ndarray) -> np.nd
 def grayscale_from_intensity(intensity: np.ndarray | None) -> np.ndarray | None:
     if intensity is None:
         return None
-    values = np.clip(np.asarray(intensity, dtype=np.float32).reshape(-1), 0.0, 1.0)
-    return np.repeat(values[:, None], 3, axis=1).astype(np.float32)
+    values = np.asarray(intensity, dtype=np.float32).reshape(-1)
+    if len(values) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    values = values.copy()
+    finite_mask = np.isfinite(values)
+    values[~finite_mask] = 0.0
+    values = np.maximum(values, 0.0)
+    display_values = np.log1p(values).astype(np.float32, copy=False)
+    lo = float(np.percentile(display_values, 5.0))
+    hi = float(np.percentile(display_values, 95.0))
+    if hi > lo + 1e-6:
+        normalized = (display_values - lo) / (hi - lo)
+    else:
+        normalized = display_values
+    normalized = np.clip(normalized, 0.0, 1.0).astype(np.float32, copy=False)
+    return np.repeat(normalized[:, None], 3, axis=1).astype(np.float32)
 
 
 def optional_concatenate(parts: list[np.ndarray | None], width: int | None = None) -> np.ndarray | None:

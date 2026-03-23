@@ -79,6 +79,8 @@ class AggregationConfig:
     registration_max_iter: int = 80
     registration_min_fitness: float = 0.25
     registration_max_translation: float = 3.2
+    enable_registration_underfill_fallback: bool = False
+    registration_min_kept_chunks: int = 4
     global_registration_voxel: float = 0.12
     fusion_voxel_size: float = 0.05
     fusion_min_observations: int = 1
@@ -86,6 +88,9 @@ class AggregationConfig:
     consensus_ratio: float = 0.35
     min_track_quality_for_save: float = 0.0
     min_saved_aggregate_points: int = 180
+    enable_confidence_point_cap: bool = False
+    confidence_point_cap_max_points: int = 2048
+    confidence_point_cap_bins: int = 16
     long_vehicle_mode: bool = False
     long_vehicle_length_threshold: float = 4.5
     length_coverage_bins: int = 10
@@ -103,6 +108,16 @@ class PostprocessingConfig:
     enable_tracklet_stitching: bool = False
     stitching_max_gap: int = 4
     stitching_max_center_dist: float = 2.5
+    enable_articulated_vehicle_merge: bool = False
+    articulated_gap_eval_window_frames: int = 5
+    articulated_min_overlap_frames: int = 4
+    articulated_min_overlap_ratio: float = 0.5
+    articulated_max_lateral_offset: float = 0.9
+    articulated_max_vertical_offset: float = 0.6
+    articulated_max_hitch_gap: float = 2.5
+    articulated_max_hitch_gap_std: float = 0.6
+    articulated_max_speed_delta: float = 0.5
+    articulated_min_combined_length: float = 6.5
     enable_co_moving_track_merge: bool = False
     parallel_merge_max_lateral_offset: float = 0.8
     parallel_merge_max_longitudinal_gap: float = 4.0
@@ -126,6 +141,10 @@ class OutputConfig:
 class VisualizationConfig:
     enabled: bool = True
     color_by_intensity: bool = False
+    show_full_frame_pcd: bool = False
+    show_tracker_debug: bool = False
+    show_track_outcome_debug: bool = False
+    show_articulated_merge_debug: bool = False
     max_points: int = 120000
     max_cluster_points: int = 15000
     max_assoc_dist: float = 4.2

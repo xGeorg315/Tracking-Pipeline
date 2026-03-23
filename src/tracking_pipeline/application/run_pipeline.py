@@ -13,6 +13,7 @@ from tracking_pipeline.application.factories import (
     build_tracker,
 )
 from tracking_pipeline.application.performance import PerformanceProfiler
+from tracking_pipeline.application.track_outcomes import build_track_outcomes
 from tracking_pipeline.config.models import PipelineConfig
 from tracking_pipeline.domain.models import AggregateResult, ObjectLabelData, RunSummary
 
@@ -35,6 +36,7 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
     latest_object_labels: dict[int, ObjectLabelData] = {}
     object_list_seen_ids: set[int] = set()
     object_list_skipped_empty = 0
+    tracker_states = []
     with profiler.stage("read_frames"):
         frames = reader.iter_frames(config.input.paths)
     for frame in frames:
@@ -49,7 +51,9 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
         with profiler.stage("cluster_frames"):
             cluster_result = clusterer.cluster(frame, lane_box)
         with profiler.stage("tracker_steps"):
-            tracker.step(cluster_result.detections, frame.frame_index, frame.timestamp_ns)
+            state = tracker.step(cluster_result.detections, frame.frame_index, frame.timestamp_ns)
+        state.cluster_metrics = cluster_result.metrics
+        tracker_states.append(state)
 
     with profiler.stage("tracker_finalize"):
         tracks = tracker.finalize()
@@ -73,6 +77,7 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
         if result.status == "saved":
             with profiler.stage("write_aggregates"):
                 writer.write_aggregate(run_dir, result, save_intensity=config.output.save_aggregate_intensity)
+    track_outcomes = build_track_outcomes(tracks, aggregate_results, tracker_states)
 
     with profiler.stage("write_object_list"):
         writer.write_object_list(run_dir, latest_object_labels)
@@ -102,6 +107,8 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
     )
     with profiler.stage("write_tracks"):
         writer.write_tracks(run_dir, tracks, aggregate_results)
+        writer.write_tracker_debug(run_dir, tracker_states)
+        writer.write_track_outcomes(run_dir, track_outcomes)
     summary.performance = profiler.snapshot()
     with profiler.stage("write_summary"):
         writer.write_summary(run_dir, summary)

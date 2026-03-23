@@ -91,9 +91,6 @@ class A42PBReader:
         xyz = np.asarray(xyz_all[finite_mask], dtype=np.float32)
         if len(xyz) == 0:
             return None
-        intensity = self._unpack_point_intensity(pointcloud, len(xyz_all))
-        if intensity is not None:
-            intensity = np.asarray(intensity[finite_mask], dtype=np.float32)
         point_timestamp_ns = self._decode_point_timestamp_ns(
             pointcloud,
             int(getattr(scan, "scan_timestamp_ns", 0)),
@@ -103,6 +100,9 @@ class A42PBReader:
             point_timestamp_ns = np.asarray(point_timestamp_ns[finite_mask], dtype=np.int64)
         calibration = self._calibration_to_data(getattr(scan, "calibration", None))
         ranges = np.linalg.norm(xyz, axis=1).astype(np.float32)
+        intensity = self._unpack_point_signal(pointcloud, len(xyz_all))
+        if intensity is not None:
+            intensity = self._range_correct_signal(np.asarray(intensity[finite_mask], dtype=np.float32), ranges)
         row_index = self._compute_row_index(xyz, ranges, calibration, pointcloud)
         col_index = self._compute_col_index(xyz, calibration)
         return LidarScanData(
@@ -167,13 +167,19 @@ class A42PBReader:
             return np.zeros((0, 3), dtype=np.float32)
         return np.frombuffer(pointcloud.cartesian, dtype="<f4").reshape(count, 3)
 
-    def _unpack_point_intensity(self, pointcloud: object, count: int) -> np.ndarray | None:
+    def _unpack_point_signal(self, pointcloud: object, count: int) -> np.ndarray | None:
         if not self.read_intensity or not pointcloud or count <= 0:
             return None
-        intensity = self._decode_intensity(getattr(pointcloud, "intensity", b""), count)
-        if intensity is not None:
-            return intensity
-        return self._decode_reflectivity(getattr(pointcloud, "reflectivity", b""), count)
+        reflectivity = self._decode_reflectivity(getattr(pointcloud, "reflectivity", b""), count)
+        if reflectivity is not None:
+            return reflectivity
+        return self._decode_intensity(getattr(pointcloud, "intensity", b""), count)
+
+    @staticmethod
+    def _range_correct_signal(signal: np.ndarray, ranges: np.ndarray) -> np.ndarray:
+        signal_values = np.asarray(signal, dtype=np.float32)
+        range_squared = np.square(np.asarray(ranges, dtype=np.float32))
+        return (signal_values * range_squared).astype(np.float32, copy=False)
 
     def _decode_intensity(self, raw: bytes, count: int) -> np.ndarray | None:
         if not raw:

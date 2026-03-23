@@ -152,7 +152,7 @@ flowchart LR
 
 ## Wichtige Besonderheiten
 
-- **Intensity-Unterstuetzung**: Intensitaet wird im aktuellen Datensatz aus `reflectivity` uebernommen, falls `pointcloud.intensity` leer ist.
+- **Reflectivity-Ausgabe**: Im aktuellen Datensatz wird `pointcloud.reflectivity` als Signalquelle gelesen und beim Einlesen zu range-korrigierter Reflectivity `signal * r^2` umgerechnet; Export und Replay nutzen diese Werte.
 - **Motion Deskew**: Aggregate koennen optional objektrelativ per Punktzeit (`timestamp_offset`) entzerrt werden.
 - **Symmetry Completion**: Aggregate koennen optional lokal vervollstaendigt werden.
 - **Fahrzeugdimensionen**: `aggregation_metrics` enthalten `vehicle_length`, `vehicle_width`, `vehicle_height` plus Achseninfo.
@@ -199,7 +199,11 @@ Wichtig fuer den Alltag:
 
 - Ein Preset wird automatisch mit `base.yaml` im selben Verzeichnis deep-merged.
 - Relative `input.paths` werden relativ zur Config-Datei aufgeloest.
+- `input.paths` akzeptiert Dateien und Ordner. Ordner werden nicht rekursiv durchsucht; alle direkten `.pb`-Dateien werden nach Dateiname als eine Sequenz genommen.
 - `benchmark`-Manifeste loesen `sequences` und `presets` ebenfalls relativ zur Manifestdatei auf.
+- `benchmark.sequences` akzeptiert ebenfalls Dateien und Ordner mit derselben Ordnersemantik pro Sequence-Eintrag.
+- `postprocessing.enable_articulated_vehicle_merge` merged Zugfahrzeug und Anhaenger nur im finalen Output; die normalen Replay-Tracks bleiben unveraendert.
+- `visualization.show_articulated_merge_debug: true` blendet im Replay ein Debug-Overlay fuer Trailer-Merge-Paare ein; zur Laufzeit per `M` umschaltbar.
 
 Die vollstaendige Referenz steht in [docs/config-reference.md](docs/config-reference.md).
 

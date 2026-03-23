@@ -22,7 +22,11 @@ class TrackQualityScoringPostprocessor:
             observation_count = len(track.frame_ids)
             if observation_count == 0:
                 track.quality_score = 0.0
-                track.quality_metrics = {"observation_count": 0, "is_long_vehicle": False}
+                track.quality_metrics = {
+                    "observation_count": 0,
+                    "is_long_vehicle": False,
+                    "is_articulated_vehicle": bool(track.state.get("articulated_vehicle", False)),
+                }
                 continue
 
             continuity = clamp01(observation_count / max(1, track.age))
@@ -41,7 +45,8 @@ class TrackQualityScoringPostprocessor:
             length_stability = clamp01(1.0 / (1.0 + length_cv))
             quality = float(0.4 * continuity + 0.3 * longevity + 0.2 * cross_section_stability + 0.1 * length_stability)
             long_extent_p75 = float(np.percentile(length_values, 75)) if len(length_values) else 0.0
-            is_long_vehicle = bool(long_extent_p75 >= self.long_vehicle_length_threshold)
+            is_articulated_vehicle = bool(track.state.get("articulated_vehicle", False))
+            is_long_vehicle = bool(is_articulated_vehicle or long_extent_p75 >= self.long_vehicle_length_threshold)
 
             track.quality_score = quality
             track.quality_metrics = {
@@ -55,9 +60,12 @@ class TrackQualityScoringPostprocessor:
                 "cross_section_cv": float(cross_section_cv),
                 "quality_score": quality,
                 "is_long_vehicle": is_long_vehicle,
+                "is_articulated_vehicle": is_articulated_vehicle,
                 "longitudinal_axis": ["x", "y", "z"][self.axis_idx],
                 "longitudinal_extent_p75": long_extent_p75,
             }
+            if is_articulated_vehicle:
+                track.quality_metrics["object_kind"] = str(track.state.get("object_kind") or "truck_with_trailer")
         return tracks
 
     def _extents(self, track: Track) -> np.ndarray:

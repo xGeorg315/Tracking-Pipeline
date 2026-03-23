@@ -15,6 +15,7 @@ from tracking_pipeline.domain.rules import (
     find_lane_end_touch_index,
     orthogonal_axes,
     select_best_frames_for_aggregation,
+    track_exit_line_value,
     track_exited_lane_box,
 )
 from tracking_pipeline.domain.value_objects import LaneBox
@@ -31,9 +32,14 @@ class VoxelFusionAccumulator:
 
     def accumulate(self, track: Track, lane_box: LaneBox) -> AggregateResult:
         if track.hit_count < int(self.tracking_config.min_track_hits):
-            return AggregateResult(track.track_id, np.zeros((0, 3), dtype=np.float32), [], "skipped_min_hits", self._base_metrics(track))
-        if self.output_config.require_track_exit and not track_exited_lane_box(track, lane_box, edge_margin=self.output_config.track_exit_edge_margin):
-            return AggregateResult(track.track_id, np.zeros((0, 3), dtype=np.float32), [], "skipped_track_exit", self._base_metrics(track))
+            return self._result(track, lane_box, np.zeros((0, 3), dtype=np.float32), [], "skipped_min_hits", self._base_metrics(track))
+        if self.output_config.require_track_exit and not track_exited_lane_box(
+            track,
+            lane_box,
+            edge_margin=self.output_config.track_exit_edge_margin,
+            axis=self.config.frame_selection_line_axis,
+        ):
+            return self._result(track, lane_box, np.zeros((0, 3), dtype=np.float32), [], "skipped_track_exit", self._base_metrics(track))
 
         long_vehicle_mode_applied = self._track_is_long_vehicle(track)
         frame_selection_method = self._effective_frame_selection_method(track, long_vehicle_mode_applied)
@@ -104,7 +110,7 @@ class VoxelFusionAccumulator:
             selection_info = {**selection_info, **shape_info}
         if not selected_chunks:
             metrics = {**self._base_metrics(track), **selection_info, **self._motion_deskew_metrics()}
-            return AggregateResult(track.track_id, np.zeros((0, 3), dtype=np.float32), [], "empty_selection", metrics)
+            return self._result(track, lane_box, np.zeros((0, 3), dtype=np.float32), [], "empty_selection", metrics)
 
         selected_chunks, selected_intensity, motion_deskew_metrics = self._apply_motion_deskew(
             track,
@@ -137,7 +143,15 @@ class VoxelFusionAccumulator:
         selected_frame_ids = [int(frame_id) for _, _, _, frame_id in selected_triplets]
         if not prepared_chunks:
             metrics = {**self._base_metrics(track), **selection_info, **motion_deskew_metrics}
-            return AggregateResult(track.track_id, np.zeros((0, 3), dtype=np.float32), selected_frame_ids, "empty_prepared_chunks", metrics)
+            return self._result(
+                track,
+                lane_box,
+                np.zeros((0, 3), dtype=np.float32),
+                selected_frame_ids,
+                "empty_prepared_chunks",
+                metrics,
+                prepared_chunk_count=0,
+            )
 
         accumulation_input, registration_metrics = self._prepare_for_fusion(prepared_chunks)
         (
@@ -148,26 +162,42 @@ class VoxelFusionAccumulator:
             registration_metrics,
         ) = self._apply_registration_subset(
             accumulation_input,
+            prepared_chunks,
             prepared_intensity,
             selected_centers,
             selected_frame_ids,
             registration_metrics,
         )
         chunk_weights = self._chunk_weights(track, accumulation_input, registration_metrics, long_vehicle_mode_applied)
-        fused_xyz, fused_intensity, raw_points_total, fusion_voxels_total, fusion_voxels_kept = self._fuse_chunks(
+        confidence_chunk_weights = self._confidence_chunk_weights(accumulation_input, chunk_weights, registration_metrics)
+        fused_xyz, fused_intensity, fused_confidence, raw_points_total, fusion_voxels_total, fusion_voxels_kept = self._fuse_chunks(
             accumulation_input,
             prepared_intensity,
             chunk_weights,
+            confidence_chunk_weights,
             min_observations=self._required_observations(len(accumulation_input)),
         )
         if len(fused_xyz) == 0:
             metrics = {**self._base_metrics(track), **selection_info, **motion_deskew_metrics, **registration_metrics}
-            return AggregateResult(track.track_id, np.zeros((0, 3), dtype=np.float32), selected_frame_ids, "empty_fused", metrics)
+            return self._result(
+                track,
+                lane_box,
+                np.zeros((0, 3), dtype=np.float32),
+                selected_frame_ids,
+                "empty_fused",
+                metrics,
+                prepared_chunk_count=len(accumulation_input),
+            )
 
-        filtered_xyz, filtered_intensity, prefilter_points, stat_filtered_points, final_points = self._post_filter(fused_xyz, fused_intensity)
-        filtered_xyz, filtered_intensity, component_count_post_fusion, tail_bridge_count, longitudinal_extent = self._apply_tail_bridge(
+        filtered_xyz, filtered_intensity, filtered_confidence, prefilter_points, stat_filtered_points, final_points = self._post_filter(
+            fused_xyz,
+            fused_intensity,
+            fused_confidence,
+        )
+        filtered_xyz, filtered_intensity, filtered_confidence, component_count_post_fusion, tail_bridge_count, longitudinal_extent = self._apply_tail_bridge(
             filtered_xyz,
             filtered_intensity,
+            filtered_confidence,
             long_vehicle_mode_applied,
         )
         final_points = len(filtered_xyz)
@@ -198,35 +228,290 @@ class VoxelFusionAccumulator:
             **symmetry_metrics,
         }
         if final_points == 0:
-            return AggregateResult(track.track_id, np.zeros((0, 3), dtype=np.float32), selected_frame_ids, "empty_filtered", metrics)
+            return self._result(
+                track,
+                lane_box,
+                np.zeros((0, 3), dtype=np.float32),
+                selected_frame_ids,
+                "empty_filtered",
+                metrics,
+                prepared_chunk_count=len(accumulation_input),
+                point_count_after_downsample=0,
+                point_count_before_confidence_cap=0,
+                point_count_after_confidence_cap=0,
+            )
         if final_points < int(self.config.min_saved_aggregate_points):
-            return AggregateResult(
-                track.track_id,
+            return self._result(
+                track,
+                lane_box,
                 np.zeros((0, 3), dtype=np.float32),
                 selected_frame_ids,
                 "skipped_min_saved_points",
                 metrics,
+                prepared_chunk_count=len(accumulation_input),
+                point_count_after_downsample=final_points,
+                point_count_before_confidence_cap=final_points,
+                point_count_after_confidence_cap=final_points,
             )
         quality_threshold = self._quality_threshold(long_vehicle_mode_applied)
         if float(track.quality_score or 0.0) < quality_threshold:
             metrics["quality_threshold"] = quality_threshold
-            return AggregateResult(track.track_id, np.zeros((0, 3), dtype=np.float32), selected_frame_ids, "skipped_quality_threshold", metrics)
-        completed_xyz, completed_intensity, symmetry_metrics = self._apply_symmetry_completion(
+            return self._result(
+                track,
+                lane_box,
+                np.zeros((0, 3), dtype=np.float32),
+                selected_frame_ids,
+                "skipped_quality_threshold",
+                metrics,
+                prepared_chunk_count=len(accumulation_input),
+                point_count_after_downsample=final_points,
+                quality_threshold=quality_threshold,
+                point_count_before_confidence_cap=final_points,
+                point_count_after_confidence_cap=final_points,
+            )
+        point_count_before_confidence_cap = int(len(filtered_xyz))
+        capped_xyz, capped_intensity, capped_confidence, confidence_cap_applied = self._apply_confidence_point_cap(
             filtered_xyz,
             filtered_intensity,
+            filtered_confidence,
+        )
+        completed_xyz, completed_intensity, _, symmetry_metrics = self._apply_symmetry_completion(
+            capped_xyz,
+            capped_intensity,
+            capped_confidence,
             selected_centers,
             component_count_post_fusion,
         )
         metrics.update(symmetry_metrics)
         metrics.update(self._vehicle_dimension_metrics(completed_xyz))
         metrics["point_count_after_downsample"] = int(len(completed_xyz))
-        return AggregateResult(track.track_id, completed_xyz, selected_frame_ids, "saved", metrics, intensity=completed_intensity)
+        return self._result(
+            track,
+            lane_box,
+            completed_xyz,
+            selected_frame_ids,
+            "saved",
+            metrics,
+            intensity=completed_intensity,
+            prepared_chunk_count=len(accumulation_input),
+            point_count_after_downsample=len(completed_xyz),
+            quality_threshold=quality_threshold,
+            point_count_before_confidence_cap=point_count_before_confidence_cap,
+            point_count_after_confidence_cap=len(capped_xyz),
+            confidence_point_cap_applied=confidence_cap_applied,
+        )
 
     def _base_metrics(self, track: Track) -> dict[str, Any]:
-        return {
+        metrics = {
             "quality_score": 0.0 if track.quality_score is None else float(track.quality_score),
             "quality_metrics": track.quality_metrics,
             "track_source_ids": track.source_track_ids or [track.track_id],
+        }
+        if bool(track.state.get("articulated_vehicle")):
+            metrics["articulated_vehicle"] = True
+            component_ids = track.state.get("articulated_component_track_ids")
+            if component_ids:
+                metrics["articulated_component_track_ids"] = list(component_ids)
+            gap_mean = track.state.get("articulated_rear_gap_mean")
+            if gap_mean is not None:
+                metrics["articulated_rear_gap_mean"] = float(gap_mean)
+            gap_std = track.state.get("articulated_rear_gap_std")
+            if gap_std is not None:
+                metrics["articulated_rear_gap_std"] = float(gap_std)
+            object_kind = track.state.get("object_kind")
+            if object_kind:
+                metrics["object_kind"] = str(object_kind)
+        return metrics
+
+    def _result(
+        self,
+        track: Track,
+        lane_box: LaneBox,
+        points: np.ndarray,
+        selected_frame_ids: list[int],
+        status: str,
+        metrics: dict[str, Any],
+        *,
+        intensity: np.ndarray | None = None,
+        prepared_chunk_count: int = 0,
+        point_count_after_downsample: int | None = None,
+        quality_threshold: float | None = None,
+        point_count_before_confidence_cap: int | None = None,
+        point_count_after_confidence_cap: int | None = None,
+        confidence_point_cap_applied: bool = False,
+    ) -> AggregateResult:
+        cap_before = int(len(points)) if point_count_before_confidence_cap is None else int(point_count_before_confidence_cap)
+        cap_after = int(len(points)) if point_count_after_confidence_cap is None else int(point_count_after_confidence_cap)
+        merged_metrics = {
+            **metrics,
+            **self._confidence_point_cap_metrics(
+                point_count_before_cap=cap_before,
+                point_count_after_cap=cap_after,
+                applied=confidence_point_cap_applied,
+            ),
+            **self._decision_metrics(
+                track,
+                lane_box,
+                status,
+                selected_frame_ids,
+                prepared_chunk_count=prepared_chunk_count,
+                point_count_after_downsample=point_count_after_downsample,
+                quality_threshold=quality_threshold,
+            ),
+        }
+        return AggregateResult(
+            track.track_id,
+            np.asarray(points, dtype=np.float32),
+            [int(frame_id) for frame_id in selected_frame_ids],
+            status,
+            merged_metrics,
+            intensity=None if intensity is None else np.asarray(intensity, dtype=np.float32),
+        )
+
+    def _confidence_point_cap_metrics(
+        self,
+        *,
+        point_count_before_cap: int,
+        point_count_after_cap: int,
+        applied: bool,
+    ) -> dict[str, Any]:
+        return {
+            "confidence_point_cap_enabled": bool(self.config.enable_confidence_point_cap),
+            "confidence_point_cap_applied": bool(applied),
+            "confidence_point_cap_target": int(self.config.confidence_point_cap_max_points),
+            "confidence_point_cap_bins": int(self.config.confidence_point_cap_bins),
+            "point_count_before_confidence_cap": int(point_count_before_cap),
+            "point_count_after_confidence_cap": int(point_count_after_cap),
+        }
+
+    def _decision_metrics(
+        self,
+        track: Track,
+        lane_box: LaneBox,
+        status: str,
+        selected_frame_ids: list[int],
+        *,
+        prepared_chunk_count: int,
+        point_count_after_downsample: int | None,
+        quality_threshold: float | None,
+    ) -> dict[str, Any]:
+        decision_stage, decision_reason_code, decision_reason_label = self._decision_identity(status)
+        quality_score = 0.0 if track.quality_score is None else float(track.quality_score)
+        track_exit_metrics = self._track_exit_metrics(track, lane_box)
+        point_count = 0 if point_count_after_downsample is None else int(point_count_after_downsample)
+        selected_count = int(len(selected_frame_ids))
+        summary = self._decision_summary(
+            decision_reason_code,
+            hit_count=int(track.hit_count),
+            min_track_hits=int(self.tracking_config.min_track_hits),
+            track_exit_line_value=float(track_exit_metrics["track_exit_line_value"]),
+            track_center_line_coordinate=float(track_exit_metrics["track_center_line_coordinate"]),
+            quality_score=quality_score,
+            quality_threshold=quality_threshold,
+            point_count_after_downsample=point_count,
+            min_saved_aggregate_points=int(self.config.min_saved_aggregate_points),
+            selected_frame_count=selected_count,
+            prepared_chunk_count=int(prepared_chunk_count),
+        )
+        return {
+            "decision_stage": decision_stage,
+            "decision_reason_code": decision_reason_code,
+            "decision_reason_label": decision_reason_label,
+            "decision_summary": summary,
+            "hit_count": int(track.hit_count),
+            "min_track_hits": int(self.tracking_config.min_track_hits),
+            "quality_score": quality_score,
+            "quality_threshold": 0.0 if quality_threshold is None else float(quality_threshold),
+            "selected_frame_count": selected_count,
+            "prepared_chunk_count": int(prepared_chunk_count),
+            "point_count_after_downsample": point_count,
+            "min_saved_aggregate_points": int(self.config.min_saved_aggregate_points),
+            **track_exit_metrics,
+        }
+
+    def _decision_identity(self, status: str) -> tuple[str, str, str]:
+        mapping = {
+            "skipped_min_hits": ("tracking_gate", "min_hits", "Minimum Hits"),
+            "skipped_track_exit": ("exit_gate", "track_exit", "Track Exit"),
+            "empty_selection": ("selection", "empty_selection", "Empty Selection"),
+            "empty_prepared_chunks": ("preparation", "empty_prepared_chunks", "Empty Prepared Chunks"),
+            "empty_fused": ("fusion", "empty_output", "Empty Output"),
+            "empty_filtered": ("fusion", "empty_output", "Empty Output"),
+            "skipped_min_saved_points": ("save_gate", "min_saved_points", "Minimum Saved Points"),
+            "skipped_quality_threshold": ("quality_gate", "quality_threshold", "Quality Threshold"),
+            "saved": ("saved", "saved", "Saved"),
+        }
+        return mapping.get(status, ("other", status, status.replace("_", " ")))
+
+    def _decision_summary(
+        self,
+        decision_reason_code: str,
+        *,
+        hit_count: int,
+        min_track_hits: int,
+        track_exit_line_value: float,
+        track_center_line_coordinate: float,
+        quality_score: float,
+        quality_threshold: float | None,
+        point_count_after_downsample: int,
+        min_saved_aggregate_points: int,
+        selected_frame_count: int,
+        prepared_chunk_count: int,
+    ) -> str:
+        if decision_reason_code == "min_hits":
+            return f"min_hits {hit_count}/{min_track_hits}"
+        if decision_reason_code == "track_exit":
+            return f"track_exit line={track_exit_line_value:.2f} center={track_center_line_coordinate:.2f}"
+        if decision_reason_code == "empty_selection":
+            return f"empty_selection selected={selected_frame_count}"
+        if decision_reason_code == "empty_prepared_chunks":
+            return f"empty_prepared_chunks prepared={prepared_chunk_count}"
+        if decision_reason_code == "empty_output":
+            return f"empty_output points={point_count_after_downsample}"
+        if decision_reason_code == "min_saved_points":
+            return f"min_saved_points {point_count_after_downsample}/{min_saved_aggregate_points}"
+        if decision_reason_code == "quality_threshold":
+            threshold = 0.0 if quality_threshold is None else float(quality_threshold)
+            return f"quality {quality_score:.2f}<{threshold:.2f}"
+        if decision_reason_code == "saved":
+            return f"saved points={point_count_after_downsample}"
+        return decision_reason_code
+
+    def _track_exit_metrics(self, track: Track, lane_box: LaneBox) -> dict[str, Any]:
+        axis_idx = axis_to_index(self.config.frame_selection_line_axis)
+        line_value = track_exit_line_value(lane_box, axis_idx, edge_margin=self.output_config.track_exit_edge_margin)
+        if not track.centers:
+            return {
+                "track_exited": False,
+                "track_exit_edge_margin": float(self.output_config.track_exit_edge_margin),
+                "closest_edge_distance": -1.0,
+                "distance_to_exit_line": -1.0,
+                "track_exit_line_axis": ["x", "y", "z"][axis_idx],
+                "track_exit_line_side": "min",
+                "track_exit_line_value": float(line_value),
+                "track_center_line_coordinate": -1.0,
+                "track_passed_exit_line": False,
+            }
+        last = np.asarray(track.centers[-1], dtype=np.float64)
+        center_coordinate = float(last[axis_idx]) if last.shape[0] > axis_idx else -1.0
+        distance_to_exit_line = float(center_coordinate - float(line_value))
+        return {
+            "track_exited": bool(
+                track_exited_lane_box(
+                    track,
+                    lane_box,
+                    edge_margin=self.output_config.track_exit_edge_margin,
+                    axis=self.config.frame_selection_line_axis,
+                )
+            ),
+            "track_exit_edge_margin": float(self.output_config.track_exit_edge_margin),
+            "closest_edge_distance": distance_to_exit_line,
+            "distance_to_exit_line": distance_to_exit_line,
+            "track_exit_line_axis": ["x", "y", "z"][axis_idx],
+            "track_exit_line_side": "min",
+            "track_exit_line_value": float(line_value),
+            "track_center_line_coordinate": center_coordinate,
+            "track_passed_exit_line": bool(center_coordinate <= float(line_value)),
         }
 
     def _symmetry_completion_metrics(
@@ -273,14 +558,20 @@ class VoxelFusionAccumulator:
         self,
         xyz: np.ndarray,
         intensity: np.ndarray | None,
+        confidence: np.ndarray | None,
         selected_centers: list[np.ndarray],
         component_count_post_fusion: int,
-    ) -> tuple[np.ndarray, np.ndarray | None, dict[str, Any]]:
+    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, dict[str, Any]]:
         points = np.asarray(xyz, dtype=np.float32)
         metrics = self._symmetry_completion_metrics(points, selected_centers)
         if not self.config.symmetry_completion or len(points) == 0:
             metrics["symmetry_completion_skipped_reason"] = "disabled" if not self.config.symmetry_completion else "empty"
-            return points, None if intensity is None else np.asarray(intensity, dtype=np.float32), metrics
+            return (
+                points,
+                None if intensity is None else np.asarray(intensity, dtype=np.float32),
+                None if confidence is None else np.asarray(confidence, dtype=np.float32),
+                metrics,
+            )
         _ = component_count_post_fusion
 
         axis_idx, lateral_idx, vertical_idx = self._symmetry_axes()
@@ -289,6 +580,9 @@ class VoxelFusionAccumulator:
         intensity_values = None
         if intensity is not None and len(np.asarray(intensity, dtype=np.float32)) == len(points):
             intensity_values = np.asarray(intensity, dtype=np.float32)
+        confidence_values = None
+        if confidence is not None and len(np.asarray(confidence, dtype=np.float32)) == len(points):
+            confidence_values = np.asarray(confidence, dtype=np.float32)
 
         slice_records, side_point_clouds = self._symmetry_slice_records(
             points,
@@ -305,7 +599,7 @@ class VoxelFusionAccumulator:
         negative_count = int(len(side_point_clouds.get(-1, np.zeros((0, 3), dtype=np.float32))))
         if positive_count == 0 and negative_count == 0:
             metrics["symmetry_completion_skipped_reason"] = "no_off_plane_points"
-            return points, intensity_values, metrics
+            return points, intensity_values, confidence_values, metrics
 
         dominant_side = self._symmetry_half_source_side(points, plane_coordinate, lateral_idx, completion_voxel)
         source_slice_count = positive_slice_count if dominant_side > 0 else negative_slice_count
@@ -323,7 +617,7 @@ class VoxelFusionAccumulator:
         source_points = np.asarray(points[source_mask], dtype=np.float32)
         if len(source_points) == 0:
             metrics["symmetry_completion_skipped_reason"] = "no_source_side"
-            return points, intensity_values, metrics
+            return points, intensity_values, confidence_values, metrics
 
         mirrored_points = source_points.copy()
         mirrored_points[:, lateral_idx] = np.float32((2.0 * plane_coordinate) - mirrored_points[:, lateral_idx])
@@ -336,7 +630,17 @@ class VoxelFusionAccumulator:
             kept_intensity = np.asarray(intensity_values[kept_mask], dtype=np.float32)
             source_intensity = np.asarray(intensity_values[source_mask], dtype=np.float32)
             combined_intensity = np.concatenate([kept_intensity, source_intensity], axis=0).astype(np.float32, copy=False)
-        combined_xyz, combined_intensity = self._mean_per_voxel(combined_xyz, combined_intensity, completion_voxel)
+        combined_confidence = None
+        if confidence_values is not None:
+            kept_confidence = np.asarray(confidence_values[kept_mask], dtype=np.float32)
+            source_confidence = np.asarray(confidence_values[source_mask], dtype=np.float32)
+            combined_confidence = np.concatenate([kept_confidence, source_confidence], axis=0).astype(np.float32, copy=False)
+        combined_xyz, combined_intensity, combined_confidence = self._aggregate_per_voxel(
+            combined_xyz,
+            combined_intensity,
+            combined_confidence,
+            completion_voxel,
+        )
         metrics.update(
             {
                 "symmetry_completion_applied": True,
@@ -345,7 +649,7 @@ class VoxelFusionAccumulator:
                 "symmetry_completion_skipped_reason": "applied",
             }
         )
-        return combined_xyz, combined_intensity, metrics
+        return combined_xyz, combined_intensity, combined_confidence, metrics
 
     def _symmetry_axes(self) -> tuple[int, int, int]:
         axis_idx = axis_to_index(self.config.frame_selection_line_axis)
@@ -498,6 +802,7 @@ class VoxelFusionAccumulator:
     def _apply_registration_subset(
         self,
         accumulation_input: list[np.ndarray],
+        prepared_chunks: list[np.ndarray],
         prepared_intensity: list[np.ndarray | None],
         selected_centers: list[np.ndarray],
         selected_frame_ids: list[int],
@@ -516,21 +821,52 @@ class VoxelFusionAccumulator:
             aligned_count = min(len(accumulation_input), input_count)
             keep_indices = list(range(aligned_count))
             accumulation_input = list(accumulation_input[:aligned_count])
+        attempt_output_count = int(len(keep_indices))
+        attempt_dropped_count = max(0, int(input_count - attempt_output_count))
         synced_metrics = dict(registration_metrics)
         synced_metrics["registration_input_chunk_count"] = int(input_count)
-        synced_metrics["registration_output_chunk_count"] = int(len(keep_indices))
-        synced_metrics["registration_dropped_count"] = max(0, int(input_count - len(keep_indices)))
-        synced_metrics["registration_keep_indices"] = keep_indices
         chunk_weights = synced_metrics.get("registration_chunk_weights")
         if not isinstance(chunk_weights, list) or len(chunk_weights) != len(keep_indices):
-            synced_metrics["registration_chunk_weights"] = [1.0 for _ in keep_indices]
+            attempt_chunk_weights = [1.0 for _ in keep_indices]
         else:
-            synced_metrics["registration_chunk_weights"] = [float(weight) for weight in chunk_weights]
+            attempt_chunk_weights = [float(weight) for weight in chunk_weights]
+        fallback_min_kept_chunks = max(1, int(self.config.registration_min_kept_chunks))
+        fallback_enabled = bool(self.config.enable_registration_underfill_fallback)
+        fallback_applied = (
+            fallback_enabled
+            and not bool(synced_metrics.get("registration_skipped", False))
+            and attempt_output_count < fallback_min_kept_chunks
+            and attempt_output_count < input_count
+        )
+        if fallback_applied:
+            effective_chunks = list(prepared_chunks)
+            effective_intensity = list(prepared_intensity)
+            effective_centers = list(selected_centers)
+            effective_frame_ids = [int(frame_id) for frame_id in selected_frame_ids]
+            effective_keep_indices = list(range(input_count))
+            effective_chunk_weights = [1.0 for _ in effective_keep_indices]
+        else:
+            effective_chunks = list(accumulation_input)
+            effective_intensity = [prepared_intensity[index] for index in keep_indices]
+            effective_centers = [selected_centers[index] for index in keep_indices]
+            effective_frame_ids = [int(selected_frame_ids[index]) for index in keep_indices]
+            effective_keep_indices = list(keep_indices)
+            effective_chunk_weights = attempt_chunk_weights
+        synced_metrics["registration_fallback_applied"] = bool(fallback_applied)
+        synced_metrics["registration_fallback_min_kept_chunks"] = int(fallback_min_kept_chunks)
+        synced_metrics["registration_attempt_output_chunk_count"] = attempt_output_count
+        synced_metrics["registration_attempt_dropped_count"] = attempt_dropped_count
+        synced_metrics["registration_attempt_keep_indices"] = list(keep_indices)
+        synced_metrics["registration_attempt_chunk_weights"] = list(attempt_chunk_weights)
+        synced_metrics["registration_output_chunk_count"] = int(len(effective_keep_indices))
+        synced_metrics["registration_dropped_count"] = max(0, int(input_count - len(effective_keep_indices)))
+        synced_metrics["registration_keep_indices"] = list(effective_keep_indices)
+        synced_metrics["registration_chunk_weights"] = list(effective_chunk_weights)
         return (
-            list(accumulation_input),
-            [prepared_intensity[index] for index in keep_indices],
-            [selected_centers[index] for index in keep_indices],
-            [int(selected_frame_ids[index]) for index in keep_indices],
+            effective_chunks,
+            effective_intensity,
+            effective_centers,
+            effective_frame_ids,
             synced_metrics,
         )
 
@@ -912,6 +1248,19 @@ class VoxelFusionAccumulator:
             return base_weights
         return [1.0 for _ in chunks]
 
+    def _confidence_chunk_weights(
+        self,
+        chunks: list[np.ndarray],
+        chunk_weights: list[float],
+        registration_metrics: dict[str, Any],
+    ) -> list[float]:
+        if self.fusion_method == "weighted_voxel_fusion":
+            return [float(weight) for weight in chunk_weights]
+        reg_weights = registration_metrics.get("registration_chunk_weights")
+        if reg_weights and len(reg_weights) == len(chunks):
+            return [float(weight) for weight in reg_weights]
+        return [1.0 for _ in chunks]
+
     def _quality_weighted_chunk_weights(self, track: Track, chunks: list[np.ndarray], long_vehicle_mode_applied: bool) -> list[float]:
         if not chunks:
             return []
@@ -948,9 +1297,17 @@ class VoxelFusionAccumulator:
         chunks: list[np.ndarray],
         intensities: list[np.ndarray | None],
         chunk_weights: list[float],
+        confidence_chunk_weights: list[float],
         min_observations: int,
-    ) -> tuple[np.ndarray, np.ndarray | None, int, int, int]:
-        return self._voxel_accumulate(chunks, intensities, chunk_weights, self.config.fusion_voxel_size, min_observations)
+    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray, int, int, int]:
+        return self._voxel_accumulate(
+            chunks,
+            intensities,
+            chunk_weights,
+            confidence_chunk_weights,
+            self.config.fusion_voxel_size,
+            min_observations,
+        )
 
     def _voxel_downsample(
         self,
@@ -967,13 +1324,15 @@ class VoxelFusionAccumulator:
         chunks: list[np.ndarray],
         intensities: list[np.ndarray | None],
         chunk_weights: list[float],
+        confidence_chunk_weights: list[float],
         voxel_size: float,
         min_observations: int,
-    ) -> tuple[np.ndarray, np.ndarray | None, int, int, int]:
+    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray, int, int, int]:
         voxel_sum: dict[tuple[int, int, int], np.ndarray] = {}
         voxel_weight_sum: dict[tuple[int, int, int], float] = {}
         voxel_hits: dict[tuple[int, int, int], int] = {}
         voxel_intensity_sum: dict[tuple[int, int, int], float] = {}
+        voxel_confidence_sum: dict[tuple[int, int, int], float] = {}
         has_intensity = len(intensities) == len(chunks) and all(
             intensity is not None and len(np.asarray(intensity, dtype=np.float32)) == len(points)
             for points, intensity in zip(chunks, intensities)
@@ -984,6 +1343,7 @@ class VoxelFusionAccumulator:
                 continue
             raw_points += len(points)
             weight = float(chunk_weights[chunk_index]) if chunk_index < len(chunk_weights) else 1.0
+            confidence_weight = float(confidence_chunk_weights[chunk_index]) if chunk_index < len(confidence_chunk_weights) else 1.0
             voxels = np.floor(points / float(voxel_size)).astype(np.int32)
             unique, inverse = np.unique(voxels, axis=0, return_inverse=True)
             intensity_values = np.asarray(intensities[chunk_index], dtype=np.float32) if has_intensity else None
@@ -996,54 +1356,70 @@ class VoxelFusionAccumulator:
                     voxel_sum[key] = point_mean * weight
                     voxel_weight_sum[key] = weight
                     voxel_hits[key] = 1
+                    voxel_confidence_sum[key] = confidence_weight
                     if intensity_values is not None:
                         voxel_intensity_sum[key] = intensity_mean * weight
                 else:
                     voxel_sum[key] += point_mean * weight
                     voxel_weight_sum[key] += weight
                     voxel_hits[key] += 1
+                    voxel_confidence_sum[key] += confidence_weight
                     if intensity_values is not None:
                         voxel_intensity_sum[key] += intensity_mean * weight
         if not voxel_sum:
-            return np.zeros((0, 3), dtype=np.float32), None, raw_points, 0, 0
+            return np.zeros((0, 3), dtype=np.float32), None, np.zeros((0,), dtype=np.float32), raw_points, 0, 0
         kept = []
         kept_intensity = []
+        kept_confidence = []
         for key, hits in voxel_hits.items():
             if hits < max(1, int(min_observations)):
                 continue
             kept.append(voxel_sum[key] / max(voxel_weight_sum[key], 1e-6))
+            kept_confidence.append(float(voxel_confidence_sum[key]))
             if has_intensity:
                 kept_intensity.append(voxel_intensity_sum[key] / max(voxel_weight_sum[key], 1e-6))
         if not kept:
-            return np.zeros((0, 3), dtype=np.float32), None, raw_points, len(voxel_sum), 0
+            return np.zeros((0, 3), dtype=np.float32), None, np.zeros((0,), dtype=np.float32), raw_points, len(voxel_sum), 0
         xyz = np.asarray(kept, dtype=np.float32)
         intensity = np.asarray(kept_intensity, dtype=np.float32) if has_intensity else None
-        return xyz, intensity, raw_points, len(voxel_sum), len(kept)
+        confidence = np.asarray(kept_confidence, dtype=np.float32)
+        return xyz, intensity, confidence, raw_points, len(voxel_sum), len(kept)
 
     def _post_filter(
         self,
         xyz: np.ndarray,
         intensity: np.ndarray | None,
-    ) -> tuple[np.ndarray, np.ndarray | None, int, int, int]:
+        confidence: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, int, int, int]:
         if len(xyz) == 0:
-            return np.zeros((0, 3), dtype=np.float32), None, 0, 0, 0
+            empty_confidence = None if confidence is None else np.zeros((0,), dtype=np.float32)
+            return np.zeros((0, 3), dtype=np.float32), None, empty_confidence, 0, 0, 0
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(np.asarray(xyz, dtype=np.float64))
         raw_count = len(pcd.points)
         stat_count = raw_count
         filtered_intensity = None if intensity is None else np.asarray(intensity, dtype=np.float32).copy()
+        filtered_confidence = None if confidence is None else np.asarray(confidence, dtype=np.float32).copy()
         if raw_count >= max(8, int(self.config.post_filter_stat_nb_neighbors)):
             pcd, keep_indices = pcd.remove_statistical_outlier(
                 nb_neighbors=int(self.config.post_filter_stat_nb_neighbors),
                 std_ratio=float(self.config.post_filter_stat_std_ratio),
             )
             stat_count = len(pcd.points)
+            keep = np.asarray(keep_indices, dtype=np.int32)
             if filtered_intensity is not None:
-                filtered_intensity = filtered_intensity[np.asarray(keep_indices, dtype=np.int32)]
+                filtered_intensity = filtered_intensity[keep]
+            if filtered_confidence is not None:
+                filtered_confidence = filtered_confidence[keep]
         current_xyz = np.asarray(pcd.points, dtype=np.float32)
         if self.config.aggregate_voxel > 0 and len(current_xyz) > 0:
-            current_xyz, filtered_intensity = self._mean_per_voxel(current_xyz, filtered_intensity, self.config.aggregate_voxel)
-        return current_xyz, filtered_intensity, raw_count, stat_count, len(current_xyz)
+            current_xyz, filtered_intensity, filtered_confidence = self._aggregate_per_voxel(
+                current_xyz,
+                filtered_intensity,
+                filtered_confidence,
+                self.config.aggregate_voxel,
+            )
+        return current_xyz, filtered_intensity, filtered_confidence, raw_count, stat_count, len(current_xyz)
 
     def _effective_frame_selection_method(self, track: Track, long_vehicle_mode_applied: bool) -> str:
         method = str(self.config.frame_selection_method)
@@ -1079,18 +1455,20 @@ class VoxelFusionAccumulator:
         self,
         xyz: np.ndarray,
         intensity: np.ndarray | None,
+        confidence: np.ndarray | None,
         long_vehicle_mode_applied: bool,
-    ) -> tuple[np.ndarray, np.ndarray | None, int, int, float]:
+    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, int, int, float]:
         longitudinal_extent = self._longitudinal_extent(xyz)
         if len(xyz) == 0:
-            return np.zeros((0, 3), dtype=np.float32), None, 0, 0, longitudinal_extent
-        components = self._components(xyz, intensity)
+            empty_confidence = None if confidence is None else np.zeros((0,), dtype=np.float32)
+            return np.zeros((0, 3), dtype=np.float32), None, empty_confidence, 0, 0, longitudinal_extent
+        components = self._components(xyz, intensity, confidence)
         if not long_vehicle_mode_applied or len(components) <= 1:
-            return np.asarray(xyz, dtype=np.float32), intensity, len(components), 0, longitudinal_extent
+            return np.asarray(xyz, dtype=np.float32), intensity, confidence, len(components), 0, longitudinal_extent
 
-        bridge_points, bridge_intensity, bridge_count = self._tail_bridge_components(components)
+        bridge_points, bridge_intensity, bridge_confidence, bridge_count = self._tail_bridge_components(components)
         if len(bridge_points) == 0:
-            return np.asarray(xyz, dtype=np.float32), intensity, len(components), 0, longitudinal_extent
+            return np.asarray(xyz, dtype=np.float32), intensity, confidence, len(components), 0, longitudinal_extent
 
         bridged_xyz = np.vstack([np.asarray(xyz, dtype=np.float32), bridge_points.astype(np.float32)])
         bridged_intensity = None
@@ -1099,22 +1477,42 @@ class VoxelFusionAccumulator:
                 [np.asarray(intensity, dtype=np.float32), np.asarray(bridge_intensity, dtype=np.float32)],
                 axis=0,
             ).astype(np.float32, copy=False)
-        bridged_xyz, bridged_intensity, _, _, _ = self._post_filter(bridged_xyz, bridged_intensity)
-        bridged_components = self._components(bridged_xyz, bridged_intensity)
-        return bridged_xyz, bridged_intensity, len(bridged_components), bridge_count, self._longitudinal_extent(bridged_xyz)
+        bridged_confidence = None
+        if confidence is not None and bridge_confidence is not None:
+            bridged_confidence = np.concatenate(
+                [np.asarray(confidence, dtype=np.float32), np.asarray(bridge_confidence, dtype=np.float32)],
+                axis=0,
+            ).astype(np.float32, copy=False)
+        bridged_xyz, bridged_intensity, bridged_confidence, _, _, _ = self._post_filter(
+            bridged_xyz,
+            bridged_intensity,
+            bridged_confidence,
+        )
+        bridged_components = self._components(bridged_xyz, bridged_intensity, bridged_confidence)
+        return bridged_xyz, bridged_intensity, bridged_confidence, len(bridged_components), bridge_count, self._longitudinal_extent(bridged_xyz)
 
-    def _components(self, xyz: np.ndarray, intensity: np.ndarray | None) -> list[tuple[np.ndarray, np.ndarray | None]]:
+    def _components(
+        self,
+        xyz: np.ndarray,
+        intensity: np.ndarray | None,
+        confidence: np.ndarray | None,
+    ) -> list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None]]:
         points = np.asarray(xyz, dtype=np.float32)
         if len(points) == 0:
             return []
         if len(points) < 3:
-            return [(points, None if intensity is None else np.asarray(intensity, dtype=np.float32))]
+            return [(
+                points,
+                None if intensity is None else np.asarray(intensity, dtype=np.float32),
+                None if confidence is None else np.asarray(confidence, dtype=np.float32),
+            )]
         eps = max(0.35, float(max(self.config.aggregate_voxel, self.config.fusion_voxel_size)) * 5.0)
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
         labels = np.asarray(pcd.cluster_dbscan(eps=eps, min_points=1, print_progress=False), dtype=np.int32)
         components = []
         intensity_values = None if intensity is None else np.asarray(intensity, dtype=np.float32)
+        confidence_values = None if confidence is None else np.asarray(confidence, dtype=np.float32)
         for label in sorted(set(labels.tolist())):
             if label < 0:
                 continue
@@ -1123,23 +1521,25 @@ class VoxelFusionAccumulator:
             if len(component_points) == 0:
                 continue
             component_intensity = None if intensity_values is None else intensity_values[mask]
-            components.append((np.asarray(component_points, dtype=np.float32), component_intensity))
+            component_confidence = None if confidence_values is None else confidence_values[mask]
+            components.append((np.asarray(component_points, dtype=np.float32), component_intensity, component_confidence))
         return components
 
     def _tail_bridge_components(
         self,
-        components: list[tuple[np.ndarray, np.ndarray | None]],
-    ) -> tuple[np.ndarray, np.ndarray | None, int]:
+        components: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None]],
+    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, int]:
         axis_idx = axis_to_index(self.config.frame_selection_line_axis)
         lateral_idx, vertical_idx = orthogonal_axes(axis_idx)
         sorted_components = sorted(components, key=lambda component: float(np.mean(component[0][:, axis_idx])))
         step = max(0.08, float(max(self.config.aggregate_voxel, self.config.fusion_voxel_size)) * 0.9)
         bridges = []
         bridge_intensity_parts = []
+        bridge_confidence_parts = []
         bridge_count = 0
         for left, right in zip(sorted_components[:-1], sorted_components[1:]):
-            left_points, left_intensity = left
-            right_points, right_intensity = right
+            left_points, left_intensity, left_confidence = left
+            right_points, right_intensity, right_confidence = right
             left_min = np.min(left_points, axis=0)
             left_max = np.max(left_points, axis=0)
             right_min = np.min(right_points, axis=0)
@@ -1170,16 +1570,30 @@ class VoxelFusionAccumulator:
                 )
             else:
                 bridge_intensity_parts.append(None)
+            if left_confidence is not None and right_confidence is not None:
+                left_conf_mean = float(np.mean(np.asarray(left_confidence, dtype=np.float32)))
+                right_conf_mean = float(np.mean(np.asarray(right_confidence, dtype=np.float32)))
+                bridge_confidence_parts.append(
+                    np.asarray([(1.0 - alpha) * left_conf_mean + alpha * right_conf_mean for alpha in alphas], dtype=np.float32)
+                )
+            else:
+                bridge_confidence_parts.append(None)
             bridge_count += 1
         if not bridges:
-            return np.zeros((0, 3), dtype=np.float32), None, 0
+            return np.zeros((0, 3), dtype=np.float32), None, None, 0
         bridge_intensity = None
         if bridge_intensity_parts and all(values is not None for values in bridge_intensity_parts):
             bridge_intensity = np.concatenate(
                 [np.asarray(values, dtype=np.float32) for values in bridge_intensity_parts if values is not None],
                 axis=0,
             ).astype(np.float32, copy=False)
-        return np.vstack(bridges).astype(np.float32), bridge_intensity, bridge_count
+        bridge_confidence = None
+        if bridge_confidence_parts and all(values is not None for values in bridge_confidence_parts):
+            bridge_confidence = np.concatenate(
+                [np.asarray(values, dtype=np.float32) for values in bridge_confidence_parts if values is not None],
+                axis=0,
+            ).astype(np.float32, copy=False)
+        return np.vstack(bridges).astype(np.float32), bridge_intensity, bridge_confidence, bridge_count
 
     def _mean_per_voxel(
         self,
@@ -1187,24 +1601,126 @@ class VoxelFusionAccumulator:
         intensity: np.ndarray | None,
         voxel_size: float,
     ) -> tuple[np.ndarray, np.ndarray | None]:
+        reduced_xyz, reduced_intensity, _ = self._aggregate_per_voxel(xyz, intensity, None, voxel_size)
+        return reduced_xyz, reduced_intensity
+
+    def _aggregate_per_voxel(
+        self,
+        xyz: np.ndarray,
+        intensity: np.ndarray | None,
+        confidence: np.ndarray | None,
+        voxel_size: float,
+    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
         if len(xyz) == 0:
-            return np.zeros((0, 3), dtype=np.float32), None if intensity is None else np.zeros((0,), dtype=np.float32)
+            return (
+                np.zeros((0, 3), dtype=np.float32),
+                None if intensity is None else np.zeros((0,), dtype=np.float32),
+                None if confidence is None else np.zeros((0,), dtype=np.float32),
+            )
         voxels = np.floor(np.asarray(xyz, dtype=np.float32) / float(voxel_size)).astype(np.int32)
         unique, inverse = np.unique(voxels, axis=0, return_inverse=True)
         intensity_values = None
         if intensity is not None and len(np.asarray(intensity, dtype=np.float32)) == len(xyz):
             intensity_values = np.asarray(intensity, dtype=np.float32)
+        confidence_values = None
+        if confidence is not None and len(np.asarray(confidence, dtype=np.float32)) == len(xyz):
+            confidence_values = np.asarray(confidence, dtype=np.float32)
         reduced_points = []
         reduced_intensity = []
+        reduced_confidence = []
         for index in range(len(unique)):
             mask = inverse == index
             reduced_points.append(np.asarray(xyz, dtype=np.float32)[mask].mean(axis=0))
             if intensity_values is not None:
                 reduced_intensity.append(float(np.mean(intensity_values[mask])))
+            if confidence_values is not None:
+                reduced_confidence.append(float(np.sum(confidence_values[mask])))
         return (
             np.asarray(reduced_points, dtype=np.float32),
             None if intensity_values is None else np.asarray(reduced_intensity, dtype=np.float32),
+            None if confidence_values is None else np.asarray(reduced_confidence, dtype=np.float32),
         )
+
+    def _apply_confidence_point_cap(
+        self,
+        xyz: np.ndarray,
+        intensity: np.ndarray | None,
+        confidence: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, bool]:
+        points = np.asarray(xyz, dtype=np.float32)
+        intensity_values = None if intensity is None else np.asarray(intensity, dtype=np.float32)
+        confidence_values = None if confidence is None else np.asarray(confidence, dtype=np.float32)
+        if not self.config.enable_confidence_point_cap:
+            return points, intensity_values, confidence_values, False
+        target = int(self.config.confidence_point_cap_max_points)
+        if len(points) <= target:
+            return points, intensity_values, confidence_values, False
+        if confidence_values is None or len(confidence_values) != len(points):
+            confidence_values = np.ones((len(points),), dtype=np.float32)
+        selected_indices = self._confidence_point_cap_indices(points, confidence_values, target, int(self.config.confidence_point_cap_bins))
+        capped_points = points[selected_indices]
+        capped_intensity = None if intensity_values is None else intensity_values[selected_indices]
+        capped_confidence = confidence_values[selected_indices]
+        return capped_points, capped_intensity, capped_confidence, True
+
+    def _confidence_point_cap_indices(
+        self,
+        points: np.ndarray,
+        confidence: np.ndarray,
+        target: int,
+        bin_count: int,
+    ) -> np.ndarray:
+        point_count = int(len(points))
+        if point_count <= target:
+            return np.arange(point_count, dtype=np.int32)
+        axis_idx = axis_to_index(self.config.frame_selection_line_axis)
+        axis_values = np.asarray(points, dtype=np.float32)[:, axis_idx]
+        if bin_count <= 1 or not np.all(np.isfinite(axis_values)):
+            return self._top_confidence_indices(confidence, np.arange(point_count, dtype=np.int32), target)
+        axis_min = float(np.min(axis_values))
+        axis_max = float(np.max(axis_values))
+        axis_span = axis_max - axis_min
+        if axis_span <= 1e-6:
+            return self._top_confidence_indices(confidence, np.arange(point_count, dtype=np.int32), target)
+        normalized = (axis_values - axis_min) / axis_span
+        bin_indices = np.clip(np.floor(normalized * float(bin_count)).astype(np.int32), 0, int(bin_count) - 1)
+        occupied_bins = sorted(int(bin_id) for bin_id in np.unique(bin_indices))
+        if not occupied_bins:
+            return self._top_confidence_indices(confidence, np.arange(point_count, dtype=np.int32), target)
+        base_budget = int(target // len(occupied_bins))
+        selected_mask = np.zeros((point_count,), dtype=bool)
+        selected_parts: list[np.ndarray] = []
+        for bin_id in occupied_bins:
+            bin_member_indices = np.flatnonzero(bin_indices == int(bin_id)).astype(np.int32)
+            if len(bin_member_indices) == 0 or base_budget <= 0:
+                continue
+            ranked = self._top_confidence_indices(confidence, bin_member_indices, min(base_budget, len(bin_member_indices)))
+            selected_parts.append(ranked)
+            selected_mask[ranked] = True
+        selected_count = int(sum(len(part) for part in selected_parts))
+        remaining_budget = max(0, int(target) - selected_count)
+        if remaining_budget > 0:
+            remaining_indices = np.flatnonzero(~selected_mask).astype(np.int32)
+            if len(remaining_indices) > 0:
+                selected_parts.append(self._top_confidence_indices(confidence, remaining_indices, remaining_budget))
+        if not selected_parts:
+            return self._top_confidence_indices(confidence, np.arange(point_count, dtype=np.int32), target)
+        selected = np.concatenate(selected_parts, axis=0).astype(np.int32, copy=False)
+        if len(selected) > target:
+            selected = self._top_confidence_indices(confidence, selected, target)
+        return np.sort(selected, kind="stable")
+
+    def _top_confidence_indices(
+        self,
+        confidence: np.ndarray,
+        candidate_indices: np.ndarray,
+        keep_count: int,
+    ) -> np.ndarray:
+        if keep_count <= 0 or len(candidate_indices) == 0:
+            return np.zeros((0,), dtype=np.int32)
+        candidates = np.asarray(candidate_indices, dtype=np.int32)
+        order = np.argsort(-np.asarray(confidence, dtype=np.float32)[candidates], kind="stable")
+        return candidates[order[: int(keep_count)]]
 
     def _axis_gap(self, left_min: float, left_max: float, right_min: float, right_max: float) -> float:
         return max(0.0, max(float(right_min) - float(left_max), float(left_min) - float(right_max)))

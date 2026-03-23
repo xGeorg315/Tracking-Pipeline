@@ -17,6 +17,7 @@ from tracking_pipeline.infrastructure.clustering.range_image_connected_component
 from tracking_pipeline.infrastructure.clustering.range_image_depth_jump import RangeImageDepthJumpClusterer
 from tracking_pipeline.infrastructure.clustering.beam_neighbor_region_growing import BeamNeighborRegionGrowingClusterer
 from tracking_pipeline.infrastructure.io.artifact_writer import JsonArtifactWriter
+from tracking_pipeline.infrastructure.postprocessing.articulated_vehicle_merge import ArticulatedVehicleMergePostprocessor
 from tracking_pipeline.infrastructure.postprocessing.co_moving_track_merge import CoMovingTrackMergePostprocessor
 from tracking_pipeline.infrastructure.postprocessing.track_quality_scoring import TrackQualityScoringPostprocessor
 from tracking_pipeline.infrastructure.postprocessing.tracklet_stitching import TrackletStitchingPostprocessor
@@ -72,6 +73,13 @@ def build_track_postprocessors(config: PipelineConfig) -> list[TrackPostprocesso
     processors: list[TrackPostprocessor] = []
     if config.postprocessing.enable_tracklet_stitching:
         processors.append(TrackletStitchingPostprocessor(config.postprocessing))
+    if config.postprocessing.enable_articulated_vehicle_merge:
+        processors.append(
+            ArticulatedVehicleMergePostprocessor(
+                config.postprocessing,
+                config.aggregation.frame_selection_line_axis,
+            )
+        )
     if config.postprocessing.enable_co_moving_track_merge:
         processors.append(
             CoMovingTrackMergePostprocessor(
@@ -110,4 +118,9 @@ def build_artifact_writer(project_root: Path) -> ArtifactWriter:
 
 
 def build_viewer(config: PipelineConfig) -> ReplayViewer:
-    return Open3DReplayViewer(config.visualization)
+    return Open3DReplayViewer(
+        config.visualization,
+        track_exit_edge_margin=config.output.track_exit_edge_margin,
+        require_track_exit=config.output.require_track_exit,
+        track_exit_line_axis=config.aggregation.frame_selection_line_axis,
+    )

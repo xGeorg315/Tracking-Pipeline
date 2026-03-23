@@ -3,9 +3,15 @@ from __future__ import annotations
 import numpy as np
 
 from tracking_pipeline.config.models import TrackingConfig
-from tracking_pipeline.domain.models import ActiveTrackState, Detection, FrameTrackingState, Track
+from tracking_pipeline.domain.models import ActiveTrackState, Detection, FrameTrackerDebug, FrameTrackingState, Track, TrackDebugState
 from tracking_pipeline.infrastructure.tracking.assignment import assign_cost_matrix, build_cost_matrix
-from tracking_pipeline.infrastructure.tracking.common import append_detection, initialize_track
+from tracking_pipeline.infrastructure.tracking.common import (
+    append_detection,
+    build_tracker_metrics,
+    initialize_track,
+    make_detection_debug_states,
+    record_missed_track,
+)
 
 
 class EuclideanNNTracker:
@@ -21,14 +27,23 @@ class EuclideanNNTracker:
         self.tracks[track_id] = initialize_track(track_id, detection, frame_idx, frame_timestamp_ns)
         return ActiveTrackState(track_id=track_id, points=detection.points, center=detection.center, intensity=detection.intensity)
 
-    def _associate(self, detections: list[Detection]) -> tuple[dict[int, int], list[int], list[int]]:
+    def _associate(
+        self,
+        detections: list[Detection],
+    ) -> tuple[dict[int, int], list[int], list[int], dict[int, np.ndarray], dict[int, float]]:
         track_ids = list(self.tracks.keys())
         if not track_ids and not detections:
-            return {}, [], []
+            return {}, [], [], {}, {}
         if not track_ids:
-            return {}, [], list(range(len(detections)))
+            return {}, [], list(range(len(detections))), {}, {}
         if not detections:
-            return {}, track_ids, []
+            return (
+                {},
+                track_ids,
+                [],
+                {track_id: np.asarray(self.tracks[track_id].current_center(), dtype=np.float32).copy() for track_id in track_ids},
+                {track_id: float(self.config.max_dist) for track_id in track_ids},
+            )
 
         predicted = np.array([self.tracks[track_id].current_center() for track_id in track_ids], dtype=np.float32)
         predicted_extents = np.array([self.tracks[track_id].current_extent() for track_id in track_ids], dtype=np.float32)
@@ -39,20 +54,43 @@ class EuclideanNNTracker:
         assignment_rows, unmatched_rows, unmatched_detections = assign_cost_matrix(cost, valid, method="greedy")
         assignments = {track_ids[row]: detection_idx for row, detection_idx in assignment_rows.items()}
         unmatched_tracks = [track_ids[row] for row in unmatched_rows]
-        return assignments, unmatched_tracks, unmatched_detections
+        return (
+            assignments,
+            unmatched_tracks,
+            unmatched_detections,
+            {track_id: predicted[idx] for idx, track_id in enumerate(track_ids)},
+            {track_id: float(self.config.max_dist) for track_id in track_ids},
+        )
 
     def step(self, detections: list[Detection], frame_idx: int, frame_timestamp_ns: int) -> FrameTrackingState:
-        assignments, unmatched_tracks, unmatched_detections = self._associate(detections)
+        assignments, unmatched_tracks, unmatched_detections, predicted_by_track, gate_by_track = self._associate(detections)
         active_tracks: list[ActiveTrackState] = []
+        detection_debug_states = make_detection_debug_states(detections)
+        track_debug_states: list[TrackDebugState] = []
 
         for track_id, detection_idx in assignments.items():
             detection = detections[detection_idx]
+            missed_before = int(self.tracks[track_id].missed)
             append_detection(
                 self.tracks[track_id],
                 detection,
                 frame_idx,
                 frame_timestamp_ns,
                 np.asarray(detection.center, dtype=np.float32),
+            )
+            detection_debug_states[detection_idx].status = "matched"
+            detection_debug_states[detection_idx].matched_track_id = int(track_id)
+            track_debug_states.append(
+                TrackDebugState(
+                    track_id=int(track_id),
+                    predicted_center=np.asarray(predicted_by_track.get(track_id), dtype=np.float32).copy(),
+                    output_center=np.asarray(detection.center, dtype=np.float32).copy(),
+                    status="matched",
+                    matched_detection_id=int(detection.detection_id),
+                    gate_radius=float(gate_by_track.get(track_id, 0.0)),
+                    missed_before=missed_before,
+                    missed_after=int(self.tracks[track_id].missed),
+                )
             )
             active_tracks.append(
                 ActiveTrackState(
@@ -66,8 +104,19 @@ class EuclideanNNTracker:
         to_delete = []
         for track_id in unmatched_tracks:
             track = self.tracks[track_id]
-            track.missed += 1
-            track.age += 1
+            missed_before, missed_after = record_missed_track(track)
+            predicted_center = predicted_by_track.get(track_id)
+            track_debug_states.append(
+                TrackDebugState(
+                    track_id=int(track_id),
+                    predicted_center=None if predicted_center is None else np.asarray(predicted_center, dtype=np.float32).copy(),
+                    output_center=None if predicted_center is None else np.asarray(predicted_center, dtype=np.float32).copy(),
+                    status="missed",
+                    gate_radius=float(gate_by_track.get(track_id, 0.0)),
+                    missed_before=missed_before,
+                    missed_after=missed_after,
+                )
+            )
             if track.missed > int(self.config.max_missed):
                 track.ended_by_missed = True
                 self.finished_tracks[track_id] = track
@@ -76,20 +125,47 @@ class EuclideanNNTracker:
             del self.tracks[track_id]
 
         for detection_idx in unmatched_detections:
-            active_tracks.append(self._spawn_track(detections[detection_idx], frame_idx, frame_timestamp_ns))
+            detection = detections[detection_idx]
+            if self._should_suppress_spawn(detection):
+                detection_debug_states[detection_idx].status = "spawn_suppressed"
+                detection_debug_states[detection_idx].spawn_suppressed = True
+                continue
+            spawned_state = self._spawn_track(detection, frame_idx, frame_timestamp_ns)
+            active_tracks.append(spawned_state)
+            detection_debug_states[detection_idx].status = "spawned"
+            detection_debug_states[detection_idx].spawned_track_id = int(spawned_state.track_id)
+            track_debug_states.append(
+                TrackDebugState(
+                    track_id=int(spawned_state.track_id),
+                    output_center=np.asarray(spawned_state.center, dtype=np.float32).copy(),
+                    status="spawned",
+                    matched_detection_id=int(detection.detection_id),
+                )
+            )
+
+        tracker_debug = FrameTrackerDebug(
+            assignment_method="greedy",
+            track_states=track_debug_states,
+            detection_states=detection_debug_states,
+            matched_count=sum(1 for state in track_debug_states if state.status == "matched"),
+            missed_count=sum(1 for state in track_debug_states if state.status == "missed"),
+            spawned_count=sum(1 for state in track_debug_states if state.status == "spawned"),
+            suppressed_count=sum(1 for state in detection_debug_states if state.status == "spawn_suppressed"),
+            halo_detection_count=sum(1 for state in detection_debug_states if state.tracking_halo_only),
+        )
 
         return FrameTrackingState(
             frame_index=frame_idx,
             lane_points=np.zeros((0, 3), dtype=np.float32),
             detections=detections,
             active_tracks=active_tracks,
-            tracker_metrics={
-                "assignment_method": "greedy",
-                "matched_count": len(assignments),
-                "unmatched_track_count": len(unmatched_tracks),
-                "unmatched_detection_count": len(unmatched_detections),
-            },
+            tracker_metrics=build_tracker_metrics(tracker_debug),
+            tracker_debug=tracker_debug,
         )
+
+    @staticmethod
+    def _should_suppress_spawn(detection: Detection) -> bool:
+        return bool(detection.metadata.get("spawn_suppressed", False))
 
     def finalize(self) -> dict[int, Track]:
         for track_id, track in self.tracks.items():

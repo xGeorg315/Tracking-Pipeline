@@ -12,7 +12,7 @@ import yaml
 
 from tracking_pipeline.application.performance import STAGE_NAMES
 from tracking_pipeline.application.services import build_benchmark_name, resolve_benchmark_root
-from tracking_pipeline.config.loader import load_config
+from tracking_pipeline.config.loader import load_config, resolve_input_paths
 from tracking_pipeline.config.models import BenchmarkConfig, PipelineConfig
 from tracking_pipeline.infrastructure.io.manifest_writer import ManifestWriter
 
@@ -67,7 +67,11 @@ class BenchmarkRunner:
                 for phase, count in (("warmup", config.warmup_runs), ("measure", config.measure_runs)):
                     for run_index in range(1, count + 1):
                         pipeline_config = load_config(preset_path)
-                        pipeline_config.input.paths = [str(Path(sequence_path).resolve())]
+                        pipeline_config.input.paths = resolve_input_paths(
+                            [sequence_path],
+                            config.config_path.parent if config.config_path is not None else self.project_root,
+                            field_name="benchmark.sequences",
+                        )
                         run_root = (runs_root / sequence_name / preset_name / f"{phase}_{run_index:02d}").resolve()
                         pipeline_config.output.root_dir = str(run_root)
                         resolved_config_path = self._write_resolved_config(

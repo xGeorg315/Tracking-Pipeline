@@ -84,11 +84,47 @@ class ClusterResult:
 
 
 @dataclass(slots=True)
+class TrackDebugState:
+    track_id: int
+    predicted_center: np.ndarray | None = None
+    output_center: np.ndarray | None = None
+    status: str = ""
+    matched_detection_id: int | None = None
+    gate_radius: float | None = None
+    missed_before: int = 0
+    missed_after: int = 0
+
+
+@dataclass(slots=True)
+class DetectionDebugState:
+    detection_id: int
+    center: np.ndarray
+    status: str = ""
+    matched_track_id: int | None = None
+    spawned_track_id: int | None = None
+    spawn_suppressed: bool = False
+    tracking_halo_only: bool = False
+
+
+@dataclass(slots=True)
+class FrameTrackerDebug:
+    assignment_method: str = ""
+    track_states: list[TrackDebugState] = field(default_factory=list)
+    detection_states: list[DetectionDebugState] = field(default_factory=list)
+    matched_count: int = 0
+    missed_count: int = 0
+    spawned_count: int = 0
+    suppressed_count: int = 0
+    halo_detection_count: int = 0
+
+
+@dataclass(slots=True)
 class ActiveTrackState:
     track_id: int
     points: np.ndarray
     center: np.ndarray
     intensity: np.ndarray | None = None
+    status: str = "matched"
 
 
 @dataclass(slots=True)
@@ -97,9 +133,12 @@ class FrameTrackingState:
     lane_points: np.ndarray
     detections: list[Detection]
     active_tracks: list[ActiveTrackState]
+    full_frame_points: np.ndarray | None = None
+    full_frame_intensity: np.ndarray | None = None
     lane_intensity: np.ndarray | None = None
     cluster_metrics: dict[str, Any] = field(default_factory=dict)
     tracker_metrics: dict[str, Any] = field(default_factory=dict)
+    tracker_debug: FrameTrackerDebug | None = None
 
 
 @dataclass(slots=True)
@@ -173,6 +212,43 @@ class AggregateResult:
     status: str
     metrics: dict[str, Any] = field(default_factory=dict)
     intensity: np.ndarray | None = None
+
+
+@dataclass(slots=True)
+class TrackOutcomeDebug:
+    track_id: int
+    status: str
+    decision_stage: str
+    decision_reason_code: str
+    decision_summary: str
+    last_frame_id: int = -1
+    last_playback_index: int = -1
+    last_center: np.ndarray | None = None
+    hit_count: int = 0
+    age: int = 0
+    missed: int = 0
+    ended_by_missed: bool = False
+    quality_score: float | None = None
+    selected_frame_ids: list[int] = field(default_factory=list)
+    tracker_debug_summary: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ArticulatedMergeDebugEvent:
+    lead_track_id: int
+    rear_track_id: int
+    accepted: bool
+    rejection_reason: str
+    playback_start_index: int
+    playback_end_index: int
+    full_gap_mean: float
+    full_gap_std: float
+    tail_gap_mean: float
+    tail_gap_std: float
+    tail_window_frame_count: int
+    mean_lateral_offset: float
+    mean_vertical_offset: float
+    center: np.ndarray | None = None
 
 
 @dataclass(slots=True)

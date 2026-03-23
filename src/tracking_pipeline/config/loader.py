@@ -18,7 +18,7 @@ from tracking_pipeline.config.models import (
     TrackingConfig,
     VisualizationConfig,
 )
-from tracking_pipeline.config.validation import validate_benchmark_config, validate_config
+from tracking_pipeline.config.validation import ConfigError, validate_benchmark_config, validate_config
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -36,6 +36,34 @@ def _read_yaml(path: Path) -> dict[str, Any]:
         return yaml.safe_load(handle) or {}
 
 
+def _resolve_path(value: str | Path, base_dir: Path) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        path = base_dir / path
+    return path.resolve()
+
+
+def resolve_input_paths(values: list[str | Path], base_dir: Path, *, field_name: str = "input.paths") -> list[str]:
+    resolved_paths: list[str] = []
+    for value in values:
+        input_path = _resolve_path(value, base_dir)
+        if not input_path.is_dir():
+            resolved_paths.append(str(input_path))
+            continue
+        pb_files = sorted(
+            (
+                child.resolve()
+                for child in input_path.iterdir()
+                if child.is_file() and child.suffix == ".pb"
+            ),
+            key=lambda path: path.name,
+        )
+        if not pb_files:
+            raise ConfigError(f"{field_name} directory does not contain any .pb files: {input_path}")
+        resolved_paths.extend(str(path) for path in pb_files)
+    return resolved_paths
+
+
 def load_config(path: str | Path) -> PipelineConfig:
     cfg_path = Path(path).resolve()
     raw = _read_yaml(cfg_path)
@@ -45,13 +73,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         raw = _deep_merge(_read_yaml(base_path), raw)
 
     input_cfg = dict(raw["input"])
-    input_paths = []
-    for value in input_cfg.get("paths", []):
-        input_path = Path(value)
-        if not input_path.is_absolute():
-            input_path = (cfg_path.parent / input_path).resolve()
-        input_paths.append(str(input_path))
-    input_cfg["paths"] = input_paths
+    input_cfg["paths"] = resolve_input_paths(input_cfg.get("paths", []), cfg_path.parent, field_name="input.paths")
 
     config = PipelineConfig(
         input=InputConfig(**input_cfg),
@@ -74,17 +96,11 @@ def load_benchmark_config(path: str | Path) -> BenchmarkConfig:
 
     sequences = []
     for value in raw.get("sequences", []):
-        sequence_path = Path(value)
-        if not sequence_path.is_absolute():
-            sequence_path = (cfg_path.parent / sequence_path).resolve()
-        sequences.append(str(sequence_path))
+        sequences.append(str(_resolve_path(value, cfg_path.parent)))
 
     presets = []
     for value in raw.get("presets", []):
-        preset_path = Path(value)
-        if not preset_path.is_absolute():
-            preset_path = (cfg_path.parent / preset_path).resolve()
-        presets.append(str(preset_path))
+        presets.append(str(_resolve_path(value, cfg_path.parent)))
 
     config = BenchmarkConfig(
         sequences=sequences,

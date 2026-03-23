@@ -1,32 +1,42 @@
 input:
   paths:
-    # - ../data/20260316_120647_00001-00200.pb
-    # - ../data/20260316_120647_00201-00400.pb
-    - ../data/20260316_120647_00401-00600.pb
-    - ../data/20260316_120647_00601-00800.pb
-    - ../data/20260316_120647_00801-01000.pb
-    - ../data/20260316_120647_01001-01200.pb
-    # - ../data/20260316_120647_01201-01400.pb
-    # - ../data/20260316_120647_01401-01600.pb
-    # - ../data/20260316_120647_01601-01800.pb
-    # - ../data/20260316_120647_01801-02000.pb
-    # - ../data/20260316_120647_02001-02200.pb
-    # - ../data/20260316_120647_02201-02400.pb
-    # - ../data/20260316_120647_02401-02600.pb
-    # - ../data/20260316_120647_02601-02800.pb
-    # - ../data/20260316_120647_02801-03000.pb
-    # - ../data/20260316_120647_03001-03200.pb
-    # - ../data/20260316_120647_03201-03400.pb
-    # - ../data/20260316_120647_03401-03600.pb
+    - ../data/medium_2 # 115 Vehicles
+    # - ../data/medium_energy # 159 Vehicles
 tracking:
   algorithm: kalman_nn
+  max_dist: 7.5
+  max_missed: 2
+  min_track_hits: 6
+  sticky_extra_dist_per_missed: 1.0
+  sticky_max_dist: 12.0
+  kf_process_var: 0.8
+  kf_meas_var: 1.2
+  association_size_weight: 0.05
 aggregation:
   algorithm: registration_voxel_fusion
-  registration_backend: small_gicp
+  registration_backend: feature_global_then_local
   frame_selection_method: keyframe_motion
   keyframe_keep: 8
-  registration_min_fitness: 0.22
-  registration_max_corr_dist: 0.75
+  enable_registration_underfill_fallback: true
+  registration_min_kept_chunks: 2
+  registration_max_iter: 30
+  registration_max_translation: 3.5
+  registration_min_fitness: 0.3
+  registration_max_corr_dist: 0.5
   shape_consistency_filter: false
+  truncate_after_lane_end_touch: true
+  enable_confidence_point_cap: false
+  confidence_point_cap_max_points: 2048
+  confidence_point_cap_bins: 16
 postprocessing:
-  enable_trajectory_smoothing: false
+  enable_trajectory_smoothing: false 
+  enable_articulated_vehicle_merge: true
+  articulated_gap_eval_window_frames: 5
+  articulated_min_overlap_frames: 3
+  articulated_min_overlap_ratio: 0.6
+  articulated_max_lateral_offset: 0.6
+  articulated_max_vertical_offset: 5
+  articulated_max_hitch_gap: 1.75
+  articulated_max_hitch_gap_std: 0.6
+  articulated_max_speed_delta: 0.55
+  articulated_min_combined_length: 5.5

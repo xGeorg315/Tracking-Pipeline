@@ -3,13 +3,13 @@ input:
     - ../data/3.pb
   format: a42_pb
 preprocessing:
-  lane_box: [-2.10, 1.80, 4.0, 35.30, 0.12, 5.15]
+  lane_box: [-2.10, 1.80, 4.0, 35.30, 0.12, 4.8]
   bootstrap_frames: 10
 clustering:
   algorithm: dbscan
-  eps: 1.15
-  min_points: 20
-  vehicle_min_points: 12
+  eps: 1.0
+  min_points: 10
+  vehicle_min_points: 20
   vehicle_max_points: 10000
   plane_distance_threshold: 0.12
   plane_ransac_n: 3
@@ -27,15 +27,15 @@ clustering:
   sensor_ground_row_ignore: 0
 tracking:
   algorithm: kalman_nn
-  max_dist: 3.4
-  max_missed: 12
-  min_track_hits: 4
-  sticky_extra_dist_per_missed: 0.55
-  sticky_max_dist: 6.2
+  max_dist: 7.5
+  max_missed: 2
+  min_track_hits: 6
+  sticky_extra_dist_per_missed: 0.8
+  sticky_max_dist: 10.5
   kf_init_var: 5.0
-  kf_process_var: 0.08
-  kf_meas_var: 0.60
-  association_size_weight: 0.15
+  kf_process_var: 0.8
+  kf_meas_var: 1.2
+  association_size_weight: 0.05
 aggregation:
   algorithm: voxel_fusion
   symmetry_completion: true
@@ -66,7 +66,7 @@ aggregation:
   fusion_weight_mode: point_count
   consensus_ratio: 0.35
   min_track_quality_for_save: 0.0
-  min_saved_aggregate_points: 180
+  min_saved_aggregate_points: 50
   long_vehicle_mode: false
   long_vehicle_length_threshold: 4.5
   length_coverage_bins: 10
@@ -93,11 +93,15 @@ output:
   root_dir: runs
   save_world: false
   save_aggregate_intensity: true
-  require_track_exit: false
-  track_exit_edge_margin: 0.9 # 0.6 for best resulte
+  require_track_exit: true
+  track_exit_edge_margin: 5 
 visualization:
   enabled: true
   color_by_intensity: false
+  show_full_frame_pcd: true
+  show_tracker_debug: true
+  show_track_outcome_debug: true
+  show_articulated_merge_debug: true
   max_points: 12000
   max_cluster_points: 15000
   max_assoc_dist: 4.2

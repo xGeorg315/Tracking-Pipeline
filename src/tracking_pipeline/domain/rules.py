@@ -168,6 +168,141 @@ def select_keyframes_by_length_coverage(chunks: list[np.ndarray], axis_idx: int,
     return sorted(chosen)
 
 
+def _chunk_axis_intervals(chunks: list[np.ndarray], axis_idx: int) -> list[tuple[float, float]]:
+    intervals: list[tuple[float, float]] = []
+    for points in chunks:
+        if points is None or len(points) == 0:
+            intervals.append((0.0, 0.0))
+            continue
+        values = np.asarray(points, dtype=np.float64)[:, axis_idx]
+        values = values[np.isfinite(values)]
+        if len(values) == 0:
+            intervals.append((0.0, 0.0))
+        else:
+            intervals.append((float(np.min(values)), float(np.max(values))))
+    return intervals
+
+
+def _chunk_quality_scores(chunks: list[np.ndarray], axis_idx: int) -> list[tuple[float, float, float]]:
+    intervals = _chunk_axis_intervals(chunks, axis_idx)
+    scores: list[tuple[float, float, float]] = []
+    for points, (lo, hi) in zip(chunks, intervals):
+        arr = np.asarray(points, dtype=np.float32)
+        point_count = 0.0 if points is None else float(len(points))
+        span = float(hi - lo)
+        extent_norm = float(np.linalg.norm(compute_extent(arr)))
+        scores.append((point_count, span, extent_norm))
+    return scores
+
+
+def _interval_coverage(intervals: list[tuple[float, float]], bins: int) -> tuple[list[set[int]], list[float]]:
+    if not intervals:
+        return [], []
+    global_min = min(lo for lo, _ in intervals)
+    global_max = max(hi for _, hi in intervals)
+    spans = [float(hi - lo) for lo, hi in intervals]
+    if abs(global_max - global_min) <= 1e-6:
+        return [set() for _ in intervals], spans
+
+    bin_edges = np.linspace(global_min, global_max, max(2, int(bins)) + 1)
+    coverage: list[set[int]] = []
+    for lo, hi in intervals:
+        covered = set()
+        for index in range(len(bin_edges) - 1):
+            left = float(bin_edges[index])
+            right = float(bin_edges[index + 1])
+            if hi < left or lo > right:
+                continue
+            covered.add(index)
+        coverage.append(covered)
+    return coverage, spans
+
+
+def select_keyframes_by_quality_coverage(chunks: list[np.ndarray], axis_idx: int, keep: int, bins: int) -> list[int]:
+    if not chunks:
+        return []
+    if len(chunks) <= keep:
+        return list(range(len(chunks)))
+
+    intervals = _chunk_axis_intervals(chunks, axis_idx)
+    quality_scores = _chunk_quality_scores(chunks, axis_idx)
+    coverage, _ = _interval_coverage(intervals, bins)
+    start_idx = int(np.argmin([lo for lo, _ in intervals]))
+    end_idx = int(np.argmax([hi for _, hi in intervals]))
+    chosen = {start_idx, end_idx}
+    covered_bins = set().union(*(coverage[index] for index in chosen))
+
+    while len(chosen) < keep:
+        best_index = None
+        best_gain = -1
+        best_score = None
+        for index, bins_covered in enumerate(coverage):
+            if index in chosen:
+                continue
+            gain = len(bins_covered - covered_bins)
+            score = (*quality_scores[index], index)
+            if gain > best_gain or (gain == best_gain and (best_score is None or score > best_score)):
+                best_index = index
+                best_gain = gain
+                best_score = score
+        if best_index is None or best_gain <= 0:
+            break
+        chosen.add(int(best_index))
+        covered_bins.update(coverage[best_index])
+
+    if len(chosen) < keep:
+        remaining = [index for index in range(len(chunks)) if index not in chosen]
+        remaining.sort(key=lambda index: (*quality_scores[index], index), reverse=True)
+        for index in remaining:
+            chosen.add(int(index))
+            if len(chosen) >= keep:
+                break
+    return sorted(chosen)
+
+
+def select_keyframes_by_tail_coverage(chunks: list[np.ndarray], axis_idx: int, keep: int, bins: int, top_k: int) -> tuple[list[int], int]:
+    if not chunks:
+        return [], 0
+    window_size = min(len(chunks), max(1, int(top_k)))
+    start_index = max(0, len(chunks) - window_size)
+    chosen = select_keyframes_by_quality_coverage(chunks[start_index:], axis_idx, keep, bins)
+    return [start_index + int(index) for index in chosen], start_index
+
+
+def select_keyframes_by_center_diversity(
+    chunks: list[np.ndarray],
+    centers: list[np.ndarray],
+    axis_idx: int,
+    keep: int,
+) -> list[int]:
+    if not centers:
+        return []
+    if len(centers) <= keep:
+        return list(range(len(centers)))
+
+    arr = np.asarray(centers, dtype=np.float64)
+    quality_scores = _chunk_quality_scores(chunks, axis_idx)
+    spans = [score[1] for score in quality_scores]
+    point_counts = [score[0] for score in quality_scores]
+    chosen = {0, len(centers) - 1}
+
+    while len(chosen) < keep:
+        best_index = None
+        best_key = None
+        for index in range(len(centers)):
+            if index in chosen:
+                continue
+            min_dist = min(float(np.linalg.norm(arr[index] - arr[selected])) for selected in chosen)
+            key = (min_dist, point_counts[index], spans[index], index)
+            if best_key is None or key > best_key:
+                best_index = index
+                best_key = key
+        if best_index is None:
+            break
+        chosen.add(int(best_index))
+    return sorted(chosen)
+
+
 def select_best_frames_for_aggregation(
     chunks: list[np.ndarray],
     centers: list[np.ndarray],
@@ -218,6 +353,59 @@ def select_best_frames_for_aggregation(
             [frame_ids[index] for index in chosen],
             {
                 "strategy": "length_coverage",
+                "line_axis": ["x", "y", "z"][axis_idx],
+                "candidate_count": len(chunks),
+                "selected_end_index": int(chosen[-1]),
+            },
+        )
+
+    if method == "quality_coverage":
+        axis_idx = axis_to_index(line_axis)
+        chosen = select_keyframes_by_quality_coverage(chunks, axis_idx, max(1, int(keyframe_keep)), max(2, int(length_coverage_bins)))
+        return (
+            [chunks[index] for index in chosen],
+            [centers[index] for index in chosen],
+            [frame_ids[index] for index in chosen],
+            {
+                "strategy": "quality_coverage",
+                "line_axis": ["x", "y", "z"][axis_idx],
+                "candidate_count": len(chunks),
+                "selected_end_index": int(chosen[-1]),
+            },
+        )
+
+    if method == "tail_coverage":
+        axis_idx = axis_to_index(line_axis)
+        chosen, tail_window_start_index = select_keyframes_by_tail_coverage(
+            chunks,
+            axis_idx,
+            max(1, int(keyframe_keep)),
+            max(2, int(length_coverage_bins)),
+            max(1, int(top_k)),
+        )
+        return (
+            [chunks[index] for index in chosen],
+            [centers[index] for index in chosen],
+            [frame_ids[index] for index in chosen],
+            {
+                "strategy": "tail_coverage",
+                "line_axis": ["x", "y", "z"][axis_idx],
+                "candidate_count": min(len(chunks), max(1, int(top_k))),
+                "selected_end_index": int(chosen[-1]),
+                "tail_window_start_index": int(tail_window_start_index),
+                "tail_window_size": min(len(chunks), max(1, int(top_k))),
+            },
+        )
+
+    if method == "center_diversity":
+        axis_idx = axis_to_index(line_axis)
+        chosen = select_keyframes_by_center_diversity(chunks, centers, axis_idx, max(1, int(keyframe_keep)))
+        return (
+            [chunks[index] for index in chosen],
+            [centers[index] for index in chosen],
+            [frame_ids[index] for index in chosen],
+            {
+                "strategy": "center_diversity",
                 "line_axis": ["x", "y", "z"][axis_idx],
                 "candidate_count": len(chunks),
                 "selected_end_index": int(chosen[-1]),
@@ -294,17 +482,26 @@ def moving_average_centers(centers: list[np.ndarray], window: int) -> list[np.nd
     return smoothed
 
 
-def track_exited_lane_box(track: Track, lane_box: LaneBox, edge_margin: float = 0.9) -> bool:
+def track_exit_line_value(lane_box: LaneBox, axis: str | int, edge_margin: float = 0.9) -> float:
+    axis_idx = axis_to_index(axis)
+    axis_min, _ = lane_axis_bounds(lane_box, axis_idx)
+    return float(axis_min) + float(edge_margin)
+
+
+def track_exited_lane_box(
+    track: Track,
+    lane_box: LaneBox,
+    edge_margin: float = 0.9,
+    axis: str | int = "y",
+) -> bool:
     if not track.centers:
         return False
+    axis_idx = axis_to_index(axis)
     last = np.asarray(track.centers[-1], dtype=np.float64)
-    distances = [
-        abs(last[0] - lane_box.x_min),
-        abs(last[0] - lane_box.x_max),
-        abs(last[1] - lane_box.y_min),
-        abs(last[1] - lane_box.y_max),
-    ]
-    return min(distances) <= float(edge_margin) and bool(track.ended_by_missed or track.missed > 0)
+    if last.shape[0] <= axis_idx:
+        return False
+    line_value = track_exit_line_value(lane_box, axis_idx, edge_margin=edge_margin)
+    return float(last[axis_idx]) <= float(line_value) and bool(track.ended_by_missed or track.missed > 0)
 
 
 def is_valid_transform(transform: np.ndarray, max_translation: float | None) -> bool:

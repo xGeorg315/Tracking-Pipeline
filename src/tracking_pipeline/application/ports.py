@@ -4,7 +4,17 @@ from pathlib import Path
 from typing import Protocol
 
 from tracking_pipeline.config.models import PipelineConfig
-from tracking_pipeline.domain.models import AggregateResult, ClusterResult, FrameData, FrameTrackingState, ObjectLabelData, RunSummary, Track
+from tracking_pipeline.domain.models import (
+    AggregateResult,
+    ArticulatedMergeDebugEvent,
+    ClusterResult,
+    FrameData,
+    FrameTrackingState,
+    ObjectLabelData,
+    RunSummary,
+    Track,
+    TrackOutcomeDebug,
+)
 from tracking_pipeline.domain.value_objects import LaneBox
 
 
@@ -36,9 +46,18 @@ class ArtifactWriter(Protocol):
     def write_config_snapshot(self, run_dir: Path, config: PipelineConfig) -> None: ...
     def write_aggregate(self, run_dir: Path, result: AggregateResult, save_intensity: bool = False) -> None: ...
     def write_object_list(self, run_dir: Path, object_labels: dict[int, ObjectLabelData]) -> None: ...
+    def write_tracker_debug(self, run_dir: Path, states: list[FrameTrackingState]) -> None: ...
+    def write_track_outcomes(self, run_dir: Path, track_outcomes: dict[int, TrackOutcomeDebug]) -> None: ...
     def write_summary(self, run_dir: Path, summary: RunSummary) -> None: ...
     def write_tracks(self, run_dir: Path, tracks: dict[int, Track], aggregate_results: list[AggregateResult]) -> None: ...
 
 
 class ReplayViewer(Protocol):
-    def replay(self, states: list[FrameTrackingState], lane_box: LaneBox, aggregate_results: dict[int, AggregateResult]) -> None: ...
+    def replay(
+        self,
+        states: list[FrameTrackingState],
+        lane_box: LaneBox,
+        aggregate_results: dict[int, AggregateResult],
+        track_outcomes: dict[int, TrackOutcomeDebug],
+        articulated_merge_debug_events: list[ArticulatedMergeDebugEvent],
+    ) -> None: ...

@@ -12,6 +12,7 @@ from tracking_pipeline.infrastructure.clustering.ground_removed_dbscan import Gr
 from tracking_pipeline.infrastructure.clustering.hdbscan_clusterer import HDBSCANClusterer
 from tracking_pipeline.infrastructure.clustering.range_image_connected_components import RangeImageConnectedComponentsClusterer
 from tracking_pipeline.infrastructure.clustering.range_image_depth_jump import RangeImageDepthJumpClusterer
+from tracking_pipeline.infrastructure.postprocessing.articulated_vehicle_merge import ArticulatedVehicleMergePostprocessor
 from tracking_pipeline.infrastructure.postprocessing.co_moving_track_merge import CoMovingTrackMergePostprocessor
 from tracking_pipeline.infrastructure.postprocessing.track_quality_scoring import TrackQualityScoringPostprocessor
 from tracking_pipeline.infrastructure.postprocessing.tracklet_stitching import TrackletStitchingPostprocessor
@@ -86,6 +87,56 @@ def _track(track_id: int, frame_ids: list[int], centers: list[np.ndarray]) -> Tr
         track.world_points.append(points.copy())
         track.local_points.append(points - center)
         track.bbox_extents.append(np.array([0.1, 0.1, 0.1], dtype=np.float32))
+    return track
+
+
+def _box_points(center: np.ndarray, *, width: float, length: float, height: float) -> np.ndarray:
+    signs = np.asarray(
+        [
+            [-1.0, -1.0, -1.0],
+            [-1.0, -1.0, 1.0],
+            [-1.0, 1.0, -1.0],
+            [-1.0, 1.0, 1.0],
+            [1.0, -1.0, -1.0],
+            [1.0, -1.0, 1.0],
+            [1.0, 1.0, -1.0],
+            [1.0, 1.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    scale = np.asarray([width * 0.5, length * 0.5, height * 0.5], dtype=np.float32)
+    return center.astype(np.float32) + signs * scale
+
+
+def _articulated_track(
+    track_id: int,
+    frame_ids: list[int],
+    longitudinal_centers: list[float],
+    *,
+    lateral_center: float = 0.0,
+    vertical_center: float = 1.0,
+    width: float = 0.9,
+    length: float = 3.4,
+    height: float = 1.4,
+) -> Track:
+    track = Track(track_id=track_id, age=len(frame_ids), hit_count=len(frame_ids), ended_by_missed=True, source_track_ids=[track_id])
+    extent = np.asarray([width, length, height], dtype=np.float32)
+    for frame_id, longitudinal_center in zip(frame_ids, longitudinal_centers):
+        center = np.asarray([lateral_center, longitudinal_center, vertical_center], dtype=np.float32)
+        points = _box_points(center, width=width, length=length, height=height)
+        intensity = np.linspace(float(track_id), float(track_id) + 0.7, len(points), dtype=np.float32)
+        point_timestamps_ns = np.arange(frame_id * 1000, frame_id * 1000 + len(points), dtype=np.int64)
+        track.add_observation(
+            center,
+            points,
+            frame_id,
+            frame_id * 1_000_000,
+            extent,
+            intensity=intensity,
+            point_timestamp_ns=point_timestamps_ns,
+        )
+    track.age = max(track.age, track.last_frame - track.first_frame + 1)
+    track.hit_count = len(track.frame_ids)
     return track
 
 
@@ -284,6 +335,147 @@ def test_co_moving_track_merge_rejects_large_lateral_offset() -> None:
     assert set(merged.keys()) == {12, 13}
 
 
+def test_articulated_vehicle_merge_merges_front_and_rear_tracks() -> None:
+    front = _articulated_track(21, [0, 1, 2, 3], [10.0, 11.0, 12.0, 13.0], lateral_center=0.0)
+    rear = _articulated_track(22, [0, 1, 2, 3], [6.8, 7.8, 8.8, 9.8], lateral_center=0.1)
+    processor = ArticulatedVehicleMergePostprocessor(PostprocessingConfig(enable_articulated_vehicle_merge=True), longitudinal_axis="y")
+
+    merged = processor.process({front.track_id: front, rear.track_id: rear})
+
+    assert list(merged.keys()) == [21]
+    merged_track = merged[21]
+    assert merged_track.source_track_ids == [21, 22]
+    assert merged_track.hit_count == 4
+    assert merged_track.state["articulated_vehicle"] is True
+    assert merged_track.state["articulated_component_track_ids"] == [21, 22]
+    assert merged_track.state["object_kind"] == "truck_with_trailer"
+    assert merged_track.state["articulated_rear_gap_mean"] >= -0.5
+    assert merged_track.state["articulated_rear_gap_mean"] <= 0.1
+    assert merged_track.state["articulated_rear_gap_std"] < 0.1
+    assert all(len(points) == 16 for points in merged_track.world_points)
+    assert processor.debug_records[-1].accepted is True
+    assert processor.debug_records[-1].rejection_reason == "tail_gap"
+
+
+def test_articulated_vehicle_merge_rejects_side_by_side_neighbor() -> None:
+    left = _articulated_track(23, [0, 1, 2, 3], [10.0, 11.0, 12.0, 13.0], lateral_center=-0.3)
+    right = _articulated_track(24, [0, 1, 2, 3], [10.2, 11.2, 12.2, 13.2], lateral_center=0.3)
+    processor = ArticulatedVehicleMergePostprocessor(PostprocessingConfig(enable_articulated_vehicle_merge=True), longitudinal_axis="y")
+
+    merged = processor.process({left.track_id: left, right.track_id: right})
+
+    assert set(merged.keys()) == {23, 24}
+
+
+def test_articulated_vehicle_merge_rejects_large_or_unstable_hitch_gap() -> None:
+    front = _articulated_track(25, [0, 1, 2, 3], [10.0, 11.0, 12.0, 13.0], lateral_center=0.0)
+    far_rear = _articulated_track(26, [0, 1, 2, 3], [4.0, 5.0, 6.0, 7.0], lateral_center=0.1)
+    unstable_rear = _articulated_track(27, [0, 1, 2, 3], [6.8, 8.6, 7.6, 10.7], lateral_center=0.1)
+    processor = ArticulatedVehicleMergePostprocessor(PostprocessingConfig(enable_articulated_vehicle_merge=True), longitudinal_axis="y")
+
+    merged_far = processor.process({front.track_id: front, far_rear.track_id: far_rear})
+    merged_unstable = processor.process({front.track_id: front, unstable_rear.track_id: unstable_rear})
+
+    assert set(merged_far.keys()) == {25, 26}
+    assert set(merged_unstable.keys()) == {25, 27}
+
+
+def test_articulated_vehicle_merge_rejects_large_vertical_offset() -> None:
+    front = _articulated_track(28, [0, 1, 2, 3], [10.0, 11.0, 12.0, 13.0], lateral_center=0.0, vertical_center=1.0)
+    rear = _articulated_track(29, [0, 1, 2, 3], [6.8, 7.8, 8.8, 9.8], lateral_center=0.1, vertical_center=1.9)
+    processor = ArticulatedVehicleMergePostprocessor(PostprocessingConfig(enable_articulated_vehicle_merge=True), longitudinal_axis="y")
+
+    merged = processor.process({front.track_id: front, rear.track_id: rear})
+
+    assert set(merged.keys()) == {28, 29}
+
+
+def test_articulated_vehicle_merge_uses_tail_window_for_gap_acceptance() -> None:
+    front = _articulated_track(32, [0, 1, 2, 3, 4, 5], [10.0, 11.0, 12.0, 13.0, 14.0, 15.0], lateral_center=0.0, length=5.0)
+    rear = _articulated_track(33, [0, 1, 2, 3, 4, 5], [2.5, 4.8, 5.8, 6.8, 7.8, 8.8], lateral_center=0.1, length=5.0)
+    processor = ArticulatedVehicleMergePostprocessor(
+        PostprocessingConfig(
+            enable_articulated_vehicle_merge=True,
+            articulated_gap_eval_window_frames=5,
+            articulated_max_hitch_gap=1.25,
+            articulated_max_hitch_gap_std=0.6,
+            articulated_min_combined_length=8.0,
+        ),
+        longitudinal_axis="y",
+    )
+
+    merged = processor.process({front.track_id: front, rear.track_id: rear})
+
+    assert list(merged.keys()) == [32]
+    debug = processor.debug_records[-1]
+    assert debug.accepted is True
+    assert debug.rejection_reason == "tail_gap"
+    assert debug.tail_window_frame_count == 5
+    assert debug.full_gap_mean > 1.25
+    assert debug.tail_gap_mean < 1.25
+
+
+def test_articulated_vehicle_merge_rejects_unstable_tail_window_gap() -> None:
+    front = _articulated_track(34, [0, 1, 2, 3, 4, 5], [10.0, 11.0, 12.0, 13.0, 14.0, 15.0], lateral_center=0.0, length=5.0)
+    rear = _articulated_track(35, [0, 1, 2, 3, 4, 5], [4.8, 4.2, 6.8, 6.2, 8.8, 8.2], lateral_center=0.1, length=5.0)
+    processor = ArticulatedVehicleMergePostprocessor(
+        PostprocessingConfig(
+            enable_articulated_vehicle_merge=True,
+            articulated_gap_eval_window_frames=5,
+            articulated_max_hitch_gap=2.0,
+            articulated_max_hitch_gap_std=0.6,
+        ),
+        longitudinal_axis="y",
+    )
+
+    merged = processor.process({front.track_id: front, rear.track_id: rear})
+
+    assert set(merged.keys()) == {34, 35}
+    debug = processor.debug_records[-1]
+    assert debug.accepted is False
+    assert debug.rejection_reason == "gap_tail_std"
+    assert debug.tail_gap_std > 0.6
+
+
+def test_articulated_vehicle_merge_falls_back_to_full_gap_for_short_tail_window() -> None:
+    front = _articulated_track(36, [0, 1], [10.0, 11.0], lateral_center=0.0, length=5.0)
+    rear = _articulated_track(37, [0, 1], [3.6, 4.6], lateral_center=0.1, length=5.0)
+    processor = ArticulatedVehicleMergePostprocessor(
+        PostprocessingConfig(
+            enable_articulated_vehicle_merge=True,
+            articulated_min_overlap_frames=2,
+            articulated_gap_eval_window_frames=5,
+            articulated_max_hitch_gap=1.3,
+            articulated_max_hitch_gap_std=0.6,
+        ),
+        longitudinal_axis="y",
+    )
+
+    merged = processor.process({front.track_id: front, rear.track_id: rear})
+
+    assert set(merged.keys()) == {36, 37}
+    debug = processor.debug_records[-1]
+    assert debug.accepted is False
+    assert debug.rejection_reason == "gap_full"
+    assert debug.tail_window_frame_count == 2
+    assert debug.full_gap_mean > 1.3
+
+
+def test_articulated_vehicle_merge_recomputes_quality_metrics() -> None:
+    front = _articulated_track(30, [0, 1, 2, 3], [10.0, 11.0, 12.0, 13.0], lateral_center=0.0)
+    rear = _articulated_track(31, [0, 1, 2, 3], [6.8, 7.8, 8.8, 9.8], lateral_center=0.1)
+    merge_processor = ArticulatedVehicleMergePostprocessor(PostprocessingConfig(enable_articulated_vehicle_merge=True), longitudinal_axis="y")
+    score_processor = TrackQualityScoringPostprocessor(PostprocessingConfig(enable_track_quality_scoring=True), longitudinal_axis="y")
+
+    merged_tracks = merge_processor.process({front.track_id: front, rear.track_id: rear})
+    scored_track = score_processor.process(merged_tracks)[30]
+
+    assert scored_track.quality_score is not None
+    assert scored_track.quality_metrics["is_articulated_vehicle"] is True
+    assert scored_track.quality_metrics["is_long_vehicle"] is True
+    assert scored_track.quality_metrics["object_kind"] == "truck_with_trailer"
+
+
 def test_track_quality_scoring_populates_quality_fields() -> None:
     track = _track(
         4,
@@ -303,4 +495,5 @@ def test_track_quality_scoring_populates_quality_fields() -> None:
     assert scored.quality_metrics["observation_count"] == 4
     assert "cross_section_cv" in scored.quality_metrics
     assert "length_cv" in scored.quality_metrics
+    assert scored.quality_metrics["is_articulated_vehicle"] is False
     assert scored.quality_metrics["is_long_vehicle"] is False

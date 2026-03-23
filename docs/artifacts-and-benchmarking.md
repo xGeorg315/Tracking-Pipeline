@@ -10,6 +10,8 @@ Ein typischer Run unter `runs/<timestamp>_<tracker>_<accumulator>/` sieht so aus
 runs/<run_name>/
 ├── config.snapshot.yaml
 ├── summary.json
+├── tracker_debug.jsonl
+├── track_outcomes.jsonl
 ├── tracks.jsonl
 ├── aggregates/
 │   ├── track_0001.pcd
@@ -78,9 +80,55 @@ Top-Level-Felder:
 | `ended_by_missed` | ob der Track durch Misses beendet wurde |
 | `quality_score` | finaler Track-Qualitaetswert |
 | `quality_metrics` | Detailmetriken zum Track |
+| `tracker_debug_summary` | kompakte Spawn-/Match-/Miss-Statistik des Tracks |
+| `decision_stage` | normalisierte Stufe der finalen Save-/Skip-Entscheidung |
+| `decision_reason_code` | stabiler Failure-/Save-Code wie `track_exit`, `min_hits`, `saved` |
+| `decision_summary` | kurze menschenlesbare Zusammenfassung fuer Replay/HUD |
+| `last_frame_id` | letzter Frame des Tracks |
+| `last_center` | letzter Track-Zentrumspunkt |
 | `selected_frame_ids` | Chunks/Frames, die in die Aggregation eingegangen sind |
 | `aggregate_status` | `saved` oder Skip-/Empty-Status |
 | `aggregation_metrics` | Detailmetriken der Aggregation |
+
+## `tracker_debug.jsonl`
+
+Eine Zeile pro Frame mit den Tracker-Entscheidungen des Replays/Run-Loops.
+
+Wichtige Felder:
+
+| Feld | Bedeutung |
+| --- | --- |
+| `frame_index` | verarbeiteter Frame |
+| `cluster_metrics` | Clusterer-Metriken desselben Frames |
+| `tracker_metrics` | kompakte Frame-Summary wie `matched_count`, `spawned_count`, `spawn_suppressed_count` |
+| `tracker_debug.track_states` | Vorhersagen und Status pro Track (`matched`, `missed`, `spawned`) |
+| `tracker_debug.detection_states` | Status pro Detection (`matched`, `spawned`, `unmatched`, `spawn_suppressed`) |
+
+Das ist die beste Datei, um spaeter ohne Viewer nachzuvollziehen, warum ein zweiter Track entstanden ist.
+
+## `track_outcomes.jsonl`
+
+Eine Zeile pro finalisiertem Track mit kompakter Save-/Failure-Diagnose.
+
+Wichtige Felder:
+
+| Feld | Bedeutung |
+| --- | --- |
+| `track_id` | Track-ID |
+| `status` | finaler `AggregateResult.status` |
+| `decision_stage` | normalisierte Gate-Stufe, z. B. `tracking_gate`, `save_gate`, `saved` |
+| `decision_reason_code` | stabiler Failure-/Save-Code |
+| `decision_summary` | kurze Zusammenfassung fuer Replay und schnelle Diagnose |
+| `last_frame_id` | letzter beobachteter Frame des Tracks |
+| `last_playback_index` | Playback-Index fuer Replay-Overlays |
+| `last_center` | letzter bekannter Mittelpunkt des Tracks |
+| `hit_count` / `age` / `missed` | kompakte Lifecycle-Daten des Tracks |
+| `ended_by_missed` | ob der Track durch Misses finalisiert wurde |
+| `quality_score` | finaler Track-Qualitaetswert |
+| `selected_frame_ids` | Frames, die fuer die Aggregation selektiert wurden |
+| `tracker_debug_summary` | Spawn-/Match-/Miss-Summen des Track-Lifecycles |
+
+Das ist die schnellste Datei, um zu sehen, warum ein Track nicht gespeichert wurde, ohne erst alle Frame-Logs zu lesen.
 
 ### Wichtige `aggregation_metrics`
 
@@ -88,6 +136,14 @@ Top-Level-Felder:
 
 | Feld | Bedeutung |
 | --- | --- |
+| `decision_stage` | normalisierte Entscheidungsstufe des finalen Status |
+| `decision_reason_code` | stabiler Reason-Code fuer Replay/Reports |
+| `decision_summary` | kurze menschenlesbare Save-/Skip-Begruendung |
+| `hit_count` / `min_track_hits` | Ist-/Soll-Werte fuer das Min-Hits-Gate |
+| `track_exited` / `track_exit_edge_margin` / `distance_to_exit_line` | Ist-/Soll-Werte fuer das Exit-Gate |
+| `track_exit_line_axis` / `track_exit_line_side` / `track_exit_line_value` | geometrische Definition der Exit-Linie |
+| `track_center_line_coordinate` / `track_passed_exit_line` | letzter Centerwert auf der Exit-Achse und Crossing-Status |
+| `selected_frame_count` / `prepared_chunk_count` | Selektion und Vorbereitung vor der Fusion |
 | `point_count_after_fusion` | Punktzahl nach Voxel-Fusion |
 | `point_count_after_stat_filter` | Punktzahl nach Statistical Outlier Removal |
 | `point_count_after_downsample` | finale gespeicherte Punktzahl |
@@ -117,10 +173,16 @@ Top-Level-Felder:
 | `registration_accepted` | akzeptierte Paare |
 | `registration_rejected` | verworfene Paare |
 | `registration_input_chunk_count` | Chunks vor Registrierung |
-| `registration_output_chunk_count` | Chunks, die weiterverwendet wurden |
-| `registration_dropped_count` | verworfene Chunks |
-| `registration_keep_indices` | Indizes der behaltenen Chunks |
-| `registration_chunk_weights` | finale Chunk-Gewichte nach Registration/Fusion |
+| `registration_output_chunk_count` | effektiv weiterverwendete Chunks nach eventuellem Underfill-Fallback |
+| `registration_dropped_count` | effektiv verworfene Chunks nach eventuellem Underfill-Fallback |
+| `registration_keep_indices` | Indizes der effektiv behaltenen Chunks |
+| `registration_chunk_weights` | finale Chunk-Gewichte fuer die Fusion |
+| `registration_fallback_applied` | zeigt, ob auf unregistrierte selektierte Chunks zurueckgefallen wurde |
+| `registration_fallback_min_kept_chunks` | Schwellwert fuer den optionalen Underfill-Fallback |
+| `registration_attempt_output_chunk_count` | rohe Anzahl Registration-Chunks vor eventuellem Fallback |
+| `registration_attempt_dropped_count` | rohe Anzahl verworfener Registration-Chunks vor eventuellem Fallback |
+| `registration_attempt_keep_indices` | rohe behaltene Registration-Indizes vor eventuellem Fallback |
+| `registration_attempt_chunk_weights` | rohe Registration-Gewichte vor eventuellem Fallback |
 
 #### Symmetry Completion
 
@@ -144,8 +206,8 @@ Top-Level-Felder:
 ## `aggregates/*.pcd`
 
 - finale aggregierte Punktwolke pro gespeichertem Track
-- optional mit echtem `intensity`-Feld, wenn `output.save_aggregate_intensity=true`
-- Intensitaet stammt aktuell aus `reflectivity`, falls `pointcloud.intensity` leer ist
+- optional mit PCD-Feld `reflectivity`, wenn `output.save_aggregate_intensity=true`
+- Reflectivity wird beim Einlesen als `signal * r^2` berechnet; im aktuellen Datensatz stammt das Signal aus `pointcloud.reflectivity`
 
 ## `aggregates/*.json`
 
