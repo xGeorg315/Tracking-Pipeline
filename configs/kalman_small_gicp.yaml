@@ -39,4 +39,6 @@ postprocessing:
   articulated_max_hitch_gap: 1.75
   articulated_max_hitch_gap_std: 0.6
   articulated_max_speed_delta: 0.55
-  articulated_min_combined_length: 5.5
+  articulated_min_combined_length: 5.
+warumup_runs: 1
+measure_runs: 1

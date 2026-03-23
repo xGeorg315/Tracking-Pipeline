@@ -183,7 +183,7 @@ class BenchmarkConfig:
     output_root: str = "benchmarks"
     name: str = "curated_proxy"
     warmup_runs: int = 1
-    measure_runs: int = 3
+    measure_runs: int = 1
     config_path: Path | None = None
 
     def to_dict(self) -> dict[str, Any]:

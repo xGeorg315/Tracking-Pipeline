@@ -670,7 +670,7 @@ class VoxelFusionAccumulator:
         if confidence is not None and len(np.asarray(confidence, dtype=np.float32)) == len(points):
             confidence_values = np.asarray(confidence, dtype=np.float32)
 
-        slice_records, side_point_clouds = self._symmetry_slice_records(
+        slice_counts, side_point_clouds = self._symmetry_slice_records(
             points,
             intensity_values,
             plane_coordinate,
@@ -679,8 +679,8 @@ class VoxelFusionAccumulator:
             vertical_idx,
             completion_voxel,
         )
-        positive_slice_count = sum(1 for records in slice_records.values() if 1 in records)
-        negative_slice_count = sum(1 for records in slice_records.values() if -1 in records)
+        positive_slice_count = int(slice_counts.get(1, 0))
+        negative_slice_count = int(slice_counts.get(-1, 0))
         positive_count = int(len(side_point_clouds.get(1, np.zeros((0, 3), dtype=np.float32))))
         negative_count = int(len(side_point_clouds.get(-1, np.zeros((0, 3), dtype=np.float32))))
         if positive_count == 0 and negative_count == 0:
@@ -745,6 +745,59 @@ class VoxelFusionAccumulator:
     def _symmetry_completion_voxel(self) -> float:
         return max(0.05, float(self.config.aggregate_voxel), float(self.config.fusion_voxel_size))
 
+    def _unique_rows(self, rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        values = np.asarray(rows)
+        if len(values) == 0:
+            return np.asarray(values), np.zeros((0,), dtype=np.int32)
+        unique_rows, inverse = np.unique(values, axis=0, return_inverse=True)
+        return unique_rows, inverse.astype(np.int32, copy=False)
+
+    def _unique_rows_first_seen(self, rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        values = np.asarray(rows)
+        if len(values) == 0:
+            return np.asarray(values), np.zeros((0,), dtype=np.int32)
+        unique_rows, first_indices, inverse = np.unique(values, axis=0, return_index=True, return_inverse=True)
+        order = np.argsort(first_indices, kind="stable")
+        ordered_rows = unique_rows[order]
+        remap = np.empty(len(order), dtype=np.int32)
+        remap[order] = np.arange(len(order), dtype=np.int32)
+        return ordered_rows, remap[inverse]
+
+    def _sum_by_group(
+        self,
+        values: np.ndarray,
+        inverse: np.ndarray,
+        group_count: int,
+        *,
+        dtype: Any | None = None,
+    ) -> np.ndarray:
+        array = np.asarray(values)
+        target_dtype = array.dtype if dtype is None else dtype
+        reduced = np.zeros((group_count, *array.shape[1:]), dtype=target_dtype)
+        np.add.at(reduced, inverse, array.astype(target_dtype, copy=False))
+        return reduced
+
+    def _reduce_points_by_voxel(
+        self,
+        xyz: np.ndarray,
+        voxel_size: float,
+        intensity: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray]:
+        points = np.asarray(xyz, dtype=np.float32)
+        voxels = np.floor(points / float(voxel_size)).astype(np.int32)
+        unique_voxels, inverse = self._unique_rows(voxels)
+        group_count = len(unique_voxels)
+        counts = np.bincount(inverse, minlength=group_count).astype(np.float32)
+        point_sum = self._sum_by_group(points, inverse, group_count, dtype=np.float32)
+        point_means = (point_sum / np.maximum(counts[:, None], 1.0)).astype(np.float32, copy=False)
+        intensity_means = None
+        if intensity is not None:
+            intensity_values = np.asarray(intensity, dtype=np.float32)
+            if len(intensity_values) == len(points):
+                intensity_sum = np.bincount(inverse, weights=intensity_values.astype(np.float64), minlength=group_count)
+                intensity_means = (intensity_sum / np.maximum(counts.astype(np.float64), 1.0)).astype(np.float32, copy=False)
+        return unique_voxels, point_means, intensity_means, counts
+
     def _symmetry_slice_records(
         self,
         points: np.ndarray,
@@ -754,59 +807,33 @@ class VoxelFusionAccumulator:
         lateral_idx: int,
         vertical_idx: int,
         completion_voxel: float,
-    ) -> tuple[dict[tuple[int, int], dict[int, dict[str, Any]]], dict[int, np.ndarray]]:
-        off_plane_mask = np.abs(np.asarray(points, dtype=np.float32)[:, lateral_idx] - float(plane_coordinate)) >= (0.5 * completion_voxel)
-        off_plane_points = np.asarray(points, dtype=np.float32)[off_plane_mask]
-        off_plane_intensity = None if intensity is None else np.asarray(intensity, dtype=np.float32)[off_plane_mask]
+    ) -> tuple[dict[int, int], dict[int, np.ndarray]]:
+        _ = intensity
+        point_values = np.asarray(points, dtype=np.float32)
+        off_plane_mask = np.abs(point_values[:, lateral_idx] - float(plane_coordinate)) >= (0.5 * completion_voxel)
+        off_plane_points = point_values[off_plane_mask]
         if len(off_plane_points) == 0:
-            return {}, {1: np.zeros((0, 3), dtype=np.float32), -1: np.zeros((0, 3), dtype=np.float32)}
+            return {1: 0, -1: 0}, {1: np.zeros((0, 3), dtype=np.float32), -1: np.zeros((0, 3), dtype=np.float32)}
 
         side_distances = off_plane_points[:, lateral_idx].astype(np.float64) - float(plane_coordinate)
+        positive_mask = side_distances > 0.0
+        negative_mask = side_distances < 0.0
         side_point_clouds = {
-            1: np.asarray(off_plane_points[side_distances > 0.0], dtype=np.float32),
-            -1: np.asarray(off_plane_points[side_distances < 0.0], dtype=np.float32),
+            1: np.asarray(off_plane_points[positive_mask], dtype=np.float32),
+            -1: np.asarray(off_plane_points[negative_mask], dtype=np.float32),
         }
-        raw_buckets: dict[tuple[int, int, int], dict[str, Any]] = {}
-        for index, point in enumerate(off_plane_points):
-            signed_distance = float(point[lateral_idx] - plane_coordinate)
-            side = 1 if signed_distance > 0.0 else -1
-            bucket = raw_buckets.setdefault(
-                (
-                    int(np.floor(float(point[axis_idx]) / completion_voxel)),
-                    int(np.floor(float(point[vertical_idx]) / completion_voxel)),
-                    int(side),
-                ),
-                {
-                    "points": [],
-                    "distances": [],
-                    "intensity": [],
-                },
-            )
-            bucket["points"].append(np.asarray(point, dtype=np.float32))
-            bucket["distances"].append(abs(signed_distance))
-            if off_plane_intensity is not None:
-                bucket["intensity"].append(float(off_plane_intensity[index]))
-
-        slice_records: dict[tuple[int, int], dict[int, dict[str, Any]]] = {}
-        for (longitudinal_bin, vertical_bin, side), bucket in raw_buckets.items():
-            bucket_points = np.asarray(bucket["points"], dtype=np.float32)
-            bucket_distances = np.asarray(bucket["distances"], dtype=np.float32)
-            lateral_bins = np.floor(bucket_distances / completion_voxel).astype(np.int32)
-            outer_bin = int(np.max(lateral_bins))
-            outer_mask = lateral_bins == outer_bin
-            outer_points = bucket_points[outer_mask]
-            representative_point = np.asarray(np.mean(outer_points, axis=0), dtype=np.float32)
-            representative_intensity = None
-            if off_plane_intensity is not None and bucket["intensity"]:
-                bucket_intensity = np.asarray(bucket["intensity"], dtype=np.float32)
-                representative_intensity = float(np.mean(bucket_intensity[outer_mask]))
-            slice_records.setdefault((int(longitudinal_bin), int(vertical_bin)), {})[int(side)] = {
-                "point": representative_point,
-                "intensity": representative_intensity,
-                "support_count": int(len(bucket_points)),
-                "outer_lateral_distance": float(np.mean(bucket_distances[outer_mask])),
-            }
-        return slice_records, side_point_clouds
+        slice_keys = np.column_stack(
+            [
+                np.floor(off_plane_points[:, axis_idx] / float(completion_voxel)).astype(np.int32),
+                np.floor(off_plane_points[:, vertical_idx] / float(completion_voxel)).astype(np.int32),
+                np.where(positive_mask, 1, -1).astype(np.int32),
+            ]
+        )
+        unique_slices, _ = self._unique_rows(slice_keys)
+        return {
+            1: int(np.sum(unique_slices[:, 2] == 1)),
+            -1: int(np.sum(unique_slices[:, 2] == -1)),
+        }, side_point_clouds
 
     def _symmetry_half_source_side(
         self,
@@ -1630,62 +1657,63 @@ class VoxelFusionAccumulator:
         voxel_size: float,
         min_observations: int,
     ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray, int, int, int]:
-        voxel_sum: dict[tuple[int, int, int], np.ndarray] = {}
-        voxel_weight_sum: dict[tuple[int, int, int], float] = {}
-        voxel_hits: dict[tuple[int, int, int], int] = {}
-        voxel_intensity_sum: dict[tuple[int, int, int], float] = {}
-        voxel_confidence_sum: dict[tuple[int, int, int], float] = {}
         has_intensity = len(intensities) == len(chunks) and all(
             intensity is not None and len(np.asarray(intensity, dtype=np.float32)) == len(points)
             for points, intensity in zip(chunks, intensities)
         )
         raw_points = 0
+        chunk_voxels: list[np.ndarray] = []
+        chunk_point_means: list[np.ndarray] = []
+        chunk_weights_per_voxel: list[np.ndarray] = []
+        confidence_weights_per_voxel: list[np.ndarray] = []
+        chunk_intensity_means: list[np.ndarray] = []
         for chunk_index, points in enumerate(chunks):
-            if len(points) == 0:
+            point_values = np.asarray(points, dtype=np.float32)
+            if len(point_values) == 0:
                 continue
-            raw_points += len(points)
+            raw_points += len(point_values)
             weight = float(chunk_weights[chunk_index]) if chunk_index < len(chunk_weights) else 1.0
             confidence_weight = float(confidence_chunk_weights[chunk_index]) if chunk_index < len(confidence_chunk_weights) else 1.0
-            voxels = np.floor(points / float(voxel_size)).astype(np.int32)
-            unique, inverse = np.unique(voxels, axis=0, return_inverse=True)
             intensity_values = np.asarray(intensities[chunk_index], dtype=np.float32) if has_intensity else None
-            for index, voxel in enumerate(unique):
-                key = (int(voxel[0]), int(voxel[1]), int(voxel[2]))
-                mask = inverse == index
-                point_mean = points[mask].mean(axis=0)
-                intensity_mean = float(np.mean(intensity_values[mask])) if intensity_values is not None else 0.0
-                if key not in voxel_sum:
-                    voxel_sum[key] = point_mean * weight
-                    voxel_weight_sum[key] = weight
-                    voxel_hits[key] = 1
-                    voxel_confidence_sum[key] = confidence_weight
-                    if intensity_values is not None:
-                        voxel_intensity_sum[key] = intensity_mean * weight
-                else:
-                    voxel_sum[key] += point_mean * weight
-                    voxel_weight_sum[key] += weight
-                    voxel_hits[key] += 1
-                    voxel_confidence_sum[key] += confidence_weight
-                    if intensity_values is not None:
-                        voxel_intensity_sum[key] += intensity_mean * weight
-        if not voxel_sum:
+            unique_voxels, point_means, intensity_means, _ = self._reduce_points_by_voxel(point_values, voxel_size, intensity_values)
+            group_count = len(unique_voxels)
+            chunk_voxels.append(unique_voxels.astype(np.int32, copy=False))
+            chunk_point_means.append(point_means)
+            chunk_weights_per_voxel.append(np.full((group_count,), weight, dtype=np.float64))
+            confidence_weights_per_voxel.append(np.full((group_count,), confidence_weight, dtype=np.float64))
+            if has_intensity and intensity_means is not None:
+                chunk_intensity_means.append(intensity_means)
+        if not chunk_voxels:
             return np.zeros((0, 3), dtype=np.float32), None, np.zeros((0,), dtype=np.float32), raw_points, 0, 0
-        kept = []
-        kept_intensity = []
-        kept_confidence = []
-        for key, hits in voxel_hits.items():
-            if hits < max(1, int(min_observations)):
-                continue
-            kept.append(voxel_sum[key] / max(voxel_weight_sum[key], 1e-6))
-            kept_confidence.append(float(voxel_confidence_sum[key]))
-            if has_intensity:
-                kept_intensity.append(voxel_intensity_sum[key] / max(voxel_weight_sum[key], 1e-6))
-        if not kept:
-            return np.zeros((0, 3), dtype=np.float32), None, np.zeros((0,), dtype=np.float32), raw_points, len(voxel_sum), 0
-        xyz = np.asarray(kept, dtype=np.float32)
-        intensity = np.asarray(kept_intensity, dtype=np.float32) if has_intensity else None
-        confidence = np.asarray(kept_confidence, dtype=np.float32)
-        return xyz, intensity, confidence, raw_points, len(voxel_sum), len(kept)
+
+        flattened_voxels = np.concatenate(chunk_voxels, axis=0)
+        _, inverse = self._unique_rows_first_seen(flattened_voxels)
+        voxel_count = int(np.max(inverse) + 1) if len(inverse) > 0 else 0
+        point_means = np.concatenate(chunk_point_means, axis=0).astype(np.float64, copy=False)
+        weights = np.concatenate(chunk_weights_per_voxel, axis=0).astype(np.float64, copy=False)
+        confidence_weights = np.concatenate(confidence_weights_per_voxel, axis=0).astype(np.float64, copy=False)
+        weighted_point_sum = self._sum_by_group(point_means * weights[:, None], inverse, voxel_count, dtype=np.float64)
+        weight_sum = np.bincount(inverse, weights=weights, minlength=voxel_count).astype(np.float64)
+        voxel_hits = np.bincount(inverse, minlength=voxel_count).astype(np.int32)
+        voxel_confidence_sum = np.bincount(inverse, weights=confidence_weights, minlength=voxel_count).astype(np.float32)
+        keep_mask = voxel_hits >= max(1, int(min_observations))
+        if not np.any(keep_mask):
+            return np.zeros((0, 3), dtype=np.float32), None, np.zeros((0,), dtype=np.float32), raw_points, voxel_count, 0
+
+        xyz = (
+            weighted_point_sum[keep_mask] / np.maximum(weight_sum[keep_mask, None], 1e-6)
+        ).astype(np.float32, copy=False)
+        intensity = None
+        if has_intensity:
+            intensity_means = np.concatenate(chunk_intensity_means, axis=0).astype(np.float64, copy=False)
+            weighted_intensity_sum = np.bincount(
+                inverse,
+                weights=intensity_means * weights,
+                minlength=voxel_count,
+            ).astype(np.float64)
+            intensity = (weighted_intensity_sum[keep_mask] / np.maximum(weight_sum[keep_mask], 1e-6)).astype(np.float32, copy=False)
+        confidence = voxel_confidence_sum[keep_mask].astype(np.float32, copy=False)
+        return xyz, intensity, confidence, raw_points, voxel_count, int(np.count_nonzero(keep_mask))
 
     def _post_filter(
         self,
@@ -1919,28 +1947,28 @@ class VoxelFusionAccumulator:
                 None if intensity is None else np.zeros((0,), dtype=np.float32),
                 None if confidence is None else np.zeros((0,), dtype=np.float32),
             )
-        voxels = np.floor(np.asarray(xyz, dtype=np.float32) / float(voxel_size)).astype(np.int32)
-        unique, inverse = np.unique(voxels, axis=0, return_inverse=True)
+        points = np.asarray(xyz, dtype=np.float32)
         intensity_values = None
-        if intensity is not None and len(np.asarray(intensity, dtype=np.float32)) == len(xyz):
+        if intensity is not None and len(np.asarray(intensity, dtype=np.float32)) == len(points):
             intensity_values = np.asarray(intensity, dtype=np.float32)
         confidence_values = None
-        if confidence is not None and len(np.asarray(confidence, dtype=np.float32)) == len(xyz):
+        if confidence is not None and len(np.asarray(confidence, dtype=np.float32)) == len(points):
             confidence_values = np.asarray(confidence, dtype=np.float32)
-        reduced_points = []
-        reduced_intensity = []
-        reduced_confidence = []
-        for index in range(len(unique)):
-            mask = inverse == index
-            reduced_points.append(np.asarray(xyz, dtype=np.float32)[mask].mean(axis=0))
-            if intensity_values is not None:
-                reduced_intensity.append(float(np.mean(intensity_values[mask])))
-            if confidence_values is not None:
-                reduced_confidence.append(float(np.sum(confidence_values[mask])))
+        _, reduced_points, reduced_intensity, _ = self._reduce_points_by_voxel(points, voxel_size, intensity_values)
+        reduced_confidence = None
+        if confidence_values is not None:
+            voxels = np.floor(points / float(voxel_size)).astype(np.int32)
+            _, inverse = self._unique_rows(voxels)
+            group_count = int(np.max(inverse) + 1) if len(inverse) > 0 else 0
+            reduced_confidence = np.bincount(
+                inverse,
+                weights=confidence_values.astype(np.float64),
+                minlength=group_count,
+            ).astype(np.float32)
         return (
             np.asarray(reduced_points, dtype=np.float32),
-            None if intensity_values is None else np.asarray(reduced_intensity, dtype=np.float32),
-            None if confidence_values is None else np.asarray(reduced_confidence, dtype=np.float32),
+            None if reduced_intensity is None else np.asarray(reduced_intensity, dtype=np.float32),
+            None if reduced_confidence is None else np.asarray(reduced_confidence, dtype=np.float32),
         )
 
     def _apply_confidence_point_cap(

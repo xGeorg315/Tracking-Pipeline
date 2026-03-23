@@ -108,7 +108,7 @@ def load_benchmark_config(path: str | Path) -> BenchmarkConfig:
         output_root=str(raw.get("output_root", "benchmarks")),
         name=str(raw.get("name", "curated_proxy")),
         warmup_runs=int(raw.get("warmup_runs", 1)),
-        measure_runs=int(raw.get("measure_runs", 3)),
+        measure_runs=int(raw.get("measure_runs", 1)),
         config_path=cfg_path,
     )
     validate_benchmark_config(config)

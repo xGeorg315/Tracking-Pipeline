@@ -247,7 +247,7 @@ presets:
 output_root: benchmarks
 name: curated_real
 warmup_runs: 1
-measure_runs: 3
+measure_runs: 1
 ```
 
 | Feld | Default | Bedeutung |
@@ -257,7 +257,7 @@ measure_runs: 3
 | `output_root` | `benchmarks` | Zielverzeichnis fuer Benchmark-Artefakte |
 | `name` | `curated_proxy` | Suffix im Benchmark-Ordnernamen |
 | `warmup_runs` | `1` | Warmup-Laeufe pro Preset/Sequenz |
-| `measure_runs` | `3` | gemessene Laeufe pro Preset/Sequenz |
+| `measure_runs` | `1` | gemessene Laeufe pro Preset/Sequenz; fuer wiederholte Laufzeitmessung explizit groesser als `1` setzen |
 
 ## Typische Presets
 

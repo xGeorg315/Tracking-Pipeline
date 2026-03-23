@@ -356,6 +356,37 @@ def test_load_benchmark_config_reads_performance_defaults(tmp_path: Path) -> Non
     config = load_benchmark_config(manifest)
 
     assert config.warmup_runs == 1
+    assert config.measure_runs == 1
+    assert config.sequences == [str(fixture_dst.resolve())]
+    assert config.presets == [str(preset_dst.resolve())]
+
+
+def test_load_benchmark_config_preserves_explicit_measure_runs(tmp_path: Path) -> None:
+    preset_src = Path(__file__).resolve().parents[3] / "configs" / "kalman_voxel.yaml"
+    data_dir = tmp_path / "data"
+    configs_dir = tmp_path / "configs"
+    configs_dir.mkdir()
+    fixture_dst = _copy_sample_pb(data_dir / "sample_a42.pb")
+    preset_dst = configs_dir / "kalman_voxel.yaml"
+    preset_dst.write_text(preset_src.read_text(encoding="utf-8"), encoding="utf-8")
+    manifest = tmp_path / "benchmark_explicit_measure_runs.yaml"
+    manifest.write_text(
+        "\n".join(
+            [
+                "name: perf_explicit_measure_runs",
+                "measure_runs: 3",
+                "sequences:",
+                "  - data/sample_a42.pb",
+                "presets:",
+                "  - configs/kalman_voxel.yaml",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_benchmark_config(manifest)
+
     assert config.measure_runs == 3
     assert config.sequences == [str(fixture_dst.resolve())]
     assert config.presets == [str(preset_dst.resolve())]

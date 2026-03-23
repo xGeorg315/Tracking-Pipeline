@@ -273,7 +273,7 @@ Wichtige Spalten:
 
 ### Performance-Felder in `results.*`
 
-Performancewerte werden als Median/Min/Max ueber die `measure_runs` geschrieben.
+Performancewerte werden als Median/Min/Max ueber die `measure_runs` geschrieben. Standardmaessig ist das jetzt ein einzelner Messlauf; wiederholte Laufzeitmessungen sind opt-in ueber `measure_runs > 1`.
 
 | Feldtyp | Beispiel |
 | --- | --- |

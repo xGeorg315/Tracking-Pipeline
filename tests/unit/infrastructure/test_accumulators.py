@@ -781,6 +781,213 @@ def test_motion_deskew_skips_when_point_timestamps_are_missing() -> None:
     assert np.isclose(result.metrics["extent_y"], 1.0, atol=1e-4)
 
 
+def test_aggregate_per_voxel_keeps_legacy_voxel_order_and_reduces_mean_values() -> None:
+    accumulator = _symmetry_accumulator(enabled=False, save_world=True, fusion_voxel_size=0.10)
+    points = np.array(
+        [
+            [1.02, 0.00, 0.0],
+            [0.02, 0.00, 0.0],
+            [1.04, 0.02, 0.0],
+            [0.06, 0.01, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    intensity = np.array([10.0, 1.0, 30.0, 3.0], dtype=np.float32)
+    confidence = np.array([0.4, 0.5, 0.6, 0.7], dtype=np.float32)
+
+    reduced_xyz, reduced_intensity, reduced_confidence = accumulator._aggregate_per_voxel(points, intensity, confidence, 0.10)
+
+    assert np.allclose(
+        reduced_xyz,
+        np.array(
+            [
+                [0.04, 0.005, 0.0],
+                [1.03, 0.01, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        atol=1e-6,
+    )
+    assert reduced_intensity is not None
+    assert np.allclose(reduced_intensity, np.array([2.0, 20.0], dtype=np.float32), atol=1e-6)
+    assert reduced_confidence is not None
+    assert np.allclose(reduced_confidence, np.array([1.2, 1.0], dtype=np.float32), atol=1e-6)
+
+
+def test_aggregate_per_voxel_preserves_empty_optional_shapes() -> None:
+    accumulator = _symmetry_accumulator(enabled=False, save_world=True, fusion_voxel_size=0.10)
+
+    reduced_xyz, reduced_intensity, reduced_confidence = accumulator._aggregate_per_voxel(
+        np.zeros((0, 3), dtype=np.float32),
+        np.zeros((0,), dtype=np.float32),
+        np.zeros((0,), dtype=np.float32),
+        0.10,
+    )
+
+    assert reduced_xyz.shape == (0, 3)
+    assert reduced_intensity is not None
+    assert reduced_intensity.shape == (0,)
+    assert reduced_confidence is not None
+    assert reduced_confidence.shape == (0,)
+
+
+def test_voxel_accumulate_applies_weighted_means_and_keeps_legacy_voxel_order() -> None:
+    accumulator = _symmetry_accumulator(enabled=False, save_world=True, fusion_voxel_size=0.10)
+    chunks = [
+        np.array(
+            [
+                [1.02, 0.00, 0.0],
+                [0.02, 0.00, 0.0],
+                [1.04, 0.02, 0.0],
+                [0.06, 0.02, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        np.array(
+            [
+                [1.00, 0.01, 0.0],
+                [2.01, 0.00, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        np.array([[1.08, 0.02, 0.0]], dtype=np.float32),
+    ]
+    intensities = [
+        np.array([2.0, 10.0, 4.0, 20.0], dtype=np.float32),
+        np.array([6.0, 8.0], dtype=np.float32),
+        np.array([12.0], dtype=np.float32),
+    ]
+
+    xyz, intensity, confidence, raw_points, fusion_voxels_total, fusion_voxels_kept = accumulator._voxel_accumulate(
+        chunks,
+        intensities,
+        [2.0, 1.0, 3.0],
+        [0.2, 0.5, 0.7],
+        0.10,
+        1,
+    )
+
+    assert raw_points == 7
+    assert fusion_voxels_total == 3
+    assert fusion_voxels_kept == 3
+    assert np.allclose(
+        xyz,
+        np.array(
+            [
+                [0.04, 0.01, 0.0],
+                [1.05, 0.015, 0.0],
+                [2.01, 0.00, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        atol=1e-6,
+    )
+    assert intensity is not None
+    assert np.allclose(intensity, np.array([15.0, 8.0, 8.0], dtype=np.float32), atol=1e-6)
+    assert np.allclose(confidence, np.array([0.2, 1.4, 0.5], dtype=np.float32), atol=1e-6)
+
+
+def test_voxel_accumulate_requires_aligned_intensity_for_all_chunks_and_filters_by_min_observations() -> None:
+    accumulator = _symmetry_accumulator(enabled=False, save_world=True, fusion_voxel_size=0.10)
+    chunks = [
+        np.array(
+            [
+                [1.02, 0.00, 0.0],
+                [0.02, 0.00, 0.0],
+                [1.04, 0.02, 0.0],
+                [0.06, 0.02, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        np.array(
+            [
+                [1.00, 0.01, 0.0],
+                [2.01, 0.00, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        np.array([[1.08, 0.02, 0.0]], dtype=np.float32),
+    ]
+    intensities = [
+        np.array([2.0, 10.0, 4.0, 20.0], dtype=np.float32),
+        None,
+        np.array([12.0], dtype=np.float32),
+    ]
+
+    xyz, intensity, confidence, raw_points, fusion_voxels_total, fusion_voxels_kept = accumulator._voxel_accumulate(
+        chunks,
+        intensities,
+        [2.0, 1.0, 3.0],
+        [0.2, 0.5, 0.7],
+        0.10,
+        2,
+    )
+
+    assert raw_points == 7
+    assert fusion_voxels_total == 3
+    assert fusion_voxels_kept == 1
+    assert intensity is None
+    assert np.allclose(xyz, np.array([[1.05, 0.015, 0.0]], dtype=np.float32), atol=1e-6)
+    assert np.allclose(confidence, np.array([1.4], dtype=np.float32), atol=1e-6)
+
+
+def test_symmetry_slice_records_counts_one_sided_unique_slices() -> None:
+    accumulator = _symmetry_accumulator(enabled=True, save_world=False, fusion_voxel_size=0.10)
+    axis_idx, lateral_idx, vertical_idx = accumulator._symmetry_axes()
+    points = np.array(
+        [
+            [0.22, 0.00, 1.0],
+            [0.24, 0.04, 1.0],
+            [0.22, 0.18, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    slice_counts, side_point_clouds = accumulator._symmetry_slice_records(
+        points,
+        None,
+        0.0,
+        axis_idx,
+        lateral_idx,
+        vertical_idx,
+        0.10,
+    )
+
+    assert slice_counts == {1: 2, -1: 0}
+    assert len(side_point_clouds[1]) == 3
+    assert len(side_point_clouds[-1]) == 0
+
+
+def test_symmetry_slice_records_counts_two_sided_unique_slices() -> None:
+    accumulator = _symmetry_accumulator(enabled=True, save_world=False, fusion_voxel_size=0.10)
+    axis_idx, lateral_idx, vertical_idx = accumulator._symmetry_axes()
+    points = np.array(
+        [
+            [0.22, 0.00, 1.0],
+            [0.24, 0.04, 1.0],
+            [0.22, 0.18, 1.0],
+            [-0.18, 0.02, 1.0],
+            [-0.19, 0.06, 1.0],
+            [-0.18, 0.18, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    slice_counts, side_point_clouds = accumulator._symmetry_slice_records(
+        points,
+        None,
+        0.0,
+        axis_idx,
+        lateral_idx,
+        vertical_idx,
+        0.10,
+    )
+
+    assert slice_counts == {1: 2, -1: 2}
+    assert len(side_point_clouds[1]) == 3
+    assert len(side_point_clouds[-1]) == 3
+
+
 def test_symmetry_completion_cuts_at_plane_and_mirrors_stronger_half_with_intensity() -> None:
     track = _single_chunk_track(
         np.array(
