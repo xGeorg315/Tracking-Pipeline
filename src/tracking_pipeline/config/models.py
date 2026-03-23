@@ -52,6 +52,13 @@ class TrackingConfig:
     kf_process_var: float = 0.08
     kf_meas_var: float = 0.60
     association_size_weight: float = 0.15
+    fragment_parent_min_length: float = 3.8
+    fragment_max_lateral_offset: float = 1.2
+    fragment_max_vertical_offset: float = 0.9
+    fragment_child_max_length_ratio: float = 0.95
+    fragment_child_max_point_ratio: float = 1.0
+    fragment_max_rear_gap: float = 3.2
+    fragment_child_max_age: int = 6
 
 
 @dataclass(slots=True)

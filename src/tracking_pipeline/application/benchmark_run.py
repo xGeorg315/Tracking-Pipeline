@@ -134,7 +134,7 @@ class BenchmarkRunner:
         except subprocess.CalledProcessError as exc:  # pragma: no cover - exercised through integration failure
             raise RuntimeError(exc.stderr.strip() or exc.stdout.strip() or f"Run failed for {config_path}") from exc
 
-        summary_paths = sorted(run_root.rglob("summary.json"))
+        summary_paths = sorted(path for path in run_root.rglob("summary.json") if path.parent.name != "gt_matching")
         if len(summary_paths) != 1:
             raise RuntimeError(f"Expected exactly one summary.json under {run_root}, found {len(summary_paths)}")
         return json.loads(summary_paths[0].read_text(encoding="utf-8"))

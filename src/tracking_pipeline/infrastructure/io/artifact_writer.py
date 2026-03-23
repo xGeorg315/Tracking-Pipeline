@@ -7,7 +7,7 @@ import yaml
 
 from tracking_pipeline.application.services import build_run_name, resolve_output_root
 from tracking_pipeline.config.models import PipelineConfig
-from tracking_pipeline.domain.models import AggregateResult, FrameTrackingState, ObjectLabelData, RunSummary, Track, TrackOutcomeDebug
+from tracking_pipeline.domain.models import AggregateResult, FrameTrackingState, GTMatchResult, ObjectLabelData, RunSummary, Track, TrackOutcomeDebug
 from tracking_pipeline.infrastructure.io.manifest_writer import ManifestWriter
 from tracking_pipeline.infrastructure.io.pcd_writer import PCDWriter
 from tracking_pipeline.infrastructure.tracking.common import track_debug_summary
@@ -26,6 +26,7 @@ class JsonArtifactWriter:
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "aggregates").mkdir(exist_ok=True)
         (run_dir / "object_list").mkdir(exist_ok=True)
+        (run_dir / "gt_matching").mkdir(exist_ok=True)
         return run_dir
 
     def write_config_snapshot(self, run_dir: Path, config: PipelineConfig) -> None:
@@ -71,6 +72,26 @@ class JsonArtifactWriter:
                 }
             )
         self.manifest_writer.write_jsonl(object_dir / "manifest.jsonl", rows)
+
+    def write_gt_matching(
+        self,
+        run_dir: Path,
+        matches: list[GTMatchResult],
+        unmatched_saved_tracks: list[GTMatchResult],
+        unmatched_gt_objects: list[GTMatchResult],
+        summary: dict[str, int | float | str],
+    ) -> None:
+        match_dir = run_dir / "gt_matching"
+        self.manifest_writer.write_jsonl(match_dir / "matches.jsonl", [asdict(match) for match in matches])
+        self.manifest_writer.write_jsonl(
+            match_dir / "unmatched_saved_tracks.jsonl",
+            [asdict(match) for match in unmatched_saved_tracks],
+        )
+        self.manifest_writer.write_jsonl(
+            match_dir / "unmatched_gt_objects.jsonl",
+            [asdict(match) for match in unmatched_gt_objects],
+        )
+        self.manifest_writer.write_json(match_dir / "summary.json", dict(summary))
 
     def write_summary(self, run_dir: Path, summary: RunSummary) -> None:
         self.manifest_writer.write_json(run_dir / "summary.json", asdict(summary))
@@ -119,6 +140,22 @@ class JsonArtifactWriter:
                 "aggregate_status": None if result is None else result.status,
                 "aggregation_metrics": result_metrics,
             }
+            if "gt_matched" in result_metrics:
+                row["gt_matched"] = bool(result_metrics.get("gt_matched"))
+                row["gt_match_mode"] = str(result_metrics.get("gt_match_mode", ""))
+                row["gt_match_assignment"] = str(result_metrics.get("gt_match_assignment", ""))
+                if result_metrics.get("gt_object_id") is not None:
+                    gt_object_id = int(result_metrics.get("gt_object_id"))
+                    row["gt_object_id"] = gt_object_id
+                    row["matched_gt_pcd_path"] = str(Path("object_list") / f"{object_file_stem(gt_object_id)}.pcd")
+                if result_metrics.get("gt_timestamp_ns") is not None:
+                    row["gt_timestamp_ns"] = int(result_metrics.get("gt_timestamp_ns"))
+                if result_metrics.get("gt_timestamp_delta_ns") is not None:
+                    row["gt_timestamp_delta_ns"] = int(result_metrics.get("gt_timestamp_delta_ns"))
+                if result_metrics.get("gt_frame_index") is not None:
+                    row["gt_frame_index"] = int(result_metrics.get("gt_frame_index"))
+                if result_metrics.get("gt_unmatched_reason"):
+                    row["gt_unmatched_reason"] = str(result_metrics.get("gt_unmatched_reason"))
             if articulated_vehicle:
                 row["articulated_vehicle"] = True
                 row["articulated_component_track_ids"] = list(

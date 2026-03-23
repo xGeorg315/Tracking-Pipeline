@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 
-from tracking_pipeline.domain.models import AggregateResult, Track, TrackOutcomeDebug
+from tracking_pipeline.domain.models import AggregateResult, GTMatchResult, Track, TrackOutcomeDebug
 from tracking_pipeline.infrastructure.io.artifact_writer import JsonArtifactWriter
 
 
@@ -195,3 +195,71 @@ def test_artifact_writer_writes_articulated_vehicle_fields(tmp_path: Path) -> No
     assert rows[0]["object_kind"] == "truck_with_trailer"
     assert rows[0]["aggregation_metrics"]["articulated_rear_gap_mean"] == 0.2
     assert rows[0]["aggregation_metrics"]["articulated_rear_gap_std"] == 0.05
+
+
+def test_artifact_writer_writes_gt_matching_artifacts_and_track_fields(tmp_path: Path) -> None:
+    writer = JsonArtifactWriter(tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    track = Track(track_id=5, hit_count=3, age=3, ended_by_missed=True)
+    track.centers = [np.array([0.0, 1.0, 0.0], dtype=np.float32)]
+    track.frame_ids = [42]
+    result = AggregateResult(
+        track_id=5,
+        points=np.zeros((1, 3), dtype=np.float32),
+        selected_frame_ids=[42],
+        status="saved",
+        metrics={
+            "gt_matched": True,
+            "gt_match_mode": "timestamp_only",
+            "gt_match_assignment": "one_to_one",
+            "gt_object_id": 17,
+            "gt_timestamp_ns": 1005,
+            "gt_timestamp_delta_ns": 5,
+            "gt_frame_index": 7,
+        },
+    )
+    match = GTMatchResult(
+        track_id=5,
+        gt_object_id=17,
+        our_last_timestamp_ns=1000,
+        gt_timestamp_ns=1005,
+        timestamp_delta_ns=5,
+        our_last_frame_id=42,
+        gt_frame_index=7,
+        assignment_cost=5.0,
+        matched=True,
+    )
+    writer.write_tracks(run_dir, {5: track}, [result])
+    writer.write_gt_matching(
+        run_dir,
+        [match],
+        [],
+        [],
+        {
+            "gt_match_saved_track_count": 1,
+            "gt_match_matched_count": 1,
+            "gt_match_unmatched_saved_count": 0,
+            "gt_match_unmatched_gt_count": 0,
+            "gt_match_mode": "timestamp_only",
+            "gt_match_assignment": "one_to_one",
+            "gt_match_mean_timestamp_delta_ns": 5.0,
+            "gt_match_max_timestamp_delta_ns": 5,
+        },
+    )
+
+    track_rows = _load_jsonl(run_dir / "tracks.jsonl")
+    match_rows = _load_jsonl(run_dir / "gt_matching" / "matches.jsonl")
+    summary_payload = json.loads((run_dir / "gt_matching" / "summary.json").read_text(encoding="utf-8"))
+
+    assert track_rows[0]["gt_matched"] is True
+    assert track_rows[0]["gt_object_id"] == 17
+    assert track_rows[0]["matched_gt_pcd_path"] == "object_list/object_0017.pcd"
+    assert track_rows[0]["gt_timestamp_ns"] == 1005
+    assert track_rows[0]["gt_timestamp_delta_ns"] == 5
+    assert track_rows[0]["gt_match_mode"] == "timestamp_only"
+    assert track_rows[0]["gt_match_assignment"] == "one_to_one"
+    assert match_rows[0]["track_id"] == 5
+    assert match_rows[0]["gt_object_id"] == 17
+    assert summary_payload["gt_match_matched_count"] == 1

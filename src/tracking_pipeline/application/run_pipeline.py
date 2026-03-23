@@ -12,6 +12,7 @@ from tracking_pipeline.application.factories import (
     build_track_postprocessors,
     build_tracker,
 )
+from tracking_pipeline.application.gt_matching import apply_gt_matches_to_results, match_saved_aggregates_to_gt
 from tracking_pipeline.application.performance import PerformanceProfiler
 from tracking_pipeline.application.track_outcomes import build_track_outcomes
 from tracking_pipeline.config.models import PipelineConfig
@@ -77,10 +78,19 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
         if result.status == "saved":
             with profiler.stage("write_aggregates"):
                 writer.write_aggregate(run_dir, result, save_intensity=config.output.save_aggregate_intensity)
+    with profiler.stage("match_gt"):
+        matched_gt, unmatched_saved_tracks, unmatched_gt_objects, gt_match_summary = match_saved_aggregates_to_gt(
+            tracks,
+            aggregate_results,
+            latest_object_labels,
+        )
+        apply_gt_matches_to_results(aggregate_results, matched_gt, unmatched_saved_tracks)
     track_outcomes = build_track_outcomes(tracks, aggregate_results, tracker_states)
 
     with profiler.stage("write_object_list"):
         writer.write_object_list(run_dir, latest_object_labels)
+    with profiler.stage("write_gt_matching"):
+        writer.write_gt_matching(run_dir, matched_gt, unmatched_saved_tracks, unmatched_gt_objects, gt_match_summary)
 
     status_counts = Counter(result.status for result in aggregate_results)
     quality_scores = [track.quality_score for track in tracks.values() if track.quality_score is not None]
@@ -103,6 +113,14 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
         object_list_exported_count=len(latest_object_labels),
         object_list_seen_ids=len(object_list_seen_ids),
         object_list_skipped_empty=int(object_list_skipped_empty),
+        gt_match_saved_track_count=int(gt_match_summary["gt_match_saved_track_count"]),
+        gt_match_matched_count=int(gt_match_summary["gt_match_matched_count"]),
+        gt_match_unmatched_saved_count=int(gt_match_summary["gt_match_unmatched_saved_count"]),
+        gt_match_unmatched_gt_count=int(gt_match_summary["gt_match_unmatched_gt_count"]),
+        gt_match_mode=str(gt_match_summary["gt_match_mode"]),
+        gt_match_assignment=str(gt_match_summary["gt_match_assignment"]),
+        gt_match_mean_timestamp_delta_ns=float(gt_match_summary["gt_match_mean_timestamp_delta_ns"]),
+        gt_match_max_timestamp_delta_ns=int(gt_match_summary["gt_match_max_timestamp_delta_ns"]),
         performance=profiler.snapshot(),
     )
     with profiler.stage("write_tracks"):

@@ -25,6 +25,7 @@ from tracking_pipeline.domain.models import (
     FrameData,
     FrameTrackerDebug,
     FrameTrackingState,
+    GTMatchResult,
     ObjectLabelData,
     Track,
     TrackOutcomeDebug,
@@ -67,6 +68,7 @@ class _FakeTracker:
         self.seen_frame_ids: list[int] = []
         self.track.centers.append(np.array([0.95, 0.0, 0.0], dtype=np.float32))
         self.track.frame_ids.append(0)
+        self.track.frame_timestamps_ns.append(200)
         self.track.local_points.append(np.array([[0.0, 0.0, 0.0]], dtype=np.float32))
         self.track.world_points.append(np.array([[0.95, 0.0, 0.0]], dtype=np.float32))
         self.track.bbox_extents.append(np.array([0.1, 0.1, 0.1], dtype=np.float32))
@@ -128,6 +130,10 @@ class _FakeWriter:
         self.track_outcomes = None
         self.written_tracks = None
         self.written_aggregate_results = None
+        self.gt_matches = None
+        self.gt_unmatched_saved = None
+        self.gt_unmatched_objects = None
+        self.gt_summary = None
 
     def prepare_run_dir(self, config):
         _ = config
@@ -163,6 +169,16 @@ class _FakeWriter:
     def write_object_list(self, run_dir, object_labels):
         self.object_labels = object_labels
         (run_dir / "object_list_manifest.txt").write_text(str(sorted(object_labels)), encoding="utf-8")
+
+    def write_gt_matching(self, run_dir, matches, unmatched_saved_tracks, unmatched_gt_objects, summary):
+        self.gt_matches = matches
+        self.gt_unmatched_saved = unmatched_saved_tracks
+        self.gt_unmatched_objects = unmatched_gt_objects
+        self.gt_summary = summary
+        (run_dir / "gt_matching.txt").write_text(
+            f"{len(matches)}/{len(unmatched_saved_tracks)}/{len(unmatched_gt_objects)}",
+            encoding="utf-8",
+        )
 
 
 class _FakeViewer:
@@ -388,11 +404,19 @@ def test_run_pipeline_exports_latest_object_list_observation(monkeypatch, tmp_pa
     assert summary.object_list_exported_count == 2
     assert summary.object_list_seen_ids == 3
     assert summary.object_list_skipped_empty == 1
+    assert summary.gt_match_saved_track_count == 1
+    assert summary.gt_match_matched_count == 1
+    assert summary.gt_match_unmatched_gt_count == 1
     assert set(fake_writer.object_labels.keys()) == {7, 8}
     assert fake_writer.object_labels[7].timestamp_ns == 200
     assert fake_writer.object_labels[7].frame_index == 1
     assert fake_writer.object_labels[8].timestamp_ns == 150
     assert fake_writer.object_labels[8].frame_index == 1
+    assert len(fake_writer.gt_matches) == 1
+    assert fake_writer.gt_matches[0].track_id == 1
+    assert fake_writer.gt_matches[0].gt_object_id == 7
+    assert len(fake_writer.gt_unmatched_objects) == 1
+    assert fake_writer.gt_unmatched_objects[0].gt_object_id == 8
 
 
 def test_run_pipeline_passes_aggregate_intensity_flag_to_writer(monkeypatch, tmp_path: Path) -> None:

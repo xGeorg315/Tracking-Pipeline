@@ -93,10 +93,17 @@ def test_run_pipeline_creates_run_artifacts(tmp_path: Path) -> None:
     assert (run_dir / "config.snapshot.yaml").exists()
     assert (run_dir / "summary.json").exists()
     assert (run_dir / "tracks.jsonl").exists()
+    assert (run_dir / "gt_matching").exists()
+    assert (run_dir / "gt_matching" / "matches.jsonl").exists()
+    assert (run_dir / "gt_matching" / "unmatched_saved_tracks.jsonl").exists()
+    assert (run_dir / "gt_matching" / "unmatched_gt_objects.jsonl").exists()
+    assert (run_dir / "gt_matching" / "summary.json").exists()
     payload = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
     assert payload["tracker_algorithm"] == "euclidean_nn"
     assert payload["accumulator_algorithm"] == "voxel_fusion"
     assert payload["input_paths"] == config.input.paths
+    assert payload["gt_match_mode"] == "timestamp_only"
+    assert payload["gt_match_assignment"] == "one_to_one"
     assert "performance" in payload
     assert "read_frames" in payload["performance"]["stages"]
     assert "cluster_frames" in payload["performance"]["stages"]
@@ -171,8 +178,24 @@ def test_run_pipeline_exports_latest_object_list_artifacts(tmp_path: Path) -> No
         for line in (run_dir / "object_list" / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+    gt_match_rows = [
+        json.loads(line)
+        for line in (run_dir / "gt_matching" / "matches.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    track_rows = [
+        json.loads(line)
+        for line in (run_dir / "tracks.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    unmatched_gt_rows = [
+        json.loads(line)
+        for line in (run_dir / "gt_matching" / "unmatched_gt_objects.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
     assert (run_dir / "object_list").exists()
+    assert (run_dir / "gt_matching").exists()
     assert (run_dir / "object_list" / "object_0007.pcd").exists()
     assert not (run_dir / "object_list" / "object_0009.pcd").exists()
     assert payload["object_list_exported_count"] == 1
@@ -183,3 +206,10 @@ def test_run_pipeline_exports_latest_object_list_artifacts(tmp_path: Path) -> No
     assert manifest_rows[0]["timestamp_ns"] == 1002
     assert manifest_rows[0]["frame_index"] == 1
     assert manifest_rows[0]["point_count"] == 2
+    assert payload["gt_match_saved_track_count"] >= 0
+    assert payload["gt_match_mode"] == "timestamp_only"
+    assert payload["gt_match_assignment"] == "one_to_one"
+    assert len(gt_match_rows) + len(unmatched_gt_rows) >= 1
+    matched_track_rows = [row for row in track_rows if row.get("gt_matched") is True]
+    if matched_track_rows:
+        assert matched_track_rows[0]["matched_gt_pcd_path"] == "object_list/object_0007.pcd"

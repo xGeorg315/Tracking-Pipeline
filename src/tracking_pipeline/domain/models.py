@@ -215,6 +215,20 @@ class AggregateResult:
 
 
 @dataclass(slots=True)
+class GTMatchResult:
+    track_id: int
+    gt_object_id: int | None
+    our_last_timestamp_ns: int
+    gt_timestamp_ns: int | None
+    timestamp_delta_ns: int | None
+    our_last_frame_id: int
+    gt_frame_index: int | None
+    assignment_cost: float | None
+    matched: bool
+    unmatched_reason: str = ""
+
+
+@dataclass(slots=True)
 class TrackOutcomeDebug:
     track_id: int
     status: str
@@ -289,4 +303,12 @@ class RunSummary:
     object_list_exported_count: int = 0
     object_list_seen_ids: int = 0
     object_list_skipped_empty: int = 0
+    gt_match_saved_track_count: int = 0
+    gt_match_matched_count: int = 0
+    gt_match_unmatched_saved_count: int = 0
+    gt_match_unmatched_gt_count: int = 0
+    gt_match_mode: str = ""
+    gt_match_assignment: str = ""
+    gt_match_mean_timestamp_delta_ns: float = 0.0
+    gt_match_max_timestamp_delta_ns: int = 0
     performance: RunPerformance | None = None

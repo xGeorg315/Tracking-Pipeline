@@ -24,8 +24,10 @@ STAGE_NAMES = (
     "tracker_finalize",
     "postprocess_tracks",
     "accumulate_tracks",
+    "match_gt",
     "write_aggregates",
     "write_object_list",
+    "write_gt_matching",
     "write_tracks",
     "write_summary",
 )
@@ -35,11 +37,13 @@ COMPUTE_STAGE_NAMES = (
     "tracker_finalize",
     "postprocess_tracks",
     "accumulate_tracks",
+    "match_gt",
 )
 IO_STAGE_NAMES = (
     "read_frames",
     "write_aggregates",
     "write_object_list",
+    "write_gt_matching",
     "write_tracks",
     "write_summary",
 )
