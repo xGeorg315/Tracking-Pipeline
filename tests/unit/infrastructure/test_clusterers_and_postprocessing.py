@@ -12,6 +12,7 @@ from tracking_pipeline.infrastructure.clustering.ground_removed_dbscan import Gr
 from tracking_pipeline.infrastructure.clustering.hdbscan_clusterer import HDBSCANClusterer
 from tracking_pipeline.infrastructure.clustering.range_image_connected_components import RangeImageConnectedComponentsClusterer
 from tracking_pipeline.infrastructure.clustering.range_image_depth_jump import RangeImageDepthJumpClusterer
+from tracking_pipeline.infrastructure.clustering.voxel_grid_connected_components import VoxelGridConnectedComponentsClusterer
 from tracking_pipeline.infrastructure.postprocessing.articulated_vehicle_merge import ArticulatedVehicleMergePostprocessor
 from tracking_pipeline.infrastructure.postprocessing.co_moving_track_merge import CoMovingTrackMergePostprocessor
 from tracking_pipeline.infrastructure.postprocessing.track_quality_scoring import TrackQualityScoringPostprocessor
@@ -34,6 +35,17 @@ def _ground_frame() -> FrameData:
     ground = np.array([[x, y, 0.0] for x in xs for y in ys], dtype=np.float32)
     object_points = np.random.default_rng(6).normal(loc=[0.2, 1.5, 1.0], scale=0.03, size=(40, 3)).astype(np.float32)
     return FrameData(frame_index=0, timestamp_ns=1, points=np.vstack([ground, object_points]).astype(np.float32))
+
+
+def _frame_from_points(points: np.ndarray) -> FrameData:
+    xyz = np.asarray(points, dtype=np.float32)
+    return FrameData(
+        frame_index=0,
+        timestamp_ns=1,
+        points=xyz,
+        point_intensity=np.linspace(0.0, 1.0, len(xyz), dtype=np.float32),
+        point_timestamp_ns=np.arange(1000, 1000 + len(xyz), dtype=np.int64),
+    )
 
 
 def _sensor_frame() -> FrameData:
@@ -152,6 +164,111 @@ def test_euclidean_clusterer_detects_two_clusters() -> None:
     assert result.lane_intensity is not None
     assert all(detection.intensity is not None for detection in result.detections)
     assert all(detection.point_timestamp_ns is not None for detection in result.detections)
+
+
+def test_voxel_grid_connected_components_detects_two_clusters() -> None:
+    frame = _cluster_frame()
+    lane_box = LaneBox.from_values([-2.0, 3.0, -2.0, 3.0, 0.0, 2.0])
+    clusterer = VoxelGridConnectedComponentsClusterer(
+        ClusteringConfig(algorithm="voxel_grid_connected_components", voxel_size=0.25, vehicle_min_points=10, vehicle_max_points=100)
+    )
+    result = clusterer.cluster(frame, lane_box)
+    assert len(result.detections) == 2
+    assert result.metrics["accepted_cluster_count"] == 2
+    assert result.metrics["occupied_voxel_count"] > 0
+    assert result.metrics["voxel_component_count"] == 2
+    assert result.lane_intensity is not None
+    assert all(detection.intensity is not None for detection in result.detections)
+    assert all(detection.point_timestamp_ns is not None for detection in result.detections)
+
+
+def test_voxel_grid_connected_components_returns_empty_when_below_vehicle_min_points() -> None:
+    frame = _frame_from_points(_cluster_frame().points[:9])
+    lane_box = LaneBox.from_values([-2.0, 3.0, -2.0, 3.0, 0.0, 2.0])
+    clusterer = VoxelGridConnectedComponentsClusterer(
+        ClusteringConfig(algorithm="voxel_grid_connected_components", voxel_size=0.25, vehicle_min_points=10)
+    )
+    result = clusterer.cluster(frame, lane_box)
+    assert result.detections == []
+    assert result.metrics == {"algorithm": "voxel_grid_connected_components", "lane_point_count": 9}
+
+
+def test_voxel_grid_connected_components_joins_diagonal_neighbor_voxels() -> None:
+    points = np.asarray(
+        [
+            [0.10, 0.10, 0.10],
+            [0.12, 0.12, 0.10],
+            [0.14, 0.10, 0.12],
+            [1.10, 1.10, 1.10],
+            [1.12, 1.14, 1.10],
+            [1.14, 1.10, 1.12],
+        ],
+        dtype=np.float32,
+    )
+    frame = _frame_from_points(points)
+    lane_box = LaneBox.from_values([-1.0, 2.0, -1.0, 2.0, -1.0, 2.0])
+    clusterer = VoxelGridConnectedComponentsClusterer(
+        ClusteringConfig(algorithm="voxel_grid_connected_components", voxel_size=1.0, vehicle_min_points=2, vehicle_max_points=20)
+    )
+    result = clusterer.cluster(frame, lane_box)
+    assert len(result.detections) == 1
+    assert result.metrics["voxel_component_count"] == 1
+
+
+def test_voxel_grid_connected_components_separates_clusters_across_empty_voxel_gap() -> None:
+    points = np.asarray(
+        [
+            [0.10, 0.10, 0.10],
+            [0.12, 0.12, 0.10],
+            [0.14, 0.10, 0.12],
+            [2.10, 0.10, 0.10],
+            [2.12, 0.12, 0.10],
+            [2.14, 0.10, 0.12],
+        ],
+        dtype=np.float32,
+    )
+    frame = _frame_from_points(points)
+    lane_box = LaneBox.from_values([-1.0, 3.0, -1.0, 2.0, -1.0, 2.0])
+    clusterer = VoxelGridConnectedComponentsClusterer(
+        ClusteringConfig(algorithm="voxel_grid_connected_components", voxel_size=1.0, vehicle_min_points=2, vehicle_max_points=20)
+    )
+    result = clusterer.cluster(frame, lane_box)
+    assert len(result.detections) == 2
+    assert result.metrics["voxel_component_count"] == 2
+
+
+def test_voxel_grid_connected_components_filters_clusters_by_point_count() -> None:
+    points = np.asarray(
+        [
+            [0.10, 0.10, 0.10],
+            [0.11, 0.11, 0.11],
+            [0.12, 0.12, 0.12],
+            [3.10, 0.10, 0.10],
+            [3.11, 0.11, 0.11],
+            [3.12, 0.12, 0.12],
+            [3.13, 0.13, 0.13],
+            [3.14, 0.14, 0.14],
+            [6.10, 0.10, 0.10],
+            [6.11, 0.11, 0.11],
+            [6.12, 0.12, 0.12],
+            [6.13, 0.13, 0.13],
+            [6.14, 0.14, 0.14],
+            [6.15, 0.15, 0.15],
+            [6.16, 0.16, 0.16],
+            [6.17, 0.17, 0.17],
+        ],
+        dtype=np.float32,
+    )
+    frame = _frame_from_points(points)
+    lane_box = LaneBox.from_values([-1.0, 7.0, -1.0, 2.0, -1.0, 2.0])
+    clusterer = VoxelGridConnectedComponentsClusterer(
+        ClusteringConfig(algorithm="voxel_grid_connected_components", voxel_size=1.0, vehicle_min_points=4, vehicle_max_points=7)
+    )
+    result = clusterer.cluster(frame, lane_box)
+    assert len(result.detections) == 1
+    assert result.metrics["raw_cluster_count"] == 3
+    assert result.metrics["rejected_small_count"] == 1
+    assert result.metrics["rejected_large_count"] == 1
 
 
 def test_ground_removed_dbscan_reports_removed_ground_points() -> None:

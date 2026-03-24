@@ -16,6 +16,7 @@ from tracking_pipeline.infrastructure.clustering.hdbscan_clusterer import HDBSCA
 from tracking_pipeline.infrastructure.clustering.range_image_connected_components import RangeImageConnectedComponentsClusterer
 from tracking_pipeline.infrastructure.clustering.range_image_depth_jump import RangeImageDepthJumpClusterer
 from tracking_pipeline.infrastructure.clustering.beam_neighbor_region_growing import BeamNeighborRegionGrowingClusterer
+from tracking_pipeline.infrastructure.clustering.voxel_grid_connected_components import VoxelGridConnectedComponentsClusterer
 from tracking_pipeline.infrastructure.io.artifact_writer import JsonArtifactWriter
 from tracking_pipeline.infrastructure.postprocessing.articulated_vehicle_merge import ArticulatedVehicleMergePostprocessor
 from tracking_pipeline.infrastructure.postprocessing.co_moving_track_merge import CoMovingTrackMergePostprocessor
@@ -49,6 +50,8 @@ def build_clusterer(config: PipelineConfig) -> Clusterer:
         return GroundRemovedDBSCANClusterer(config.clustering)
     if algorithm == "hdbscan":
         return HDBSCANClusterer(config.clustering)
+    if algorithm == "voxel_grid_connected_components":
+        return VoxelGridConnectedComponentsClusterer(config.clustering)
     if algorithm == "range_image_connected_components":
         return RangeImageConnectedComponentsClusterer(config.clustering)
     if algorithm == "range_image_depth_jump":

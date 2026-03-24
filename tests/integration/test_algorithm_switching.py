@@ -72,13 +72,35 @@ def test_new_registration_presets_run(tmp_path: Path) -> None:
     )
     feature_cfg.output.root_dir = str(tmp_path / "feature")
 
+    kiss_cfg = _load_preset_with_fixture(
+        project_root,
+        "kalman_kiss_matcher_icp.yaml",
+        fixture,
+        tmp_path / "kiss_cfg",
+    )
+    kiss_cfg.output.root_dir = str(tmp_path / "kiss")
+
+    kiss_only_cfg = _load_preset_with_fixture(
+        project_root,
+        "kalman_kiss_matcher.yaml",
+        fixture,
+        tmp_path / "kiss_only_cfg",
+    )
+    kiss_only_cfg.output.root_dir = str(tmp_path / "kiss_only")
+
     generalized_summary = run_pipeline(generalized_cfg, project_root)
     feature_summary = run_pipeline(feature_cfg, project_root)
+    kiss_summary = run_pipeline(kiss_cfg, project_root)
+    kiss_only_summary = run_pipeline(kiss_only_cfg, project_root)
 
     generalized_payload = json.loads((Path(generalized_summary.output_dir) / "summary.json").read_text(encoding="utf-8"))
     feature_payload = json.loads((Path(feature_summary.output_dir) / "summary.json").read_text(encoding="utf-8"))
+    kiss_payload = json.loads((Path(kiss_summary.output_dir) / "summary.json").read_text(encoding="utf-8"))
+    kiss_only_payload = json.loads((Path(kiss_only_summary.output_dir) / "summary.json").read_text(encoding="utf-8"))
     assert generalized_payload["accumulator_algorithm"] == "registration_voxel_fusion"
     assert feature_payload["accumulator_algorithm"] == "registration_voxel_fusion"
+    assert kiss_payload["accumulator_algorithm"] == "registration_voxel_fusion"
+    assert kiss_only_payload["accumulator_algorithm"] == "registration_voxel_fusion"
 
 
 def test_sensor_space_preset_runs(tmp_path: Path) -> None:

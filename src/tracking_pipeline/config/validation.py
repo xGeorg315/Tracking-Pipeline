@@ -11,6 +11,7 @@ SUPPORTED_CLUSTERERS = {
     "euclidean_clustering",
     "ground_removed_dbscan",
     "hdbscan",
+    "voxel_grid_connected_components",
     "range_image_connected_components",
     "range_image_depth_jump",
     "beam_neighbor_region_growing",
@@ -33,7 +34,14 @@ SUPPORTED_FRAME_SELECTION_METHODS = {
     "center_diversity",
     "max_extent",
 }
-SUPPORTED_REGISTRATION_BACKENDS = {"small_gicp", "icp_point_to_plane", "generalized_icp", "feature_global_then_local"}
+SUPPORTED_REGISTRATION_BACKENDS = {
+    "small_gicp",
+    "icp_point_to_plane",
+    "generalized_icp",
+    "feature_global_then_local",
+    "kiss_matcher",
+    "kiss_matcher_then_icp",
+}
 SUPPORTED_FUSION_WEIGHT_MODES = {"uniform", "point_count", "quality"}
 
 
@@ -139,6 +147,8 @@ def validate_config(config: PipelineConfig) -> None:
         raise ConfigError("aggregation.length_coverage_bins must be >= 2")
     if config.clustering.sensor_range_max <= config.clustering.sensor_range_min:
         raise ConfigError("clustering.sensor_range_max must be greater than clustering.sensor_range_min")
+    if config.clustering.algorithm == "voxel_grid_connected_components" and config.clustering.voxel_size <= 0:
+        raise ConfigError("clustering.voxel_size must be > 0 for voxel_grid_connected_components")
     if config.clustering.sensor_min_component_size < 1:
         raise ConfigError("clustering.sensor_min_component_size must be >= 1")
     if config.clustering.sensor_neighbor_rows < 0 or config.clustering.sensor_neighbor_cols < 0:

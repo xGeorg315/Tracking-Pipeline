@@ -2,10 +2,6 @@ input:
   paths:
     - ../data/medium_2 # 115 Vehicles
     # - ../data/medium_energy # 159 Vehicles
-# clustering:
-#   algorithm: hdbscan
-#   hdbscan_min_cluster_size: 10
-#   hdbscan_min_samples: 5
 tracking:
   algorithm: kalman_nn
   max_dist: 7.5
@@ -18,7 +14,7 @@ tracking:
   association_size_weight: 0.05
 aggregation:
   algorithm: registration_voxel_fusion
-  registration_backend: feature_global_then_local
+  registration_backend: icp_point_to_plane
   frame_selection_method: keyframe_motion
   keyframe_keep: 8
   enable_registration_underfill_fallback: true

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import open3d as o3d
+from dbscan import DBSCAN as fast_dbscan
 
 from tracking_pipeline.config.models import ClusteringConfig
 from tracking_pipeline.domain.models import ClusterResult, FrameData
@@ -53,9 +54,11 @@ class GroundRemovedDBSCANClusterer:
                 metrics={"algorithm": "ground_removed_dbscan", **extra_metrics},
                 lane_intensity=lane_intensity,
             )
-        cluster_pcd = o3d.geometry.PointCloud()
-        cluster_pcd.points = o3d.utility.Vector3dVector(cluster_input.astype(np.float64))
-        labels = np.asarray(cluster_pcd.cluster_dbscan(eps=float(self.config.eps), min_points=int(self.config.min_points), print_progress=False))
+        labels, _ = fast_dbscan(
+            np.asarray(cluster_input, dtype=np.float32),
+            eps=float(self.config.eps),
+            min_samples=int(self.config.min_points),
+        )
         return build_cluster_result(
             "ground_removed_dbscan",
             lane_points,

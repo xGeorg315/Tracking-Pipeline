@@ -21,6 +21,7 @@ class PreprocessingConfig:
 class ClusteringConfig:
     algorithm: str = "dbscan"
     eps: float = 1.15
+    voxel_size: float = 0.25
     min_points: int = 20
     vehicle_min_points: int = 20
     vehicle_max_points: int = 10000

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import types
+
 import numpy as np
 
 from tracking_pipeline.config.models import AggregationConfig, OutputConfig, TrackingConfig
@@ -7,7 +9,11 @@ from tracking_pipeline.domain.models import AggregateResult, Track
 from tracking_pipeline.domain.rules import compute_extent
 from tracking_pipeline.domain.value_objects import LaneBox
 from tracking_pipeline.infrastructure.aggregation.occupancy_consensus_fusion import OccupancyConsensusFusionAccumulator
-from tracking_pipeline.infrastructure.aggregation.registration_backends import _BaseRegistrationBackend
+from tracking_pipeline.infrastructure.aggregation import registration_backends
+from tracking_pipeline.infrastructure.aggregation.registration_backends import (
+    _BaseRegistrationBackend,
+    build_registration_backend,
+)
 from tracking_pipeline.infrastructure.aggregation.registration_voxel_fusion import RegistrationVoxelFusionAccumulator
 from tracking_pipeline.infrastructure.aggregation.voxel_fusion import VoxelFusionAccumulator
 from tracking_pipeline.infrastructure.aggregation.weighted_voxel_fusion import WeightedVoxelFusionAccumulator
@@ -1224,6 +1230,135 @@ def test_registration_backend_keeps_only_anchor_and_accepted_chunks() -> None:
     assert np.allclose(np.mean(backend.seen_targets[0], axis=0), np.mean(chunks[0], axis=0))
     assert np.allclose(np.mean(backend.seen_targets[1], axis=0), np.mean(chunks[0], axis=0))
     assert np.allclose(aligned[1], chunks[2])
+
+
+def test_kiss_matcher_icp_backend_returns_unavailable_without_optional_modules(monkeypatch) -> None:
+    def _raise_import_error(name: str):
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(registration_backends.importlib, "import_module", _raise_import_error)
+    backend = build_registration_backend(AggregationConfig(registration_backend="kiss_matcher_then_icp"))
+
+    aligned, metrics = backend.align_chunks([_constant_chunk(0.0), _constant_chunk(1.0)])
+
+    assert len(aligned) == 2
+    assert metrics["registration_backend"] == "unavailable"
+    assert metrics["alignment_method"] == "unavailable"
+    assert metrics["registration_skipped"] is True
+
+
+def test_kiss_matcher_backend_returns_unavailable_without_optional_module(monkeypatch) -> None:
+    def _raise_import_error(name: str):
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(registration_backends.importlib, "import_module", _raise_import_error)
+    backend = build_registration_backend(AggregationConfig(registration_backend="kiss_matcher"))
+
+    aligned, metrics = backend.align_chunks([_constant_chunk(0.0), _constant_chunk(1.0)])
+
+    assert len(aligned) == 2
+    assert metrics["registration_backend"] == "unavailable"
+    assert metrics["alignment_method"] == "unavailable"
+    assert metrics["registration_skipped"] is True
+
+
+def test_kiss_matcher_backend_uses_matcher_only(monkeypatch) -> None:
+    class _FakeMatcherConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class _FakeMatcher:
+        def __init__(self, arg):
+            self.arg = arg
+            self._inliers = 0
+
+        def estimate(self, source: np.ndarray, target: np.ndarray) -> types.SimpleNamespace:
+            _ = target
+            self._inliers = len(source)
+            return types.SimpleNamespace(
+                rotation=np.eye(3, dtype=np.float64),
+                translation=np.array([-1.0, 0.0, 0.0], dtype=np.float64),
+                valid=True,
+            )
+
+        def get_num_final_inliers(self) -> int:
+            return self._inliers
+
+    def _import_module(name: str):
+        if name == "kiss_matcher":
+            return types.SimpleNamespace(KISSMatcher=_FakeMatcher, KISSMatcherConfig=_FakeMatcherConfig)
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(registration_backends.importlib, "import_module", _import_module)
+    backend = build_registration_backend(
+        AggregationConfig(
+            registration_backend="kiss_matcher",
+            registration_min_fitness=0.25,
+            registration_max_translation=3.2,
+        )
+    )
+    source = _constant_chunk(1.0)
+    target = _constant_chunk(0.0)
+
+    aligned, metrics = backend.align_chunks([target, source])
+
+    assert len(aligned) == 2
+    assert metrics["registration_backend"] == "kiss_matcher"
+    assert metrics["registration_accepted"] == 1
+    assert metrics["registration_rejected"] == 0
+    assert np.allclose(aligned[1], target)
+
+
+def test_kiss_matcher_icp_backend_uses_coarse_match_then_refines(monkeypatch) -> None:
+    class _FakeMatcher:
+        def __init__(self, *args, **kwargs):
+            _ = args, kwargs
+
+        def estimate(self, source: np.ndarray, target: np.ndarray) -> types.SimpleNamespace:
+            _ = source, target
+            return types.SimpleNamespace(
+                rotation=np.eye(3, dtype=np.float64),
+                translation=np.array([-1.0, 0.0, 0.0], dtype=np.float64),
+                valid=True,
+            )
+
+    class _FakeMatcherConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    def _import_module(name: str):
+        if name == "kiss_matcher":
+            return types.SimpleNamespace(KISSMatcher=_FakeMatcher, KISSMatcherConfig=_FakeMatcherConfig)
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(registration_backends.importlib, "import_module", _import_module)
+    backend = build_registration_backend(
+        AggregationConfig(
+            registration_backend="kiss_matcher_then_icp",
+            registration_min_fitness=0.25,
+            registration_max_translation=3.2,
+        )
+    )
+    refine_calls: list[np.ndarray] = []
+
+    def _refine_with_icp(source: np.ndarray, target: np.ndarray, init: np.ndarray) -> tuple[np.ndarray, float, float]:
+        _ = source, target
+        refine_calls.append(np.asarray(init, dtype=np.float64))
+        return np.asarray(init, dtype=np.float64), 0.9, 0.01
+
+    monkeypatch.setattr(backend, "_refine_with_icp", _refine_with_icp)
+    source = _constant_chunk(1.0)
+    target = _constant_chunk(0.0)
+
+    aligned, metrics = backend.align_chunks([target, source])
+
+    assert len(aligned) == 2
+    assert metrics["registration_backend"] == "kiss_matcher_then_icp"
+    assert metrics["registration_accepted"] == 1
+    assert metrics["registration_rejected"] == 0
+    assert len(refine_calls) == 1
+    assert np.allclose(refine_calls[0][:3, 3], np.array([-1.0, 0.0, 0.0], dtype=np.float64))
+    assert np.allclose(aligned[1], target)
 
 
 def test_registration_subset_keeps_frame_ids_intensity_and_chunk_weights_aligned() -> None:

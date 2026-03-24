@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "betterproto>=1.2.5,<2",
+  "dbscan",
   "numpy>=1.26",
   "open3d>=0.18",
   "PyYAML>=6.0",

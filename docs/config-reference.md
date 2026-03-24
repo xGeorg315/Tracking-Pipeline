@@ -14,11 +14,11 @@ Diese Seite beschreibt die YAML-Konfiguration der Pipeline auf Basis der aktuell
 ## Unterstuetzte Werte
 
 - `input.format`: `a42_pb`
-- `clustering.algorithm`: `dbscan`, `euclidean_clustering`, `ground_removed_dbscan`, `hdbscan`, `range_image_connected_components`, `range_image_depth_jump`, `beam_neighbor_region_growing`
+- `clustering.algorithm`: `dbscan`, `euclidean_clustering`, `ground_removed_dbscan`, `hdbscan`, `voxel_grid_connected_components`, `range_image_connected_components`, `range_image_depth_jump`, `beam_neighbor_region_growing`
 - `tracking.algorithm`: `euclidean_nn`, `kalman_nn`, `hungarian_kalman`
 - `aggregation.algorithm`: `voxel_fusion`, `registration_voxel_fusion`, `weighted_voxel_fusion`, `occupancy_consensus_fusion`
 - `aggregation.frame_selection_method`: `auto`, `all_track_frames`, `line_touch_last_k`, `keyframe_motion`, `length_coverage`, `quality_coverage`, `tail_coverage`, `center_diversity`, `max_extent`
-- `aggregation.registration_backend`: `small_gicp`, `icp_point_to_plane`, `generalized_icp`, `feature_global_then_local`
+- `aggregation.registration_backend`: `small_gicp`, `icp_point_to_plane`, `generalized_icp`, `feature_global_then_local`, `kiss_matcher`, `kiss_matcher_then_icp`
 - `aggregation.fusion_weight_mode`: `uniform`, `point_count`, `quality`
 
 ## Beispiel: Pipeline-Config
@@ -61,6 +61,7 @@ output:
 | --- | --- | --- |
 | `algorithm` | `dbscan` | Clusterer-Auswahl |
 | `eps` | `1.15` | DBSCAN-/Nachbarschaftsradius |
+| `voxel_size` | `0.25` | Voxelgroesse fuer `voxel_grid_connected_components` |
 | `min_points` | `20` | Mindestpunkte fuer DBSCAN/HDBSCAN |
 | `vehicle_min_points` | `20` | Untergrenze fuer gueltige Fahrzeugcluster |
 | `vehicle_max_points` | `10000` | Obergrenze fuer Fahrzeugcluster |
@@ -143,7 +144,7 @@ output:
 
 | Feld | Default | Bedeutung |
 | --- | --- | --- |
-| `registration_backend` | `small_gicp` | Backend fuer `registration_voxel_fusion` |
+| `registration_backend` | `small_gicp` | Backend fuer `registration_voxel_fusion` (`kiss_matcher_then_icp` = KISS-Matcher Initial-Guess plus ICP-Refinement) |
 | `registration_max_corr_dist` | `0.95` | maximale Korrespondenzdistanz |
 | `registration_max_iter` | `80` | Iterationslimit fuer lokales Alignment |
 | `registration_min_fitness` | `0.25` | Mindestfitness fuer akzeptierte Registrierung |
