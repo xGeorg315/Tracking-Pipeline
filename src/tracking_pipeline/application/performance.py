@@ -47,6 +47,34 @@ IO_STAGE_NAMES = (
     "write_tracks",
     "write_summary",
 )
+AGGREGATION_COMPONENT_NAMES = (
+    "registration",
+    "fusion_core",
+    "post_filter",
+    "tail_bridge",
+    "confidence_cap",
+    "symmetry_completion",
+    "fusion_post",
+    "fusion_total",
+)
+
+
+def build_component_snapshot(
+    wall_seconds: dict[str, float] | None = None,
+    cpu_seconds: dict[str, float] | None = None,
+    call_counts: dict[str, int] | None = None,
+) -> dict[str, StagePerformance]:
+    wall_seconds = wall_seconds or {}
+    cpu_seconds = cpu_seconds or {}
+    call_counts = call_counts or {}
+    return {
+        name: StagePerformance(
+            wall_seconds=float(wall_seconds.get(name, 0.0) or 0.0),
+            cpu_seconds=float(cpu_seconds.get(name, 0.0) or 0.0),
+            call_count=int(call_counts.get(name, 0) or 0),
+        )
+        for name in AGGREGATION_COMPONENT_NAMES
+    }
 
 
 @dataclass(slots=True)
@@ -88,6 +116,7 @@ class PerformanceProfiler:
             io_wall_seconds=io_wall_seconds,
             peak_rss_mb=_peak_rss_mb(),
             stages=stages,
+            aggregation_components=build_component_snapshot(),
         )
 
 

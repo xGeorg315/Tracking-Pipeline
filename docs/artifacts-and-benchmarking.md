@@ -60,8 +60,11 @@ Seit der Performance-Erweiterung schreibt `run` ein verschachteltes `performance
 | `io_wall_seconds` | Wall-Zeit von Lesen und Schreiben |
 | `peak_rss_mb` | maximaler Resident Set Size in MB |
 | `stages` | Timing pro Stage, z. B. `cluster_frames`, `tracker_steps`, `accumulate_tracks` |
+| `aggregation_components` | aufsummierte Teilzeiten der Aggregation fuer `registration`, `fusion_core`, `post_filter`, `tail_bridge`, `confidence_cap`, `symmetry_completion`, `fusion_post`, `fusion_total` |
 
 `compute_cpu_seconds` misst nur die eigentlichen Compute-Stages, nicht den gesamten Run.
+
+`accumulate_tracks` bleibt die uebergeordnete Stage-Zeit. Sie kann groesser sein als `registration + fusion_total`, weil Selektion, Vorbereitung und andere Logik davor bzw. dazwischen bewusst nicht in den Teilkomponenten stecken.
 
 ## `tracks.jsonl`
 
@@ -151,6 +154,16 @@ Das ist die schnellste Datei, um zu sehen, warum ein Track nicht gespeichert wur
 | `component_count_post_fusion` | Anzahl Komponenten nach Fusion |
 | `tail_bridge_count` | erzeugte Bridge-Punkte fuer Long Vehicles |
 | `mode` | `local` oder `world` |
+| `registration_wall_seconds` / `registration_cpu_seconds` | Zeit fuer `_prepare_for_fusion(...)` bei registrierungsbasierten Akkumulatoren |
+| `fusion_core_wall_seconds` / `fusion_core_cpu_seconds` | reine Zeit der Voxel-Akkumulation (`_fuse_chunks`) |
+| `post_filter_wall_seconds` / `post_filter_cpu_seconds` | Zeit fuer `_post_filter(...)` inklusive optionalem Statistical Outlier Removal und `aggregate_voxel` |
+| `tail_bridge_wall_seconds` / `tail_bridge_cpu_seconds` | Zeit fuer `_apply_tail_bridge(...)` inklusive Komponentenbildung und optionalem Bridge-Re-Filter |
+| `confidence_cap_wall_seconds` / `confidence_cap_cpu_seconds` | Zeit fuer `_apply_confidence_point_cap(...)` |
+| `symmetry_completion_wall_seconds` / `symmetry_completion_cpu_seconds` | Zeit fuer `_apply_symmetry_completion(...)` |
+| `fusion_post_wall_seconds` / `fusion_post_cpu_seconds` | Nachlauf ab erstem Post-Filter bis zur finalen Punktwolke vor den Save-/Skip-Gates |
+| `fusion_total_wall_seconds` / `fusion_total_cpu_seconds` | Summe aus `fusion_core` und `fusion_post` |
+
+`fusion_post` bleibt der aeussere Gesamt-Bucket ueber den kompletten Nachlauf. Er kann groesser sein als `post_filter + tail_bridge + confidence_cap + symmetry_completion`, weil Dimensionsmetriken, Candidate-Bildung und Save-/Skip-Gates bewusst nur im Outer-Bucket stecken.
 
 #### Fahrzeugdimensionen
 
@@ -302,11 +315,14 @@ Komponentenvergleich auf zwei Ebenen:
 
 - deskriptive Gruppierung nach Komponentenfamilien
 - gematchte Vergleiche bei gleicher Restkonfiguration
+- inklusive `ICP/Registration`, `Fusion Total`, `Post-Filter`, `Tail-Bridge`, `Conf-Cap` und `Symmetry` fuer direkte Laufzeitvergleiche
 
 Das ist die beste Stelle fuer Fragen wie:
 
 - Welcher Tracker ist am schnellsten?
 - Welches Registration-Backend kostet am meisten CPU?
+- Wie viel Zeit geht in ICP/Registration gegenueber der eigentlichen Fusion?
+- Welcher Teil von `fusion_post` dominiert: `post_filter`, `tail_bridge`, `confidence_cap` oder `symmetry_completion`?
 - Welche Presets haben den groessten Peak-Speicher?
 
 ## Praktische Auswertung

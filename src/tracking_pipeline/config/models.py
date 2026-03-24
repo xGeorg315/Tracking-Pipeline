@@ -103,9 +103,11 @@ class AggregationConfig:
     long_vehicle_length_threshold: float = 4.5
     length_coverage_bins: int = 10
     min_track_quality_for_save_long_vehicle: float = 0.0
+    enable_tail_bridge: bool = True
     tail_bridge_longitudinal_gap_max: float = 1.5
     tail_bridge_lateral_gap_max: float = 0.8
     tail_bridge_vertical_gap_max: float = 0.5
+    enable_post_filter_stat_outlier_removal: bool = True
     post_filter_stat_nb_neighbors: int = 12
     post_filter_stat_std_ratio: float = 2.3
     aggregate_voxel: float = 0.06

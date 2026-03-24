@@ -117,6 +117,60 @@ def test_load_config_reads_confidence_point_cap_settings(tmp_path: Path) -> None
     assert config.aggregation.confidence_point_cap_bins == 8
 
 
+def test_load_config_reads_post_filter_outlier_toggle(tmp_path: Path) -> None:
+    fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+
+    config_path = tmp_path / "config_post_filter_toggle.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "aggregation:",
+                "  enable_post_filter_stat_outlier_removal: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.input.paths == [str(fixture_dst.resolve())]
+    assert config.aggregation.enable_post_filter_stat_outlier_removal is False
+
+
+def test_load_config_reads_tail_bridge_toggle(tmp_path: Path) -> None:
+    fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+
+    config_path = tmp_path / "config_tail_bridge_toggle.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "aggregation:",
+                "  enable_tail_bridge: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.input.paths == [str(fixture_dst.resolve())]
+    assert config.aggregation.enable_tail_bridge is False
+
+
 def test_load_config_reads_registration_underfill_fallback_settings(tmp_path: Path) -> None:
     fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
 
@@ -303,6 +357,56 @@ def test_load_config_rejects_invalid_confidence_point_cap_settings(tmp_path: Pat
     )
 
     with pytest.raises(ConfigError, match="aggregation.confidence_point_cap_bins must be >= 1"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_non_boolean_post_filter_toggle(tmp_path: Path) -> None:
+    _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+
+    config_path = tmp_path / "config_invalid_post_filter_toggle.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "aggregation:",
+                "  enable_post_filter_stat_outlier_removal: nope",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="aggregation.enable_post_filter_stat_outlier_removal must be a boolean"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_non_boolean_tail_bridge_toggle(tmp_path: Path) -> None:
+    _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+
+    config_path = tmp_path / "config_invalid_tail_bridge_toggle.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "aggregation:",
+                "  enable_tail_bridge: nope",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="aggregation.enable_tail_bridge must be a boolean"):
         load_config(config_path)
 
 

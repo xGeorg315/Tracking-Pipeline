@@ -35,12 +35,45 @@ class _PairDebugRecord:
     tail_window_frame_count: int
     mean_lateral_offset: float
     mean_vertical_offset: float
+    motion_signal_type: str = ""
+    motion_window_frame_count: int = 0
+    motion_cosine: float = float("nan")
+    left_motion_speed: float = float("nan")
+    right_motion_speed: float = float("nan")
+    motion_speed_delta: float = float("nan")
+    left_center_speed: float = float("nan")
+    right_center_speed: float = float("nan")
 
 
 @dataclass(slots=True)
 class _PairEvaluation:
     metrics: _PairMetrics | None
     debug: _PairDebugRecord | None
+
+
+@dataclass(slots=True)
+class _MotionMetrics:
+    accepted: bool
+    signal_type: str
+    window_frame_count: int
+    cosine: float
+    left_speed: float
+    right_speed: float
+    speed_delta: float
+    left_center_speed: float
+    right_center_speed: float
+
+    def as_debug_kwargs(self) -> dict[str, float | int | str]:
+        return {
+            "motion_signal_type": str(self.signal_type),
+            "motion_window_frame_count": int(self.window_frame_count),
+            "motion_cosine": float(self.cosine),
+            "left_motion_speed": float(self.left_speed),
+            "right_motion_speed": float(self.right_speed),
+            "motion_speed_delta": float(self.speed_delta),
+            "left_center_speed": float(self.left_center_speed),
+            "right_center_speed": float(self.right_center_speed),
+        }
 
 
 class ArticulatedVehicleMergePostprocessor:
@@ -136,19 +169,6 @@ class ArticulatedVehicleMergePostprocessor:
                     mean_vertical_offset=mean_vertical_offset,
                 ),
             )
-        if not self._similar_motion(left_centers, right_centers):
-            return _PairEvaluation(
-                metrics=None,
-                debug=self._debug_record(
-                    left,
-                    right,
-                    overlap,
-                    False,
-                    "motion",
-                    mean_lateral_offset=mean_lateral_offset,
-                    mean_vertical_offset=mean_vertical_offset,
-                ),
-            )
 
         direction = self._movement_direction(left_centers, right_centers)
         if direction == 0.0:
@@ -162,6 +182,30 @@ class ArticulatedVehicleMergePostprocessor:
                     "direction",
                     mean_lateral_offset=mean_lateral_offset,
                     mean_vertical_offset=mean_vertical_offset,
+                ),
+            )
+
+        motion = self._similar_motion(
+            overlap,
+            left_centers,
+            right_centers,
+            left_by_frame,
+            right_by_frame,
+            direction,
+        )
+        motion_debug = motion.as_debug_kwargs()
+        if not motion.accepted:
+            return _PairEvaluation(
+                metrics=None,
+                debug=self._debug_record(
+                    left,
+                    right,
+                    overlap,
+                    False,
+                    "motion",
+                    mean_lateral_offset=mean_lateral_offset,
+                    mean_vertical_offset=mean_vertical_offset,
+                    **motion_debug,
                 ),
             )
 
@@ -180,6 +224,7 @@ class ArticulatedVehicleMergePostprocessor:
                     "ordering",
                     mean_lateral_offset=mean_lateral_offset,
                     mean_vertical_offset=mean_vertical_offset,
+                    **motion_debug,
                 ),
             )
 
@@ -196,6 +241,7 @@ class ArticulatedVehicleMergePostprocessor:
                     "ordering",
                     mean_lateral_offset=mean_lateral_offset,
                     mean_vertical_offset=mean_vertical_offset,
+                    **motion_debug,
                 ),
             )
 
@@ -220,6 +266,7 @@ class ArticulatedVehicleMergePostprocessor:
                         "missing_points",
                         mean_lateral_offset=mean_lateral_offset,
                         mean_vertical_offset=mean_vertical_offset,
+                        **motion_debug,
                     ),
                 )
             gaps.append(lead_rear - rear_front)
@@ -255,6 +302,7 @@ class ArticulatedVehicleMergePostprocessor:
                     tail_window_frame_count=tail_count,
                     mean_lateral_offset=mean_lateral_offset,
                     mean_vertical_offset=mean_vertical_offset,
+                    **motion_debug,
                 ),
             )
         if eval_gap_std > float(self.config.articulated_max_hitch_gap_std):
@@ -273,6 +321,7 @@ class ArticulatedVehicleMergePostprocessor:
                     tail_window_frame_count=tail_count,
                     mean_lateral_offset=mean_lateral_offset,
                     mean_vertical_offset=mean_vertical_offset,
+                    **motion_debug,
                 ),
             )
         if float(np.min(gaps_arr)) < -0.75:
@@ -291,6 +340,7 @@ class ArticulatedVehicleMergePostprocessor:
                     tail_window_frame_count=tail_count,
                     mean_lateral_offset=mean_lateral_offset,
                     mean_vertical_offset=mean_vertical_offset,
+                    **motion_debug,
                 ),
             )
 
@@ -311,6 +361,7 @@ class ArticulatedVehicleMergePostprocessor:
                     tail_window_frame_count=tail_count,
                     mean_lateral_offset=mean_lateral_offset,
                     mean_vertical_offset=mean_vertical_offset,
+                    **motion_debug,
                 ),
             )
 
@@ -336,28 +387,125 @@ class ArticulatedVehicleMergePostprocessor:
             tail_window_frame_count=tail_count,
             mean_lateral_offset=mean_lateral_offset,
             mean_vertical_offset=mean_vertical_offset,
+            **motion_debug,
         )
         return _PairEvaluation(metrics=metrics, debug=debug)
 
-    def _similar_motion(self, left_centers: np.ndarray, right_centers: np.ndarray) -> bool:
+    def _similar_motion(
+        self,
+        overlap: list[int],
+        left_centers: np.ndarray,
+        right_centers: np.ndarray,
+        left_by_frame,
+        right_by_frame,
+        direction: float,
+    ) -> _MotionMetrics:
         if len(left_centers) < 2 or len(right_centers) < 2:
-            return True
+            return _MotionMetrics(
+                accepted=True,
+                signal_type="insufficient_frames",
+                window_frame_count=min(len(left_centers), len(right_centers)),
+                cosine=float("nan"),
+                left_speed=float("nan"),
+                right_speed=float("nan"),
+                speed_delta=float("nan"),
+                left_center_speed=float("nan"),
+                right_center_speed=float("nan"),
+            )
         left_disp = left_centers[-1] - left_centers[0]
         right_disp = right_centers[-1] - right_centers[0]
         left_norm = float(np.linalg.norm(left_disp))
         right_norm = float(np.linalg.norm(right_disp))
+        left_center_speed = float(left_disp[self.axis_idx] / max(1, len(left_centers) - 1))
+        right_center_speed = float(right_disp[self.axis_idx] / max(1, len(right_centers) - 1))
         if left_norm <= 1e-6 and right_norm <= 1e-6:
-            return True
+            return _MotionMetrics(
+                accepted=True,
+                signal_type="rear_anchor",
+                window_frame_count=0,
+                cosine=1.0,
+                left_speed=0.0,
+                right_speed=0.0,
+                speed_delta=0.0,
+                left_center_speed=left_center_speed,
+                right_center_speed=right_center_speed,
+            )
         if left_norm <= 1e-6 or right_norm <= 1e-6:
-            return False
+            return _MotionMetrics(
+                accepted=False,
+                signal_type="rear_anchor",
+                window_frame_count=0,
+                cosine=float("nan"),
+                left_speed=float("nan"),
+                right_speed=float("nan"),
+                speed_delta=float("nan"),
+                left_center_speed=left_center_speed,
+                right_center_speed=right_center_speed,
+            )
         cosine = float(np.dot(left_disp, right_disp) / max(left_norm * right_norm, 1e-6))
         if cosine < 0.85:
-            return False
-        left_velocity = float(left_disp[self.axis_idx] / max(1, len(left_centers) - 1))
-        right_velocity = float(right_disp[self.axis_idx] / max(1, len(right_centers) - 1))
-        if abs(left_velocity - right_velocity) > float(self.config.articulated_max_speed_delta):
-            return False
-        return True
+            return _MotionMetrics(
+                accepted=False,
+                signal_type="rear_anchor",
+                window_frame_count=0,
+                cosine=cosine,
+                left_speed=float("nan"),
+                right_speed=float("nan"),
+                speed_delta=float("nan"),
+                left_center_speed=left_center_speed,
+                right_center_speed=right_center_speed,
+            )
+
+        tail_count = min(len(overlap), int(self.config.articulated_gap_eval_window_frames))
+        if tail_count < 2:
+            return _MotionMetrics(
+                accepted=True,
+                signal_type="rear_anchor",
+                window_frame_count=tail_count,
+                cosine=cosine,
+                left_speed=float("nan"),
+                right_speed=float("nan"),
+                speed_delta=float("nan"),
+                left_center_speed=left_center_speed,
+                right_center_speed=right_center_speed,
+            )
+
+        tail_frames = overlap[-tail_count:]
+        left_anchor_positions = []
+        right_anchor_positions = []
+        for frame_id in tail_frames:
+            left_rear, _ = self._signed_edges(left_by_frame[frame_id][1], direction)
+            right_rear, _ = self._signed_edges(right_by_frame[frame_id][1], direction)
+            if left_rear is None or right_rear is None:
+                center_speed_delta = abs(left_center_speed - right_center_speed)
+                return _MotionMetrics(
+                    accepted=center_speed_delta <= float(self.config.articulated_max_speed_delta),
+                    signal_type="center_fallback",
+                    window_frame_count=len(overlap),
+                    cosine=cosine,
+                    left_speed=left_center_speed,
+                    right_speed=right_center_speed,
+                    speed_delta=center_speed_delta,
+                    left_center_speed=left_center_speed,
+                    right_center_speed=right_center_speed,
+                )
+            left_anchor_positions.append(left_rear)
+            right_anchor_positions.append(right_rear)
+
+        left_speed = self._fit_line_slope(tail_frames, left_anchor_positions)
+        right_speed = self._fit_line_slope(tail_frames, right_anchor_positions)
+        speed_delta = abs(left_speed - right_speed)
+        return _MotionMetrics(
+            accepted=speed_delta <= float(self.config.articulated_max_speed_delta),
+            signal_type="rear_anchor",
+            window_frame_count=tail_count,
+            cosine=cosine,
+            left_speed=left_speed,
+            right_speed=right_speed,
+            speed_delta=speed_delta,
+            left_center_speed=left_center_speed,
+            right_center_speed=right_center_speed,
+        )
 
     def _movement_direction(self, left_centers: np.ndarray, right_centers: np.ndarray) -> float:
         pair_disp = float((left_centers[-1, self.axis_idx] - left_centers[0, self.axis_idx]) + (right_centers[-1, self.axis_idx] - right_centers[0, self.axis_idx]))
@@ -380,6 +528,18 @@ class ArticulatedVehicleMergePostprocessor:
         signed = values * direction
         return float(np.min(signed)), float(np.max(signed))
 
+    def _fit_line_slope(self, frame_ids: list[int], positions: list[float]) -> float:
+        if len(frame_ids) < 2 or len(positions) < 2:
+            return 0.0
+        x = np.asarray(frame_ids, dtype=np.float64)
+        y = np.asarray(positions, dtype=np.float64)
+        x_centered = x - float(np.mean(x))
+        denom = float(np.dot(x_centered, x_centered))
+        if denom <= 1e-9:
+            return 0.0
+        y_centered = y - float(np.mean(y))
+        return float(np.dot(x_centered, y_centered) / denom)
+
     def _debug_record(
         self,
         lead_track: Track,
@@ -395,6 +555,14 @@ class ArticulatedVehicleMergePostprocessor:
         tail_window_frame_count: int = 0,
         mean_lateral_offset: float = float("nan"),
         mean_vertical_offset: float = float("nan"),
+        motion_signal_type: str = "",
+        motion_window_frame_count: int = 0,
+        motion_cosine: float = float("nan"),
+        left_motion_speed: float = float("nan"),
+        right_motion_speed: float = float("nan"),
+        motion_speed_delta: float = float("nan"),
+        left_center_speed: float = float("nan"),
+        right_center_speed: float = float("nan"),
     ) -> _PairDebugRecord:
         return _PairDebugRecord(
             lead_track_id=int(lead_track.track_id),
@@ -410,6 +578,14 @@ class ArticulatedVehicleMergePostprocessor:
             tail_window_frame_count=int(tail_window_frame_count),
             mean_lateral_offset=float(mean_lateral_offset),
             mean_vertical_offset=float(mean_vertical_offset),
+            motion_signal_type=str(motion_signal_type),
+            motion_window_frame_count=int(motion_window_frame_count),
+            motion_cosine=float(motion_cosine),
+            left_motion_speed=float(left_motion_speed),
+            right_motion_speed=float(right_motion_speed),
+            motion_speed_delta=float(motion_speed_delta),
+            left_center_speed=float(left_center_speed),
+            right_center_speed=float(right_center_speed),
         )
 
     def _link_tracks(self, left: Track, right: Track, metrics: _PairMetrics) -> None:

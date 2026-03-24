@@ -98,7 +98,20 @@ class _FakeAccumulator:
             points=np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
             selected_frame_ids=[0],
             status="saved",
-            metrics={"registration_pairs": 1, "registration_accepted": 1, "registration_rejected": 0},
+            metrics={
+                "registration_pairs": 1,
+                "registration_accepted": 1,
+                "registration_rejected": 0,
+                "prepared_chunk_count": 1,
+                "registration_wall_seconds": 0.0,
+                "registration_cpu_seconds": 0.0,
+                "fusion_core_wall_seconds": 0.2,
+                "fusion_core_cpu_seconds": 0.1,
+                "fusion_post_wall_seconds": 0.3,
+                "fusion_post_cpu_seconds": 0.15,
+                "fusion_total_wall_seconds": 0.5,
+                "fusion_total_cpu_seconds": 0.25,
+            },
         )
 
 
@@ -402,6 +415,12 @@ def test_run_pipeline_orchestrates_dependencies(monkeypatch, tmp_path: Path) -> 
     assert len(fake_writer.tracker_debug_states) == 2
     assert isinstance(fake_writer.track_outcomes[1], TrackOutcomeDebug)
     assert fake_writer.track_outcomes[1].status == "saved"
+    assert summary.performance is not None
+    assert summary.performance.aggregation_components["registration"].wall_seconds == 0.0
+    assert summary.performance.aggregation_components["fusion_core"].wall_seconds == 0.2
+    assert summary.performance.aggregation_components["fusion_post"].wall_seconds == 0.3
+    assert summary.performance.aggregation_components["fusion_total"].wall_seconds == 0.5
+    assert summary.performance.aggregation_components["fusion_total"].call_count == 1
 
 
 def test_run_pipeline_exports_latest_object_list_observation(monkeypatch, tmp_path: Path) -> None:

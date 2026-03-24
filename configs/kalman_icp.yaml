@@ -1,7 +1,7 @@
 input:
   paths:
-    - ../data/medium_2 # 115 Vehicles
-    # - ../data/medium_energy # 159 Vehicles
+    # - ../data/medium_2 # 115 Vehicles
+    - ../data/medium_energy # 159 Vehicles
 tracking:
   algorithm: kalman_nn
   max_dist: 7.5
@@ -18,6 +18,8 @@ aggregation:
   frame_selection_method: keyframe_motion
   keyframe_keep: 8
   enable_registration_underfill_fallback: true
+  enable_tail_bridge: false
+  enable_post_filter_stat_outlier_removal: true
   registration_min_kept_chunks: 2
   registration_max_iter: 30
   registration_max_translation: 3.5
@@ -38,7 +40,7 @@ postprocessing:
   articulated_max_vertical_offset: 5
   articulated_max_hitch_gap: 1.75
   articulated_max_hitch_gap_std: 0.6
-  articulated_max_speed_delta: 0.55
-  articulated_min_combined_length: 5.
+  articulated_max_speed_delta: 0.30
+  articulated_min_combined_length: 5.0
 warumup_runs: 1
 measure_runs: 1

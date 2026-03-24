@@ -3,3 +3,5 @@ benchmarks/
 data/
 test_data/
 KISS-Matcher/
+PointNeXt/
+ckpt/

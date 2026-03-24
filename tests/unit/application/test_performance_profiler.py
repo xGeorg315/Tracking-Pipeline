@@ -46,6 +46,8 @@ def test_performance_profiler_snapshot_derives_totals(monkeypatch) -> None:
     assert snapshot.stages["cluster_frames"].call_count == 12
     assert snapshot.stages["accumulate_tracks"].wall_seconds == 1.4
     assert "build_components" in snapshot.stages
+    assert snapshot.aggregation_components["registration"].wall_seconds == 0.0
+    assert snapshot.aggregation_components["fusion_total"].call_count == 0
 
 
 def test_peak_rss_mb_normalizes_macos_units(monkeypatch) -> None:

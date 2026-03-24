@@ -13,10 +13,10 @@ from tracking_pipeline.application.factories import (
     build_tracker,
 )
 from tracking_pipeline.application.gt_matching import apply_gt_matches_to_results, match_saved_aggregates_to_gt
-from tracking_pipeline.application.performance import PerformanceProfiler
+from tracking_pipeline.application.performance import AGGREGATION_COMPONENT_NAMES, PerformanceProfiler, build_component_snapshot
 from tracking_pipeline.application.track_outcomes import build_track_outcomes
 from tracking_pipeline.config.models import PipelineConfig
-from tracking_pipeline.domain.models import AggregateResult, ObjectLabelData, RunSummary
+from tracking_pipeline.domain.models import AggregateResult, ObjectLabelData, RunPerformance, RunSummary
 
 
 def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
@@ -66,6 +66,9 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
     registration_attempts = 0
     registration_accepted = 0
     registration_rejected = 0
+    aggregation_component_wall = {component_name: 0.0 for component_name in AGGREGATION_COMPONENT_NAMES}
+    aggregation_component_cpu = {component_name: 0.0 for component_name in AGGREGATION_COMPONENT_NAMES}
+    aggregation_component_calls = {component_name: 0 for component_name in AGGREGATION_COMPONENT_NAMES}
 
     for track in tracks.values():
         with profiler.stage("accumulate_tracks"):
@@ -75,6 +78,14 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
         registration_attempts += int(metrics.get("registration_pairs", 0))
         registration_accepted += int(metrics.get("registration_accepted", 0))
         registration_rejected += int(metrics.get("registration_rejected", 0))
+        _accumulate_aggregation_component_metrics(
+            aggregation_component_wall,
+            aggregation_component_cpu,
+            aggregation_component_calls,
+            result,
+            config.aggregation.algorithm,
+            config.aggregation.enable_tail_bridge,
+        )
     if hasattr(accumulator, "merge_long_vehicle_aggregates"):
         with profiler.stage("accumulate_tracks"):
             aggregate_results = accumulator.merge_long_vehicle_aggregates(tracks, aggregate_results, lane_box)
@@ -125,17 +136,32 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
         gt_match_assignment=str(gt_match_summary["gt_match_assignment"]),
         gt_match_mean_timestamp_delta_ns=float(gt_match_summary["gt_match_mean_timestamp_delta_ns"]),
         gt_match_max_timestamp_delta_ns=int(gt_match_summary["gt_match_max_timestamp_delta_ns"]),
-        performance=profiler.snapshot(),
+        performance=_snapshot_with_aggregation_components(
+            profiler,
+            aggregation_component_wall,
+            aggregation_component_cpu,
+            aggregation_component_calls,
+        ),
     )
     with profiler.stage("write_tracks"):
         writer.write_tracks(run_dir, tracks, aggregate_results)
         writer.write_tracker_debug(run_dir, tracker_states)
         writer.write_track_outcomes(run_dir, track_outcomes)
-    summary.performance = profiler.snapshot()
+    summary.performance = _snapshot_with_aggregation_components(
+        profiler,
+        aggregation_component_wall,
+        aggregation_component_cpu,
+        aggregation_component_calls,
+    )
     with profiler.stage("write_summary"):
         writer.write_summary(run_dir, summary)
     # Persist the final profile snapshot after measuring the summary write itself.
-    summary.performance = profiler.snapshot()
+    summary.performance = _snapshot_with_aggregation_components(
+        profiler,
+        aggregation_component_wall,
+        aggregation_component_cpu,
+        aggregation_component_calls,
+    )
     writer.write_summary(run_dir, summary)
     return summary
 
@@ -146,3 +172,44 @@ def _is_newer_object_label(candidate: ObjectLabelData, current: ObjectLabelData 
     if int(candidate.timestamp_ns) != int(current.timestamp_ns):
         return int(candidate.timestamp_ns) > int(current.timestamp_ns)
     return int(candidate.frame_index) > int(current.frame_index)
+
+
+def _accumulate_aggregation_component_metrics(
+    wall_totals: dict[str, float],
+    cpu_totals: dict[str, float],
+    call_totals: dict[str, int],
+    result: AggregateResult,
+    accumulator_algorithm: str,
+    enable_tail_bridge: bool,
+) -> None:
+    metrics = result.metrics
+    for component in AGGREGATION_COMPONENT_NAMES:
+        wall_totals[component] += float(metrics.get(f"{component}_wall_seconds", 0.0) or 0.0)
+        cpu_totals[component] += float(metrics.get(f"{component}_cpu_seconds", 0.0) or 0.0)
+
+    prepared_chunk_count = int(metrics.get("prepared_chunk_count", 0) or 0)
+    if prepared_chunk_count <= 0:
+        return
+    if accumulator_algorithm == "registration_voxel_fusion":
+        call_totals["registration"] += 1
+    call_totals["fusion_core"] += 1
+    call_totals["fusion_total"] += 1
+    if result.status != "empty_fused":
+        call_totals["post_filter"] += 1
+        if enable_tail_bridge:
+            call_totals["tail_bridge"] += 1
+        call_totals["fusion_post"] += 1
+    if result.status != "empty_filtered" and result.status != "empty_fused":
+        call_totals["confidence_cap"] += 1
+        call_totals["symmetry_completion"] += 1
+
+
+def _snapshot_with_aggregation_components(
+    profiler: PerformanceProfiler,
+    wall_totals: dict[str, float],
+    cpu_totals: dict[str, float],
+    call_totals: dict[str, int],
+) -> RunPerformance:
+    snapshot = profiler.snapshot()
+    snapshot.aggregation_components = build_component_snapshot(wall_totals, cpu_totals, call_totals)
+    return snapshot

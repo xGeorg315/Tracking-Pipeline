@@ -10,13 +10,22 @@ from typing import Any
 
 import yaml
 
-from tracking_pipeline.application.performance import STAGE_NAMES
+from tracking_pipeline.application.performance import AGGREGATION_COMPONENT_NAMES, STAGE_NAMES
 from tracking_pipeline.application.services import build_benchmark_name, resolve_benchmark_root
 from tracking_pipeline.config.loader import load_config, resolve_input_paths
 from tracking_pipeline.config.models import BenchmarkConfig, PipelineConfig
 from tracking_pipeline.infrastructure.io.manifest_writer import ManifestWriter
 
 
+_AGGREGATION_PERFORMANCE_FIELDS = tuple(
+    field_name
+    for component_name in AGGREGATION_COMPONENT_NAMES
+    for field_name in (
+        f"aggregation_{component_name}_wall_seconds",
+        f"aggregation_{component_name}_cpu_seconds",
+        f"aggregation_{component_name}_wall_ms_per_track",
+    )
+)
 PERFORMANCE_TOTAL_FIELDS = (
     "total_wall_seconds",
     "total_cpu_seconds",
@@ -27,6 +36,7 @@ PERFORMANCE_TOTAL_FIELDS = (
     "wall_ms_per_frame",
     "cpu_ms_per_frame",
     "accumulate_wall_ms_per_track",
+    *_AGGREGATION_PERFORMANCE_FIELDS,
 )
 COMPONENT_FIELDS = (
     "tracker_algorithm",
@@ -182,7 +192,9 @@ class BenchmarkRunner:
         registration_accept_rate = float(registration_accepted) / float(registration_attempts) if registration_attempts else 0.0
         performance = dict(summary_payload.get("performance") or {})
         stage_data = dict(performance.get("stages") or {})
+        aggregation_component_data = dict(performance.get("aggregation_components") or {})
         stage_metrics = self._stage_metrics_from_summary(stage_data)
+        aggregation_metrics = self._aggregation_component_metrics_from_summary(aggregation_component_data, finished_track_count)
         total_wall_seconds = float(performance.get("total_wall_seconds", 0.0) or 0.0)
         total_cpu_seconds = float(performance.get("total_cpu_seconds", 0.0) or 0.0)
         track_count_for_accumulate = max(1, finished_track_count)
@@ -226,6 +238,7 @@ class BenchmarkRunner:
                 (float(stage_metrics["stage_accumulate_tracks_wall_seconds"]) * 1000.0) / float(track_count_for_accumulate),
                 6,
             ),
+            **aggregation_metrics,
             **stage_metrics,
         }
 
@@ -236,6 +249,23 @@ class BenchmarkRunner:
             metrics[f"stage_{stage_name}_wall_seconds"] = round(float(payload.get("wall_seconds", 0.0) or 0.0), 6)
             metrics[f"stage_{stage_name}_cpu_seconds"] = round(float(payload.get("cpu_seconds", 0.0) or 0.0), 6)
             metrics[f"stage_{stage_name}_call_count"] = int(payload.get("call_count", 0) or 0)
+        return metrics
+
+    def _aggregation_component_metrics_from_summary(
+        self,
+        component_data: dict[str, Any],
+        finished_track_count: int,
+    ) -> dict[str, Any]:
+        metrics: dict[str, Any] = {}
+        track_count = max(1, int(finished_track_count))
+        for component_name in AGGREGATION_COMPONENT_NAMES:
+            payload = component_data.get(component_name) or {}
+            wall_seconds = float(payload.get("wall_seconds", 0.0) or 0.0)
+            cpu_seconds = float(payload.get("cpu_seconds", 0.0) or 0.0)
+            metrics[f"aggregation_{component_name}_wall_seconds"] = round(wall_seconds, 6)
+            metrics[f"aggregation_{component_name}_cpu_seconds"] = round(cpu_seconds, 6)
+            metrics[f"aggregation_{component_name}_call_count"] = int(payload.get("call_count", 0) or 0)
+            metrics[f"aggregation_{component_name}_wall_ms_per_track"] = round((wall_seconds * 1000.0) / float(track_count), 6)
         return metrics
 
     def _aggregate_rows(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -287,6 +317,9 @@ class BenchmarkRunner:
                 aggregated[f"{field}_min"] = round(min(values), 6)
                 aggregated[f"{field}_max"] = round(max(values), 6)
             call_field = f"stage_{stage_name}_call_count"
+            aggregated[call_field] = int(representative.get(call_field, 0))
+        for component_name in AGGREGATION_COMPONENT_NAMES:
+            call_field = f"aggregation_{component_name}_call_count"
             aggregated[call_field] = int(representative.get(call_field, 0))
         aggregated["runtime_seconds"] = aggregated["total_wall_seconds_median"]
         return aggregated
@@ -371,6 +404,8 @@ class BenchmarkRunner:
                 for stat in ("median", "min", "max"):
                     fieldnames.append(f"stage_{stage_name}_{suffix}_{stat}")
             fieldnames.append(f"stage_{stage_name}_call_count")
+        for component_name in AGGREGATION_COMPONENT_NAMES:
+            fieldnames.append(f"aggregation_{component_name}_call_count")
         return fieldnames
 
     def _render_markdown(self, rows: list[dict[str, Any]]) -> str:
@@ -426,13 +461,29 @@ class BenchmarkRunner:
             lines.append(f"## {title}")
             lines.append("")
             lines.append(
-                "| Sequence | Preset | Tracker | Clusterer | Registration | Total Wall Median (s) | Compute Wall Median (s) | CPU Median (s) | Peak RSS Max (MB) | Wall / Frame (ms) |"
+                "| Sequence | Preset | Tracker | Clusterer | Registration | Total Wall Median (s) | ICP/Registration Median (s) | Fusion Total Median (s) | Fusion Post Median (s) | Post-Filter Median (s) | Tail-Bridge Median (s) | Conf-Cap Median (s) | Symmetry Median (s) | Compute Wall Median (s) | CPU Median (s) | Peak RSS Max (MB) | Wall / Frame (ms) |"
             )
-            lines.append("| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |")
+            lines.append("| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
             for row in ordered:
                 lines.append(
-                    "| {sequence_name} | {preset_name} | {tracker_algorithm} | {clusterer_algorithm} | {registration_backend} | {total_wall_seconds_median:.3f} | {compute_wall_seconds_median:.3f} | {total_cpu_seconds_median:.3f} | {peak_rss_mb_max:.3f} | {wall_ms_per_frame_median:.3f} |".format(
-                        **row
+                    "| {sequence_name} | {preset_name} | {tracker_algorithm} | {clusterer_algorithm} | {registration_backend} | {total_wall_seconds_median:.3f} | {registration_wall_seconds_median:.3f} | {fusion_total_wall_seconds_median:.3f} | {fusion_post_wall_seconds_median:.3f} | {post_filter_wall_seconds_median:.3f} | {tail_bridge_wall_seconds_median:.3f} | {confidence_cap_wall_seconds_median:.3f} | {symmetry_completion_wall_seconds_median:.3f} | {compute_wall_seconds_median:.3f} | {total_cpu_seconds_median:.3f} | {peak_rss_mb_max:.3f} | {wall_ms_per_frame_median:.3f} |".format(
+                        sequence_name=str(row.get("sequence_name", "")),
+                        preset_name=str(row.get("preset_name", "")),
+                        tracker_algorithm=str(row.get("tracker_algorithm", "")),
+                        clusterer_algorithm=str(row.get("clusterer_algorithm", "")),
+                        registration_backend=str(row.get("registration_backend", "")),
+                        total_wall_seconds_median=self._float_or_zero(row.get("total_wall_seconds_median")),
+                        registration_wall_seconds_median=self._float_or_zero(row.get("aggregation_registration_wall_seconds_median")),
+                        fusion_total_wall_seconds_median=self._float_or_zero(row.get("aggregation_fusion_total_wall_seconds_median")),
+                        fusion_post_wall_seconds_median=self._float_or_zero(row.get("aggregation_fusion_post_wall_seconds_median")),
+                        post_filter_wall_seconds_median=self._float_or_zero(row.get("aggregation_post_filter_wall_seconds_median")),
+                        tail_bridge_wall_seconds_median=self._float_or_zero(row.get("aggregation_tail_bridge_wall_seconds_median")),
+                        confidence_cap_wall_seconds_median=self._float_or_zero(row.get("aggregation_confidence_cap_wall_seconds_median")),
+                        symmetry_completion_wall_seconds_median=self._float_or_zero(row.get("aggregation_symmetry_completion_wall_seconds_median")),
+                        compute_wall_seconds_median=self._float_or_zero(row.get("compute_wall_seconds_median")),
+                        total_cpu_seconds_median=self._float_or_zero(row.get("total_cpu_seconds_median")),
+                        peak_rss_mb_max=self._float_or_zero(row.get("peak_rss_mb_max")),
+                        wall_ms_per_frame_median=self._float_or_zero(row.get("wall_ms_per_frame_median")),
                     )
                 )
             lines.append("")
@@ -445,12 +496,26 @@ class BenchmarkRunner:
             lines.append("")
             lines.append("### Deskriptive Gruppierung")
             lines.append("")
-            lines.append("| Value | Cases | Total Wall Median (s) | Compute Wall Median (s) | CPU Median (s) | Peak RSS Max (MB) |")
-            lines.append("| --- | ---: | ---: | ---: | ---: | ---: |")
+            lines.append(
+                "| Value | Cases | Total Wall Median (s) | ICP/Registration Median (s) | Fusion Total Median (s) | Fusion Post Median (s) | Post-Filter Median (s) | Tail-Bridge Median (s) | Conf-Cap Median (s) | Symmetry Median (s) | Compute Wall Median (s) | CPU Median (s) | Peak RSS Max (MB) |"
+            )
+            lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
             for group_row in self._summarize_component_rows(rows, component):
                 lines.append(
-                    "| {value} | {cases} | {total_wall_seconds_median:.3f} | {compute_wall_seconds_median:.3f} | {total_cpu_seconds_median:.3f} | {peak_rss_mb_max:.3f} |".format(
-                        **group_row
+                    "| {value} | {cases} | {total_wall_seconds_median:.3f} | {registration_wall_seconds_median:.3f} | {fusion_total_wall_seconds_median:.3f} | {fusion_post_wall_seconds_median:.3f} | {post_filter_wall_seconds_median:.3f} | {tail_bridge_wall_seconds_median:.3f} | {confidence_cap_wall_seconds_median:.3f} | {symmetry_completion_wall_seconds_median:.3f} | {compute_wall_seconds_median:.3f} | {total_cpu_seconds_median:.3f} | {peak_rss_mb_max:.3f} |".format(
+                        value=str(group_row.get("value", "")),
+                        cases=int(group_row.get("cases", 0)),
+                        total_wall_seconds_median=self._float_or_zero(group_row.get("total_wall_seconds_median")),
+                        registration_wall_seconds_median=self._float_or_zero(group_row.get("aggregation_registration_wall_seconds_median")),
+                        fusion_total_wall_seconds_median=self._float_or_zero(group_row.get("aggregation_fusion_total_wall_seconds_median")),
+                        fusion_post_wall_seconds_median=self._float_or_zero(group_row.get("aggregation_fusion_post_wall_seconds_median")),
+                        post_filter_wall_seconds_median=self._float_or_zero(group_row.get("aggregation_post_filter_wall_seconds_median")),
+                        tail_bridge_wall_seconds_median=self._float_or_zero(group_row.get("aggregation_tail_bridge_wall_seconds_median")),
+                        confidence_cap_wall_seconds_median=self._float_or_zero(group_row.get("aggregation_confidence_cap_wall_seconds_median")),
+                        symmetry_completion_wall_seconds_median=self._float_or_zero(group_row.get("aggregation_symmetry_completion_wall_seconds_median")),
+                        compute_wall_seconds_median=self._float_or_zero(group_row.get("compute_wall_seconds_median")),
+                        total_cpu_seconds_median=self._float_or_zero(group_row.get("total_cpu_seconds_median")),
+                        peak_rss_mb_max=self._float_or_zero(group_row.get("peak_rss_mb_max")),
                     )
                 )
             lines.append("")
@@ -464,17 +529,26 @@ class BenchmarkRunner:
             for context, group_rows in matched_groups:
                 lines.append(f"#### {context}")
                 lines.append("")
-                lines.append("| Preset | Value | Total Wall Median (s) | Compute Wall Median (s) | CPU Median (s) | Peak RSS Max (MB) |")
-                lines.append("| --- | --- | ---: | ---: | ---: | ---: |")
+                lines.append(
+                    "| Preset | Value | Total Wall Median (s) | ICP/Registration Median (s) | Fusion Total Median (s) | Fusion Post Median (s) | Post-Filter Median (s) | Tail-Bridge Median (s) | Conf-Cap Median (s) | Symmetry Median (s) | Compute Wall Median (s) | CPU Median (s) | Peak RSS Max (MB) |"
+                )
+                lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
                 for row in group_rows:
                     lines.append(
-                        "| {preset_name} | {value} | {total_wall_seconds_median:.3f} | {compute_wall_seconds_median:.3f} | {total_cpu_seconds_median:.3f} | {peak_rss_mb_max:.3f} |".format(
-                            preset_name=row["preset_name"],
-                            value=row[component],
-                            total_wall_seconds_median=row["total_wall_seconds_median"],
-                            compute_wall_seconds_median=row["compute_wall_seconds_median"],
-                            total_cpu_seconds_median=row["total_cpu_seconds_median"],
-                            peak_rss_mb_max=row["peak_rss_mb_max"],
+                        "| {preset_name} | {value} | {total_wall_seconds_median:.3f} | {registration_wall_seconds_median:.3f} | {fusion_total_wall_seconds_median:.3f} | {fusion_post_wall_seconds_median:.3f} | {post_filter_wall_seconds_median:.3f} | {tail_bridge_wall_seconds_median:.3f} | {confidence_cap_wall_seconds_median:.3f} | {symmetry_completion_wall_seconds_median:.3f} | {compute_wall_seconds_median:.3f} | {total_cpu_seconds_median:.3f} | {peak_rss_mb_max:.3f} |".format(
+                            preset_name=str(row.get("preset_name", "")),
+                            value=str(row.get(component, "")),
+                            total_wall_seconds_median=self._float_or_zero(row.get("total_wall_seconds_median")),
+                            registration_wall_seconds_median=self._float_or_zero(row.get("aggregation_registration_wall_seconds_median")),
+                            fusion_total_wall_seconds_median=self._float_or_zero(row.get("aggregation_fusion_total_wall_seconds_median")),
+                            fusion_post_wall_seconds_median=self._float_or_zero(row.get("aggregation_fusion_post_wall_seconds_median")),
+                            post_filter_wall_seconds_median=self._float_or_zero(row.get("aggregation_post_filter_wall_seconds_median")),
+                            tail_bridge_wall_seconds_median=self._float_or_zero(row.get("aggregation_tail_bridge_wall_seconds_median")),
+                            confidence_cap_wall_seconds_median=self._float_or_zero(row.get("aggregation_confidence_cap_wall_seconds_median")),
+                            symmetry_completion_wall_seconds_median=self._float_or_zero(row.get("aggregation_symmetry_completion_wall_seconds_median")),
+                            compute_wall_seconds_median=self._float_or_zero(row.get("compute_wall_seconds_median")),
+                            total_cpu_seconds_median=self._float_or_zero(row.get("total_cpu_seconds_median")),
+                            peak_rss_mb_max=self._float_or_zero(row.get("peak_rss_mb_max")),
                         )
                     )
                 lines.append("")
@@ -487,22 +561,26 @@ class BenchmarkRunner:
             grouped.setdefault(key, []).append(row)
         summary_rows = []
         for value, group_rows in sorted(grouped.items()):
-            summary_rows.append(
-                {
-                    "value": value,
-                    "cases": len(group_rows),
-                    "total_wall_seconds_median": self._median(
-                        [self._float_or_zero(row.get("total_wall_seconds_median")) for row in group_rows]
-                    ),
-                    "compute_wall_seconds_median": self._median(
-                        [self._float_or_zero(row.get("compute_wall_seconds_median")) for row in group_rows]
-                    ),
-                    "total_cpu_seconds_median": self._median(
-                        [self._float_or_zero(row.get("total_cpu_seconds_median")) for row in group_rows]
-                    ),
-                    "peak_rss_mb_max": max(self._float_or_zero(row.get("peak_rss_mb_max")) for row in group_rows),
-                }
-            )
+            summary_row = {
+                "value": value,
+                "cases": len(group_rows),
+                "total_wall_seconds_median": self._median(
+                    [self._float_or_zero(row.get("total_wall_seconds_median")) for row in group_rows]
+                ),
+                "compute_wall_seconds_median": self._median(
+                    [self._float_or_zero(row.get("compute_wall_seconds_median")) for row in group_rows]
+                ),
+                "total_cpu_seconds_median": self._median(
+                    [self._float_or_zero(row.get("total_cpu_seconds_median")) for row in group_rows]
+                ),
+                "peak_rss_mb_max": max(self._float_or_zero(row.get("peak_rss_mb_max")) for row in group_rows),
+            }
+            for component_name in AGGREGATION_COMPONENT_NAMES:
+                field_name = f"aggregation_{component_name}_wall_seconds_median"
+                summary_row[field_name] = self._median(
+                    [self._float_or_zero(row.get(field_name)) for row in group_rows]
+                )
+            summary_rows.append(summary_row)
         return sorted(summary_rows, key=lambda row: row["total_wall_seconds_median"])
 
     def _matched_component_groups(self, rows: list[dict[str, Any]], component: str) -> list[tuple[str, list[dict[str, Any]]]]:

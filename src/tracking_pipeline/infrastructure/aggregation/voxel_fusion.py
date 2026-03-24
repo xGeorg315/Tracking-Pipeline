@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+import time
+from collections import defaultdict
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 import numpy as np
 import open3d as o3d
 
 from tracking_pipeline.config.models import AggregationConfig, OutputConfig, TrackingConfig
-from tracking_pipeline.domain.models import AggregateResult, Track
+from tracking_pipeline.domain.models import AggregateResult, StagePerformance, Track
 from tracking_pipeline.domain.rules import (
     axis_to_index,
     compute_extent,
@@ -20,6 +23,57 @@ from tracking_pipeline.domain.rules import (
 )
 from tracking_pipeline.domain.value_objects import LaneBox
 from tracking_pipeline.shared.geometry import ensure_aligned_optional
+
+
+_AGGREGATION_TIMING_COMPONENTS = (
+    "registration",
+    "fusion_core",
+    "post_filter",
+    "tail_bridge",
+    "confidence_cap",
+    "symmetry_completion",
+    "fusion_post",
+    "fusion_total",
+)
+_AGGREGATION_TIMING_FIELD_NAMES = tuple(
+    f"{component_name}_{metric_name}_seconds"
+    for component_name in _AGGREGATION_TIMING_COMPONENTS
+    for metric_name in ("wall", "cpu")
+)
+
+
+class _AggregationComponentProfiler:
+    def __init__(self) -> None:
+        self._wall: dict[str, float] = defaultdict(float)
+        self._cpu: dict[str, float] = defaultdict(float)
+        self._calls: dict[str, int] = defaultdict(int)
+
+    @contextmanager
+    def stage(self, name: str) -> Iterator[None]:
+        started_wall = time.perf_counter()
+        started_cpu = time.process_time()
+        try:
+            yield
+        finally:
+            self._wall[name] += max(0.0, time.perf_counter() - started_wall)
+            self._cpu[name] += max(0.0, time.process_time() - started_cpu)
+            self._calls[name] += 1
+
+    def snapshot(self) -> dict[str, StagePerformance]:
+        wall = dict(self._wall)
+        cpu = dict(self._cpu)
+        calls = dict(self._calls)
+        wall["fusion_total"] = float(wall.get("fusion_core", 0.0)) + float(wall.get("fusion_post", 0.0))
+        cpu["fusion_total"] = float(cpu.get("fusion_core", 0.0)) + float(cpu.get("fusion_post", 0.0))
+        calls["fusion_total"] = max(int(calls.get("fusion_core", 0) or 0), int(calls.get("fusion_post", 0) or 0))
+        return {
+            name: StagePerformance(
+                wall_seconds=float(wall.get(name, 0.0) or 0.0),
+                cpu_seconds=float(cpu.get(name, 0.0) or 0.0),
+                call_count=int(calls.get(name, 0) or 0),
+            )
+            for name in _AGGREGATION_TIMING_COMPONENTS
+        }
 
 
 class VoxelFusionAccumulator:
@@ -45,6 +99,7 @@ class VoxelFusionAccumulator:
         ):
             return self._result(track, lane_box, np.zeros((0, 3), dtype=np.float32), [], "skipped_track_exit", self._base_metrics(track))
 
+        component_profiler = _AggregationComponentProfiler()
         long_vehicle_mode_applied = self._track_is_long_vehicle(track)
         frame_selection_method = self._effective_frame_selection_method(track, long_vehicle_mode_applied)
         all_world_chunks = list(track.world_points)
@@ -177,7 +232,11 @@ class VoxelFusionAccumulator:
                 prepared_chunk_count=0,
             )
 
-        accumulation_input, registration_metrics = self._prepare_for_fusion(prepared_chunks)
+        if self._should_profile_registration():
+            with component_profiler.stage("registration"):
+                accumulation_input, registration_metrics = self._prepare_for_fusion(prepared_chunks)
+        else:
+            accumulation_input, registration_metrics = self._prepare_for_fusion(prepared_chunks)
         pre_registration_centers = [np.asarray(center, dtype=np.float32).copy() for center in selected_centers]
         pre_registration_frame_ids = [int(frame_id) for frame_id in selected_frame_ids]
         pre_registration_intensity = [None if values is None else np.asarray(values, dtype=np.float32).copy() for values in prepared_intensity]
@@ -217,15 +276,22 @@ class VoxelFusionAccumulator:
         )
         chunk_weights = self._chunk_weights(track, accumulation_input, registration_metrics, long_vehicle_mode_applied)
         confidence_chunk_weights = self._confidence_chunk_weights(accumulation_input, chunk_weights, registration_metrics)
-        fused_xyz, fused_intensity, fused_confidence, raw_points_total, fusion_voxels_total, fusion_voxels_kept = self._fuse_chunks(
-            accumulation_input,
-            prepared_intensity,
-            chunk_weights,
-            confidence_chunk_weights,
-            min_observations=self._required_observations(len(accumulation_input)),
-        )
+        with component_profiler.stage("fusion_core"):
+            fused_xyz, fused_intensity, fused_confidence, raw_points_total, fusion_voxels_total, fusion_voxels_kept = self._fuse_chunks(
+                accumulation_input,
+                prepared_intensity,
+                chunk_weights,
+                confidence_chunk_weights,
+                min_observations=self._required_observations(len(accumulation_input)),
+            )
         if len(fused_xyz) == 0:
-            metrics = {**self._base_metrics(track), **selection_info, **motion_deskew_metrics, **registration_metrics}
+            metrics = {
+                **self._base_metrics(track),
+                **selection_info,
+                **motion_deskew_metrics,
+                **registration_metrics,
+                **self._aggregation_timing_metrics(component_profiler.snapshot()),
+            }
             return self._result(
                 track,
                 lane_box,
@@ -240,139 +306,129 @@ class VoxelFusionAccumulator:
                 candidate_status="missing",
             )
 
-        filtered_xyz, filtered_intensity, filtered_confidence, prefilter_points, stat_filtered_points, final_points = self._post_filter(
-            fused_xyz,
-            fused_intensity,
-            fused_confidence,
-        )
-        filtered_xyz, filtered_intensity, filtered_confidence, component_count_post_fusion, tail_bridge_count, longitudinal_extent = self._apply_tail_bridge(
-            filtered_xyz,
-            filtered_intensity,
-            filtered_confidence,
-            long_vehicle_mode_applied,
-        )
-        final_points = len(filtered_xyz)
-        symmetry_metrics = self._symmetry_completion_metrics(filtered_xyz, selected_centers)
-        dimension_metrics = self._vehicle_dimension_metrics(filtered_xyz)
-        metrics: dict[str, Any] = {
-            **self._base_metrics(track),
-            **selection_info,
-            **motion_deskew_metrics,
-            **registration_metrics,
-            "alignment_method": registration_metrics.get("alignment_method", "none"),
-            "frame_selection_method": selection_info.get("strategy", self.config.frame_selection_method),
-            "fusion_method": self.fusion_method,
-            "chunk_weights": chunk_weights,
-            "raw_point_count": raw_points_total,
-            "fusion_voxels_total": fusion_voxels_total,
-            "fusion_voxels_kept": fusion_voxels_kept,
-            "point_count_after_fusion": prefilter_points,
-            "point_count_after_stat_filter": stat_filtered_points,
-            "point_count_after_downsample": final_points,
-            "longitudinal_extent": longitudinal_extent,
-            "component_count_post_fusion": component_count_post_fusion,
-            "tail_bridge_count": tail_bridge_count,
-            "long_vehicle_mode_applied": bool(long_vehicle_mode_applied),
-            "min_saved_aggregate_points": int(self.config.min_saved_aggregate_points),
-            "mode": "world" if self.output_config.save_world else "local",
-            **dimension_metrics,
-            **symmetry_metrics,
-        }
-        if final_points == 0:
-            return self._result(
-                track,
-                lane_box,
-                np.zeros((0, 3), dtype=np.float32),
-                selected_frame_ids,
-                "empty_filtered",
-                metrics,
-                prepared_chunk_count=len(accumulation_input),
-                point_count_after_downsample=0,
-                point_count_before_confidence_cap=0,
-                point_count_after_confidence_cap=0,
-                candidate_points_world=None,
-                candidate_intensity_world=None,
-                candidate_anchor_center_world=candidate_anchor_center_world,
-                candidate_status="missing",
-            )
-        point_count_before_confidence_cap = int(len(filtered_xyz))
-        capped_xyz, capped_intensity, capped_confidence, confidence_cap_applied = self._apply_confidence_point_cap(
-            filtered_xyz,
-            filtered_intensity,
-            filtered_confidence,
-        )
-        completed_xyz, completed_intensity, _, symmetry_metrics = self._apply_symmetry_completion(
-            capped_xyz,
-            capped_intensity,
-            capped_confidence,
-            selected_centers,
-            component_count_post_fusion,
-        )
-        metrics.update(symmetry_metrics)
-        metrics.update(self._vehicle_dimension_metrics(completed_xyz))
-        candidate_points_world, candidate_intensity_world = self._candidate_world_outputs(
-            completed_xyz,
-            completed_intensity,
-            candidate_anchor_center_world,
-        )
-        metrics["point_count_after_downsample"] = int(len(completed_xyz))
-        if final_points < int(self.config.min_saved_aggregate_points):
-            return self._result(
-                track,
-                lane_box,
-                np.zeros((0, 3), dtype=np.float32),
-                selected_frame_ids,
-                "skipped_min_saved_points",
-                metrics,
-                prepared_chunk_count=len(accumulation_input),
-                point_count_after_downsample=final_points,
-                point_count_before_confidence_cap=point_count_before_confidence_cap,
-                point_count_after_confidence_cap=len(capped_xyz),
-                confidence_point_cap_applied=confidence_cap_applied,
-                candidate_points_world=candidate_points_world,
-                candidate_intensity_world=candidate_intensity_world,
-                candidate_anchor_center_world=candidate_anchor_center_world,
-                candidate_status="available",
-            )
-        quality_threshold = self._quality_threshold(long_vehicle_mode_applied)
-        if float(track.quality_score or 0.0) < quality_threshold:
-            metrics["quality_threshold"] = quality_threshold
-            return self._result(
-                track,
-                lane_box,
-                np.zeros((0, 3), dtype=np.float32),
-                selected_frame_ids,
-                "skipped_quality_threshold",
-                metrics,
-                prepared_chunk_count=len(accumulation_input),
-                point_count_after_downsample=final_points,
-                quality_threshold=quality_threshold,
-                point_count_before_confidence_cap=point_count_before_confidence_cap,
-                point_count_after_confidence_cap=len(capped_xyz),
-                confidence_point_cap_applied=confidence_cap_applied,
-                candidate_points_world=candidate_points_world,
-                candidate_intensity_world=candidate_intensity_world,
-                candidate_anchor_center_world=candidate_anchor_center_world,
-                candidate_status="available",
-            )
+        with component_profiler.stage("fusion_post"):
+            with component_profiler.stage("post_filter"):
+                filtered_xyz, filtered_intensity, filtered_confidence, prefilter_points, stat_filtered_points, final_points = self._post_filter(
+                    fused_xyz,
+                    fused_intensity,
+                    fused_confidence,
+                )
+            if self.config.enable_tail_bridge:
+                with component_profiler.stage("tail_bridge"):
+                    filtered_xyz, filtered_intensity, filtered_confidence, component_count_post_fusion, tail_bridge_count, longitudinal_extent = self._apply_tail_bridge(
+                        filtered_xyz,
+                        filtered_intensity,
+                        filtered_confidence,
+                        long_vehicle_mode_applied,
+                    )
+            else:
+                filtered_xyz, filtered_intensity, filtered_confidence, component_count_post_fusion, tail_bridge_count, longitudinal_extent = self._apply_tail_bridge(
+                    filtered_xyz,
+                    filtered_intensity,
+                    filtered_confidence,
+                    long_vehicle_mode_applied,
+                )
+            final_points = len(filtered_xyz)
+            symmetry_metrics = self._symmetry_completion_metrics(filtered_xyz, selected_centers)
+            dimension_metrics = self._vehicle_dimension_metrics(filtered_xyz)
+            metrics = {
+                **self._base_metrics(track),
+                **selection_info,
+                **motion_deskew_metrics,
+                **registration_metrics,
+                "alignment_method": registration_metrics.get("alignment_method", "none"),
+                "frame_selection_method": selection_info.get("strategy", self.config.frame_selection_method),
+                "fusion_method": self.fusion_method,
+                "chunk_weights": chunk_weights,
+                "raw_point_count": raw_points_total,
+                "fusion_voxels_total": fusion_voxels_total,
+                "fusion_voxels_kept": fusion_voxels_kept,
+                "point_count_after_fusion": prefilter_points,
+                "point_count_after_stat_filter": stat_filtered_points,
+                "point_count_after_downsample": final_points,
+                "longitudinal_extent": longitudinal_extent,
+                "component_count_post_fusion": component_count_post_fusion,
+                "tail_bridge_count": tail_bridge_count,
+                "long_vehicle_mode_applied": bool(long_vehicle_mode_applied),
+                "min_saved_aggregate_points": int(self.config.min_saved_aggregate_points),
+                "mode": "world" if self.output_config.save_world else "local",
+                **dimension_metrics,
+                **symmetry_metrics,
+            }
+            result_points = np.zeros((0, 3), dtype=np.float32)
+            result_intensity = None
+            result_status = "empty_filtered"
+            result_point_count_after_downsample = 0
+            result_quality_threshold: float | None = None
+            point_count_before_confidence_cap = 0
+            point_count_after_confidence_cap = 0
+            confidence_point_cap_applied = False
+            candidate_points_world = None
+            candidate_intensity_world = None
+            candidate_status = "missing"
+
+            if final_points != 0:
+                point_count_before_confidence_cap = int(len(filtered_xyz))
+                with component_profiler.stage("confidence_cap"):
+                    capped_xyz, capped_intensity, capped_confidence, confidence_point_cap_applied = self._apply_confidence_point_cap(
+                        filtered_xyz,
+                        filtered_intensity,
+                        filtered_confidence,
+                    )
+                with component_profiler.stage("symmetry_completion"):
+                    completed_xyz, completed_intensity, _, symmetry_metrics = self._apply_symmetry_completion(
+                        capped_xyz,
+                        capped_intensity,
+                        capped_confidence,
+                        selected_centers,
+                        component_count_post_fusion,
+                    )
+                metrics.update(symmetry_metrics)
+                metrics.update(self._vehicle_dimension_metrics(completed_xyz))
+                candidate_points_world, candidate_intensity_world = self._candidate_world_outputs(
+                    completed_xyz,
+                    completed_intensity,
+                    candidate_anchor_center_world,
+                )
+                metrics["point_count_after_downsample"] = int(len(completed_xyz))
+                point_count_after_confidence_cap = int(len(capped_xyz))
+                candidate_status = "available"
+                if final_points < int(self.config.min_saved_aggregate_points):
+                    result_status = "skipped_min_saved_points"
+                    result_point_count_after_downsample = final_points
+                else:
+                    quality_threshold = self._quality_threshold(long_vehicle_mode_applied)
+                    if float(track.quality_score or 0.0) < quality_threshold:
+                        metrics["quality_threshold"] = quality_threshold
+                        result_status = "skipped_quality_threshold"
+                        result_point_count_after_downsample = final_points
+                        result_quality_threshold = quality_threshold
+                    else:
+                        result_status = "saved"
+                        result_points = completed_xyz
+                        result_intensity = completed_intensity
+                        result_point_count_after_downsample = int(len(completed_xyz))
+                        result_quality_threshold = quality_threshold
+
+        metrics.update(self._aggregation_timing_metrics(component_profiler.snapshot()))
         return self._result(
             track,
             lane_box,
-            completed_xyz,
+            result_points,
             selected_frame_ids,
-            "saved",
+            result_status,
             metrics,
-            intensity=completed_intensity,
+            intensity=result_intensity,
             prepared_chunk_count=len(accumulation_input),
-            point_count_after_downsample=len(completed_xyz),
-            quality_threshold=quality_threshold,
+            point_count_after_downsample=result_point_count_after_downsample,
+            quality_threshold=result_quality_threshold,
             point_count_before_confidence_cap=point_count_before_confidence_cap,
-            point_count_after_confidence_cap=len(capped_xyz),
-            confidence_point_cap_applied=confidence_cap_applied,
+            point_count_after_confidence_cap=point_count_after_confidence_cap,
+            confidence_point_cap_applied=confidence_point_cap_applied,
             candidate_points_world=candidate_points_world,
             candidate_intensity_world=candidate_intensity_world,
             candidate_anchor_center_world=candidate_anchor_center_world,
-            candidate_status="available",
+            candidate_status=candidate_status,
         )
 
     def _base_metrics(self, track: Track) -> dict[str, Any]:
@@ -380,6 +436,7 @@ class VoxelFusionAccumulator:
             "quality_score": 0.0 if track.quality_score is None else float(track.quality_score),
             "quality_metrics": track.quality_metrics,
             "track_source_ids": track.source_track_ids or [track.track_id],
+            **self._aggregation_timing_defaults(),
         }
         if bool(track.state.get("articulated_vehicle")):
             metrics["articulated_vehicle"] = True
@@ -396,6 +453,19 @@ class VoxelFusionAccumulator:
             if object_kind:
                 metrics["object_kind"] = str(object_kind)
         return metrics
+
+    def _aggregation_timing_defaults(self) -> dict[str, float]:
+        return {field_name: 0.0 for field_name in _AGGREGATION_TIMING_FIELD_NAMES}
+
+    def _aggregation_timing_metrics(self, snapshot: dict[str, StagePerformance]) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+        for component_name in _AGGREGATION_TIMING_COMPONENTS:
+            metrics[f"{component_name}_wall_seconds"] = float(snapshot[component_name].wall_seconds)
+            metrics[f"{component_name}_cpu_seconds"] = float(snapshot[component_name].cpu_seconds)
+        return metrics
+
+    def _should_profile_registration(self) -> bool:
+        return self.fusion_method == "registration_voxel_fusion"
 
     def _result(
         self,
@@ -1730,7 +1800,7 @@ class VoxelFusionAccumulator:
         stat_count = raw_count
         filtered_intensity = None if intensity is None else np.asarray(intensity, dtype=np.float32).copy()
         filtered_confidence = None if confidence is None else np.asarray(confidence, dtype=np.float32).copy()
-        if raw_count >= max(8, int(self.config.post_filter_stat_nb_neighbors)):
+        if self.config.enable_post_filter_stat_outlier_removal and raw_count >= max(8, int(self.config.post_filter_stat_nb_neighbors)):
             pcd, keep_indices = pcd.remove_statistical_outlier(
                 nb_neighbors=int(self.config.post_filter_stat_nb_neighbors),
                 std_ratio=float(self.config.post_filter_stat_std_ratio),
@@ -1792,6 +1862,8 @@ class VoxelFusionAccumulator:
         if len(xyz) == 0:
             empty_confidence = None if confidence is None else np.zeros((0,), dtype=np.float32)
             return np.zeros((0, 3), dtype=np.float32), None, empty_confidence, 0, 0, longitudinal_extent
+        if not self.config.enable_tail_bridge:
+            return np.asarray(xyz, dtype=np.float32), intensity, confidence, 0, 0, longitudinal_extent
         components = self._components(xyz, intensity, confidence)
         if not long_vehicle_mode_applied or len(components) <= 1:
             return np.asarray(xyz, dtype=np.float32), intensity, confidence, len(components), 0, longitudinal_extent
@@ -2243,6 +2315,14 @@ class VoxelFusionAccumulator:
             "long_vehicle_rear_axis_shifts_world": component_axis_shifts_world,
             "long_vehicle_overlap_correction_applied": bool(overlap_correction_applied),
         }
+        merged_metrics.update(
+            {
+                field_name: float(
+                    sum(float(aggregate_results[track_id].metrics.get(field_name, 0.0) or 0.0) for track_id in component_ids)
+                )
+                for field_name in _AGGREGATION_TIMING_FIELD_NAMES
+            }
+        )
 
         render_points = np.asarray(merged_world_points, dtype=np.float32)
         if not self.output_config.save_world:
@@ -2500,7 +2580,7 @@ class VoxelFusionAccumulator:
             return np.zeros((0, 3), dtype=np.float32), None if intensity is None else np.zeros((0,), dtype=np.float32)
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
-        if len(points) >= max(6, int(self.config.post_filter_stat_nb_neighbors) // 2):
+        if self.config.enable_post_filter_stat_outlier_removal and len(points) >= max(6, int(self.config.post_filter_stat_nb_neighbors) // 2):
             pcd, keep_indices = pcd.remove_statistical_outlier(
                 nb_neighbors=max(6, int(self.config.post_filter_stat_nb_neighbors) // 2),
                 std_ratio=float(self.config.post_filter_stat_std_ratio) * 1.25,

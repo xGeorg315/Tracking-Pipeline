@@ -8,6 +8,7 @@ from tracking_pipeline.config.models import AggregationConfig, OutputConfig, Tra
 from tracking_pipeline.domain.models import AggregateResult, Track
 from tracking_pipeline.domain.rules import compute_extent
 from tracking_pipeline.domain.value_objects import LaneBox
+from tracking_pipeline.infrastructure.aggregation import voxel_fusion as voxel_fusion_module
 from tracking_pipeline.infrastructure.aggregation.occupancy_consensus_fusion import OccupancyConsensusFusionAccumulator
 from tracking_pipeline.infrastructure.aggregation import registration_backends
 from tracking_pipeline.infrastructure.aggregation.registration_backends import (
@@ -15,7 +16,7 @@ from tracking_pipeline.infrastructure.aggregation.registration_backends import (
     build_registration_backend,
 )
 from tracking_pipeline.infrastructure.aggregation.registration_voxel_fusion import RegistrationVoxelFusionAccumulator
-from tracking_pipeline.infrastructure.aggregation.voxel_fusion import VoxelFusionAccumulator
+from tracking_pipeline.infrastructure.aggregation.voxel_fusion import VoxelFusionAccumulator, _AggregationComponentProfiler
 from tracking_pipeline.infrastructure.aggregation.weighted_voxel_fusion import WeightedVoxelFusionAccumulator
 
 
@@ -297,6 +298,45 @@ class _CapturingAccumulator(VoxelFusionAccumulator):
         )
 
 
+def test_aggregation_component_profiler_records_stage_timings(monkeypatch) -> None:
+    wall_values = iter([1.0, 1.4, 2.0, 2.6, 3.0, 3.1, 3.6, 3.7, 3.9, 4.0, 4.7, 4.8, 4.9, 5.0])
+    cpu_values = iter([10.0, 10.2, 11.0, 11.3, 12.0, 12.01, 12.11, 12.12, 12.17, 12.18, 12.48, 12.49, 12.51, 12.55])
+    monkeypatch.setattr(voxel_fusion_module.time, "perf_counter", lambda: next(wall_values))
+    monkeypatch.setattr(voxel_fusion_module.time, "process_time", lambda: next(cpu_values))
+    profiler = _AggregationComponentProfiler()
+
+    with profiler.stage("registration"):
+        pass
+    with profiler.stage("fusion_core"):
+        pass
+    with profiler.stage("fusion_post"):
+        with profiler.stage("post_filter"):
+            pass
+        with profiler.stage("tail_bridge"):
+            pass
+        with profiler.stage("confidence_cap"):
+            pass
+        with profiler.stage("symmetry_completion"):
+            pass
+
+    snapshot = profiler.snapshot()
+
+    assert np.isclose(snapshot["registration"].wall_seconds, 0.4)
+    assert np.isclose(snapshot["registration"].cpu_seconds, 0.2)
+    assert snapshot["registration"].call_count == 1
+    assert np.isclose(snapshot["fusion_core"].wall_seconds, 0.6)
+    assert np.isclose(snapshot["post_filter"].wall_seconds, 0.5)
+    assert np.isclose(snapshot["tail_bridge"].wall_seconds, 0.2)
+    assert np.isclose(snapshot["confidence_cap"].wall_seconds, 0.7)
+    assert np.isclose(snapshot["symmetry_completion"].wall_seconds, 0.1)
+    assert np.isclose(snapshot["fusion_post"].wall_seconds, 2.0)
+    assert np.isclose(snapshot["fusion_post"].cpu_seconds, 0.55)
+    assert np.isclose(snapshot["fusion_total"].wall_seconds, 2.6)
+    assert np.isclose(snapshot["fusion_total"].cpu_seconds, 0.85)
+    assert snapshot["fusion_post"].call_count == 1
+    assert snapshot["fusion_total"].call_count == 1
+
+
 def test_voxel_fusion_accumulator_saves_track() -> None:
     accumulator = VoxelFusionAccumulator(
         AggregationConfig(min_saved_aggregate_points=0),
@@ -318,6 +358,25 @@ def test_voxel_fusion_accumulator_saves_track() -> None:
     assert np.isclose(result.metrics["vehicle_height"], float(extent[2]))
     assert np.isclose(result.metrics["extent_x"], float(extent[0]))
     assert np.isclose(result.metrics["extent_y"], float(extent[1]))
+    assert result.metrics["registration_wall_seconds"] == 0.0
+    assert result.metrics["registration_cpu_seconds"] == 0.0
+    assert result.metrics["fusion_core_wall_seconds"] >= 0.0
+    assert result.metrics["post_filter_wall_seconds"] >= 0.0
+    assert result.metrics["tail_bridge_wall_seconds"] >= 0.0
+    assert result.metrics["confidence_cap_wall_seconds"] >= 0.0
+    assert result.metrics["symmetry_completion_wall_seconds"] >= 0.0
+    assert result.metrics["fusion_post_wall_seconds"] >= 0.0
+    assert np.isclose(
+        result.metrics["fusion_total_wall_seconds"],
+        result.metrics["fusion_core_wall_seconds"] + result.metrics["fusion_post_wall_seconds"],
+    )
+    post_substep_wall_seconds = (
+        result.metrics["post_filter_wall_seconds"]
+        + result.metrics["tail_bridge_wall_seconds"]
+        + result.metrics["confidence_cap_wall_seconds"]
+        + result.metrics["symmetry_completion_wall_seconds"]
+    )
+    assert result.metrics["fusion_post_wall_seconds"] + 1e-9 >= post_substep_wall_seconds
     assert np.isclose(result.metrics["extent_z"], float(extent[2]))
 
 
@@ -1183,6 +1242,43 @@ def test_symmetry_completion_skips_when_all_points_stay_in_center_strip() -> Non
     assert len(result.points) == 3
 
 
+def test_registration_voxel_fusion_accumulator_reports_component_timings(monkeypatch) -> None:
+    wall_values = iter([1.0, 1.3, 2.0, 2.5, 3.0, 3.1, 3.5, 3.6, 3.8, 4.0, 4.6, 4.7, 4.8, 4.9])
+    cpu_values = iter([10.0, 10.1, 11.0, 11.2, 12.0, 12.01, 12.11, 12.12, 12.17, 12.18, 12.48, 12.49, 12.51, 12.55])
+    monkeypatch.setattr(voxel_fusion_module.time, "perf_counter", lambda: next(wall_values))
+    monkeypatch.setattr(voxel_fusion_module.time, "process_time", lambda: next(cpu_values))
+    accumulator = _ScriptedPrepareAccumulator(
+        AggregationConfig(
+            algorithm="registration_voxel_fusion",
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.05,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+        ),
+        OutputConfig(require_track_exit=False),
+        TrackingConfig(min_track_hits=1),
+        keep_indices=[0, 1, 2],
+    )
+    result = accumulator.accumulate(
+        _track_from_chunks([_constant_chunk(0.0), _constant_chunk(0.1), _constant_chunk(0.2)]),
+        LaneBox.from_values([-1.0, 1.0, -1.0, 2.0, -1.0, 1.0]),
+    )
+
+    assert result.status == "saved"
+    assert np.isclose(result.metrics["registration_wall_seconds"], 0.3)
+    assert np.isclose(result.metrics["registration_cpu_seconds"], 0.1)
+    assert np.isclose(result.metrics["fusion_core_wall_seconds"], 0.5)
+    assert np.isclose(result.metrics["post_filter_wall_seconds"], 0.4)
+    assert np.isclose(result.metrics["tail_bridge_wall_seconds"], 0.2)
+    assert np.isclose(result.metrics["confidence_cap_wall_seconds"], 0.6)
+    assert np.isclose(result.metrics["symmetry_completion_wall_seconds"], 0.1)
+    assert np.isclose(result.metrics["fusion_post_wall_seconds"], 1.9)
+    assert np.isclose(result.metrics["fusion_total_wall_seconds"], 2.4)
+    assert np.isclose(result.metrics["fusion_total_cpu_seconds"], 0.75)
+
+
 def test_registration_voxel_fusion_accumulator_falls_back_without_backend() -> None:
     accumulator = RegistrationVoxelFusionAccumulator(
         AggregationConfig(
@@ -1533,6 +1629,104 @@ def test_voxel_fusion_stat_filter_keeps_intensity_aligned() -> None:
     assert result.intensity is not None
     assert len(result.intensity) == len(result.points)
     assert len(result.points) < len(cluster)
+
+
+def test_voxel_fusion_stat_filter_can_be_disabled() -> None:
+    cluster = np.array(
+        [[0.02 * idx, 0.0, 0.0] for idx in range(16)] + [[8.0, 8.0, 8.0]],
+        dtype=np.float32,
+    )
+    track = _single_chunk_track(cluster, center=np.zeros((3,), dtype=np.float32))
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.01,
+            aggregate_voxel=0.0,
+            enable_post_filter_stat_outlier_removal=False,
+            post_filter_stat_nb_neighbors=8,
+            post_filter_stat_std_ratio=1.0,
+            min_saved_aggregate_points=0,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 9.0, -1.0, 9.0, -1.0, 9.0]))
+
+    assert result.status == "saved"
+    assert len(result.points) == len(cluster)
+    assert any(np.allclose(point, np.array([8.0, 8.0, 8.0], dtype=np.float32)) for point in result.points)
+
+
+def test_post_filter_long_vehicle_merge_can_skip_outlier_removal() -> None:
+    cluster = np.array(
+        [[0.05 * idx, 0.0, 0.0] for idx in range(12)] + [[6.0, 6.0, 6.0]],
+        dtype=np.float32,
+    )
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            aggregate_voxel=0.0,
+            enable_post_filter_stat_outlier_removal=False,
+            post_filter_stat_nb_neighbors=8,
+            post_filter_stat_std_ratio=1.0,
+            min_saved_aggregate_points=0,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    filtered_points, _ = accumulator._post_filter_long_vehicle_merge(cluster, None)
+
+    assert len(filtered_points) == len(cluster)
+    assert any(np.allclose(point, np.array([6.0, 6.0, 6.0], dtype=np.float32)) for point in filtered_points)
+
+
+def test_tail_bridge_can_be_disabled_without_component_clustering(monkeypatch) -> None:
+    cluster = np.array(
+        [
+            [0.0, 0.0, 1.0],
+            [0.0, 0.2, 1.0],
+            [0.0, 1.6, 1.0],
+            [0.0, 1.8, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            frame_selection_method="all_track_frames",
+            frame_selection_line_axis="y",
+            long_vehicle_mode=True,
+            enable_tail_bridge=False,
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.05,
+            aggregate_voxel=0.0,
+            min_saved_aggregate_points=0,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    def _fail_components(*args, **kwargs):
+        raise AssertionError("_components should not be called when tail bridge is disabled")
+
+    monkeypatch.setattr(accumulator, "_components", _fail_components)
+
+    bridged_xyz, bridged_intensity, bridged_confidence, component_count_post_fusion, tail_bridge_count, longitudinal_extent = accumulator._apply_tail_bridge(
+        cluster,
+        None,
+        None,
+        True,
+    )
+
+    assert np.array_equal(bridged_xyz, cluster)
+    assert bridged_intensity is None
+    assert bridged_confidence is None
+    assert component_count_post_fusion == 0
+    assert tail_bridge_count == 0
+    assert longitudinal_extent > 0.0
 
 
 def test_weighted_voxel_fusion_reports_chunk_weights() -> None:

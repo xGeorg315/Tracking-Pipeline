@@ -79,6 +79,10 @@ def validate_config(config: PipelineConfig) -> None:
         raise ConfigError("aggregation.enable_registration_underfill_fallback must be a boolean")
     if not isinstance(config.aggregation.enable_confidence_point_cap, bool):
         raise ConfigError("aggregation.enable_confidence_point_cap must be a boolean")
+    if not isinstance(config.aggregation.enable_tail_bridge, bool):
+        raise ConfigError("aggregation.enable_tail_bridge must be a boolean")
+    if not isinstance(config.aggregation.enable_post_filter_stat_outlier_removal, bool):
+        raise ConfigError("aggregation.enable_post_filter_stat_outlier_removal must be a boolean")
     if not isinstance(config.visualization.show_full_frame_pcd, bool):
         raise ConfigError("visualization.show_full_frame_pcd must be a boolean")
     if not isinstance(config.visualization.show_tracker_debug, bool):

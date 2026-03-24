@@ -7,8 +7,8 @@ preprocessing:
   bootstrap_frames: 10
 clustering:
   algorithm: dbscan
-  eps: 1.0
-  min_points: 10
+  eps: 0.90
+  min_points: 8
   vehicle_min_points: 20
   vehicle_max_points: 10000
   plane_distance_threshold: 0.12
@@ -71,9 +71,11 @@ aggregation:
   long_vehicle_length_threshold: 4.5
   length_coverage_bins: 10
   min_track_quality_for_save_long_vehicle: 0.0
+  enable_tail_bridge: true
   tail_bridge_longitudinal_gap_max: 1.5
   tail_bridge_lateral_gap_max: 0.8
   tail_bridge_vertical_gap_max: 0.5
+  enable_post_filter_stat_outlier_removal: false
   post_filter_stat_nb_neighbors: 12
   post_filter_stat_std_ratio: 2.3
   aggregate_voxel: 0.06

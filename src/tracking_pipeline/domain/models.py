@@ -285,6 +285,7 @@ class RunPerformance:
     io_wall_seconds: float = 0.0
     peak_rss_mb: float | None = None
     stages: dict[str, StagePerformance] = field(default_factory=dict)
+    aggregation_components: dict[str, StagePerformance] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

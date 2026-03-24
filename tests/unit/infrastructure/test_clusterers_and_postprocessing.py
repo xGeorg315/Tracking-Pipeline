@@ -152,6 +152,39 @@ def _articulated_track(
     return track
 
 
+def _articulated_track_from_rear_edges(
+    track_id: int,
+    frame_ids: list[int],
+    rear_edges: list[float],
+    *,
+    lengths: list[float] | float,
+    lateral_center: float = 0.0,
+    vertical_center: float = 1.0,
+    width: float = 0.9,
+    height: float = 1.4,
+) -> Track:
+    if isinstance(lengths, (int, float)):
+        lengths = [float(lengths) for _ in frame_ids]
+    track = Track(track_id=track_id, age=len(frame_ids), hit_count=len(frame_ids), ended_by_missed=True, source_track_ids=[track_id])
+    for frame_id, rear_edge, length in zip(frame_ids, rear_edges, lengths):
+        center = np.asarray([lateral_center, float(rear_edge) + 0.5 * float(length), vertical_center], dtype=np.float32)
+        points = _box_points(center, width=width, length=float(length), height=height)
+        intensity = np.linspace(float(track_id), float(track_id) + 0.7, len(points), dtype=np.float32)
+        point_timestamps_ns = np.arange(frame_id * 1000, frame_id * 1000 + len(points), dtype=np.int64)
+        track.add_observation(
+            center,
+            points,
+            frame_id,
+            frame_id * 1_000_000,
+            np.asarray([width, float(length), height], dtype=np.float32),
+            intensity=intensity,
+            point_timestamp_ns=point_timestamps_ns,
+        )
+    track.age = max(track.age, track.last_frame - track.first_frame + 1)
+    track.hit_count = len(track.frame_ids)
+    return track
+
+
 def test_euclidean_clusterer_detects_two_clusters() -> None:
     frame = _cluster_frame()
     lane_box = LaneBox.from_values([-2.0, 3.0, -2.0, 3.0, 0.0, 2.0])
@@ -519,6 +552,117 @@ def test_articulated_vehicle_merge_links_front_and_rear_tracks() -> None:
     assert merged[21].state["articulated_rear_gap_std"] < 0.1
     assert processor.debug_records[-1].accepted is True
     assert processor.debug_records[-1].rejection_reason == "tail_gap"
+    assert processor.debug_records[-1].motion_signal_type == "rear_anchor"
+    assert processor.debug_records[-1].motion_speed_delta <= 0.5
+
+
+def test_articulated_vehicle_merge_uses_rear_anchor_motion_when_center_drifts() -> None:
+    frame_ids = [0, 1, 2, 3, 4, 5]
+    front = _articulated_track_from_rear_edges(
+        43,
+        frame_ids,
+        [10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
+        lengths=[3.0, 4.2, 5.4, 6.6, 7.8, 9.0],
+        lateral_center=0.0,
+    )
+    rear = _articulated_track_from_rear_edges(
+        44,
+        frame_ids,
+        [6.8, 7.8, 8.8, 9.8, 10.8, 11.8],
+        lengths=3.0,
+        lateral_center=0.1,
+    )
+    processor = ArticulatedVehicleMergePostprocessor(
+        PostprocessingConfig(
+            enable_articulated_vehicle_merge=True,
+            articulated_max_speed_delta=0.5,
+            articulated_min_combined_length=6.0,
+        ),
+        longitudinal_axis="y",
+    )
+
+    merged = processor.process({front.track_id: front, rear.track_id: rear})
+
+    assert merged[43].state["articulated_vehicle"] is True
+    assert merged[44].state["articulated_vehicle"] is True
+    debug = processor.debug_records[-1]
+    assert debug.accepted is True
+    assert debug.motion_signal_type == "rear_anchor"
+    assert debug.motion_window_frame_count == 5
+    assert debug.motion_speed_delta < 0.05
+    assert abs(debug.left_center_speed - debug.right_center_speed) > 0.5
+
+
+def test_articulated_vehicle_merge_rejects_rear_anchor_speed_mismatch() -> None:
+    frame_ids = [0, 1, 2, 3, 4, 5]
+    front = _articulated_track_from_rear_edges(45, frame_ids, [10.0, 11.0, 12.0, 13.0, 14.0, 15.0], lengths=3.0, lateral_center=0.0)
+    rear = _articulated_track_from_rear_edges(46, frame_ids, [6.8, 7.4, 8.0, 8.6, 9.2, 9.8], lengths=3.0, lateral_center=0.1)
+    processor = ArticulatedVehicleMergePostprocessor(
+        PostprocessingConfig(enable_articulated_vehicle_merge=True, articulated_max_speed_delta=0.2),
+        longitudinal_axis="y",
+    )
+
+    merged = processor.process({front.track_id: front, rear.track_id: rear})
+
+    assert set(merged.keys()) == {45, 46}
+    debug = processor.debug_records[-1]
+    assert debug.accepted is False
+    assert debug.rejection_reason == "motion"
+    assert debug.motion_signal_type == "rear_anchor"
+    assert debug.motion_speed_delta > 0.2
+
+
+def test_articulated_vehicle_merge_rejects_opposite_motion_by_cosine() -> None:
+    front = _articulated_track(47, [0, 1, 2, 3, 4], [10.0, 11.0, 12.0, 13.0, 14.0], lateral_center=0.0)
+    rear = _articulated_track(48, [0, 1, 2, 3, 4], [6.8, 6.4, 6.0, 5.6, 5.2], lateral_center=0.1)
+    processor = ArticulatedVehicleMergePostprocessor(PostprocessingConfig(enable_articulated_vehicle_merge=True), longitudinal_axis="y")
+
+    merged = processor.process({front.track_id: front, rear.track_id: rear})
+
+    assert set(merged.keys()) == {47, 48}
+    debug = processor.debug_records[-1]
+    assert debug.accepted is False
+    assert debug.rejection_reason == "motion"
+    assert debug.motion_cosine < 0.85
+
+
+def test_articulated_vehicle_merge_tracks_motion_tail_window_size() -> None:
+    front = _articulated_track_from_rear_edges(49, [0, 1], [10.0, 11.0], lengths=3.0, lateral_center=0.0)
+    rear = _articulated_track_from_rear_edges(50, [0, 1], [6.8, 7.8], lengths=3.0, lateral_center=0.1)
+    processor = ArticulatedVehicleMergePostprocessor(
+        PostprocessingConfig(
+            enable_articulated_vehicle_merge=True,
+            articulated_min_overlap_frames=2,
+            articulated_gap_eval_window_frames=5,
+            articulated_min_combined_length=6.0,
+        ),
+        longitudinal_axis="y",
+    )
+
+    merged = processor.process({front.track_id: front, rear.track_id: rear})
+
+    assert merged[49].state["articulated_vehicle"] is True
+    assert merged[50].state["articulated_vehicle"] is True
+    debug = processor.debug_records[-1]
+    assert debug.accepted is True
+    assert debug.motion_signal_type == "rear_anchor"
+    assert debug.motion_window_frame_count == 2
+
+
+def test_articulated_vehicle_merge_falls_back_to_center_motion_when_edges_missing() -> None:
+    frame_ids = [0, 1, 2, 3]
+    front = _articulated_track_from_rear_edges(51, frame_ids, [10.0, 11.0, 12.0, 13.0], lengths=3.0, lateral_center=0.0)
+    rear = _articulated_track_from_rear_edges(52, frame_ids, [6.8, 7.8, 8.8, 9.8], lengths=3.0, lateral_center=0.1)
+    front.world_points[-1] = np.zeros((0, 3), dtype=np.float32)
+    processor = ArticulatedVehicleMergePostprocessor(PostprocessingConfig(enable_articulated_vehicle_merge=True), longitudinal_axis="y")
+
+    evaluation = processor._pair_metrics(front, rear)
+
+    assert evaluation.metrics is None
+    assert evaluation.debug is not None
+    assert evaluation.debug.rejection_reason == "missing_points"
+    assert evaluation.debug.motion_signal_type == "center_fallback"
+    assert evaluation.debug.motion_window_frame_count == len(frame_ids)
 
 
 def test_articulated_vehicle_merge_rejects_side_by_side_neighbor() -> None:

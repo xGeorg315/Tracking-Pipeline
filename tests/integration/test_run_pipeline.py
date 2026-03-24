@@ -84,6 +84,7 @@ def _write_object_list_fixture(path: Path) -> Path:
 def test_run_pipeline_creates_run_artifacts(tmp_path: Path) -> None:
     project_root = Path(__file__).resolve().parents[2]
     config = load_config(project_root / "configs" / "euclidean_voxel.yaml")
+    config.aggregation.enable_tail_bridge = False
     config.output.root_dir = str(tmp_path)
 
     summary = run_pipeline(config, project_root)
@@ -99,6 +100,11 @@ def test_run_pipeline_creates_run_artifacts(tmp_path: Path) -> None:
     assert (run_dir / "gt_matching" / "unmatched_gt_objects.jsonl").exists()
     assert (run_dir / "gt_matching" / "summary.json").exists()
     payload = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    track_rows = [
+        json.loads(line)
+        for line in (run_dir / "tracks.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
     assert payload["tracker_algorithm"] == "euclidean_nn"
     assert payload["accumulator_algorithm"] == "voxel_fusion"
     assert payload["input_paths"] == config.input.paths
@@ -107,7 +113,29 @@ def test_run_pipeline_creates_run_artifacts(tmp_path: Path) -> None:
     assert "performance" in payload
     assert "read_frames" in payload["performance"]["stages"]
     assert "cluster_frames" in payload["performance"]["stages"]
+    assert "aggregation_components" in payload["performance"]
+    assert set(payload["performance"]["aggregation_components"]) == {
+        "registration",
+        "fusion_core",
+        "post_filter",
+        "tail_bridge",
+        "confidence_cap",
+        "symmetry_completion",
+        "fusion_post",
+        "fusion_total",
+    }
+    assert payload["performance"]["aggregation_components"]["registration"]["wall_seconds"] == 0.0
+    assert payload["performance"]["aggregation_components"]["tail_bridge"]["wall_seconds"] == 0.0
+    assert payload["performance"]["aggregation_components"]["tail_bridge"]["call_count"] == 0
     assert payload["performance"]["total_wall_seconds"] >= payload["performance"]["compute_wall_seconds"]
+    assert track_rows
+    assert "registration_wall_seconds" in track_rows[0]["aggregation_metrics"]
+    assert "post_filter_wall_seconds" in track_rows[0]["aggregation_metrics"]
+    assert "tail_bridge_wall_seconds" in track_rows[0]["aggregation_metrics"]
+    assert track_rows[0]["aggregation_metrics"]["tail_bridge_wall_seconds"] == 0.0
+    assert "confidence_cap_wall_seconds" in track_rows[0]["aggregation_metrics"]
+    assert "symmetry_completion_wall_seconds" in track_rows[0]["aggregation_metrics"]
+    assert "fusion_total_wall_seconds" in track_rows[0]["aggregation_metrics"]
 
 
 def test_run_pipeline_accepts_multiple_input_files_as_one_sequence(tmp_path: Path) -> None:

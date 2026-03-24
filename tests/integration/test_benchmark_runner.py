@@ -59,6 +59,12 @@ def test_benchmark_runner_writes_proxy_reports(tmp_path: Path) -> None:
         assert "long_vehicle_saved_count" in row
         assert row["performance_samples"] == 2
         assert "total_wall_seconds_median" in row
+        assert "aggregation_registration_wall_seconds_median" in row
+        assert "aggregation_post_filter_wall_seconds_median" in row
+        assert "aggregation_tail_bridge_wall_seconds_median" in row
+        assert "aggregation_confidence_cap_wall_seconds_median" in row
+        assert "aggregation_symmetry_completion_wall_seconds_median" in row
+        assert "aggregation_fusion_total_wall_seconds_median" in row
         assert "stage_read_frames_wall_seconds_median" in row
         assert "representative_run_dir" in row
 
@@ -69,6 +75,94 @@ def test_benchmark_runner_writes_proxy_reports(tmp_path: Path) -> None:
     ]
     assert len(perf_rows) == 4
     assert {row["phase"] for row in perf_rows} == {"measure"}
+    assert "aggregation_registration_wall_seconds" in perf_rows[0]
+    assert "aggregation_post_filter_wall_seconds" in perf_rows[0]
+    assert "aggregation_tail_bridge_wall_seconds" in perf_rows[0]
+    assert "aggregation_confidence_cap_wall_seconds" in perf_rows[0]
+    assert "aggregation_symmetry_completion_wall_seconds" in perf_rows[0]
+    assert "aggregation_fusion_total_wall_seconds" in perf_rows[0]
+
+
+def test_benchmark_runner_records_registration_time_only_for_registration_presets(tmp_path: Path) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    fixture = project_root / "tests" / "fixtures" / "sample_a42.pb"
+    preset_dir = tmp_path / "presets"
+    preset_dir.mkdir(parents=True, exist_ok=True)
+    (preset_dir / "base.yaml").write_text((project_root / "configs" / "base.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+    (preset_dir / "euclidean_voxel.yaml").write_text(
+        "\n".join(
+            [
+                "input:",
+                f"  paths:",
+                f"    - {fixture}",
+                "tracking:",
+                "  algorithm: euclidean_nn",
+                "aggregation:",
+                "  algorithm: voxel_fusion",
+                "  min_saved_aggregate_points: 0",
+                "output:",
+                "  require_track_exit: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (preset_dir / "euclidean_icp.yaml").write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                f"    - {fixture}",
+                "tracking:",
+                "  algorithm: euclidean_nn",
+                "  min_track_hits: 1",
+                "aggregation:",
+                "  algorithm: registration_voxel_fusion",
+                "  registration_backend: icp_point_to_plane",
+                "  frame_selection_method: all_track_frames",
+                "  frame_downsample_voxel: 0.0",
+                "  registration_max_iter: 10",
+                "  registration_min_fitness: 0.0",
+                "  min_saved_aggregate_points: 0",
+                "output:",
+                "  require_track_exit: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "benchmark_registration.yaml"
+    manifest.write_text(
+        "\n".join(
+            [
+                "name: registration_components",
+                f"output_root: {tmp_path / 'benchmarks'}",
+                "warmup_runs: 0",
+                "measure_runs: 1",
+                "sequences:",
+                f"  - {fixture}",
+                "presets:",
+                f"  - {preset_dir / 'euclidean_voxel.yaml'}",
+                f"  - {preset_dir / 'euclidean_icp.yaml'}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_benchmark_config(manifest)
+    output_dir = BenchmarkRunner(project_root).run(config)
+    perf_rows = [
+        json.loads(line)
+        for line in (output_dir / "performance_runs.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    by_preset = {row["preset_name"]: row for row in perf_rows}
+
+    assert by_preset["euclidean_voxel"]["aggregation_registration_wall_seconds"] == 0.0
+    assert by_preset["euclidean_voxel"]["aggregation_fusion_total_wall_seconds"] >= 0.0
+    assert by_preset["euclidean_icp"]["aggregation_registration_call_count"] > 0
+    assert by_preset["euclidean_icp"]["aggregation_fusion_total_wall_seconds"] >= 0.0
 
 
 def test_benchmark_runner_expands_directory_sequence_into_sorted_input_paths(tmp_path: Path) -> None:

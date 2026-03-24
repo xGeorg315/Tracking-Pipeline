@@ -166,6 +166,7 @@ output:
 | `enable_confidence_point_cap` | `false` | kappt das finale gespeicherte Aggregate optional auf die confidentesten Punkte |
 | `confidence_point_cap_max_points` | `2048` | maximales Punktbudget fuer das finale Aggregate bei aktivem Confidence-Cap |
 | `confidence_point_cap_bins` | `16` | Anzahl Longitudinal-Bins fuer die verteilte Confidence-Auswahl |
+| `enable_post_filter_stat_outlier_removal` | `true` | schaltet Statistical Outlier Removal im normalen Post-Filter und im Long-Vehicle-Merge explizit ein oder aus |
 | `aggregate_voxel` | `0.06` | finales Downsampling nach dem Post-Filter |
 
 ### Long-Vehicle-Modus
@@ -176,6 +177,7 @@ output:
 | `long_vehicle_length_threshold` | `4.5` | Schwellwert fuer Long-Vehicle-Klassifikation |
 | `length_coverage_bins` | `10` | Bins fuer laengenbasierte Frame-Selektion |
 | `min_track_quality_for_save_long_vehicle` | `0.0` | Mindestqualitaet fuer Long Vehicles |
+| `enable_tail_bridge` | `true` | schaltet Tail-Bridge komplett ein oder aus; bei `false` entfaellt auch die teure Komponentenbildung in diesem Schritt |
 | `tail_bridge_longitudinal_gap_max` | `1.5` | maximaler Laengsabstand fuer Tail-Bridge |
 | `tail_bridge_lateral_gap_max` | `0.8` | maximaler lateraler Abstand fuer Tail-Bridge |
 | `tail_bridge_vertical_gap_max` | `0.5` | maximaler Hoehenabstand fuer Tail-Bridge |
@@ -184,7 +186,7 @@ output:
 
 | Feld | Default | Bedeutung |
 | --- | --- | --- |
-| `post_filter_stat_nb_neighbors` | `12` | Nachbarn fuer Statistical Outlier Removal |
+| `post_filter_stat_nb_neighbors` | `12` | Nachbarn fuer Statistical Outlier Removal, falls aktiviert |
 | `post_filter_stat_std_ratio` | `2.3` | Streuungsfaktor fuer Outlier Removal |
 
 ## `postprocessing`
