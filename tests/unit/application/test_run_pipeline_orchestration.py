@@ -4,11 +4,13 @@ from pathlib import Path
 
 import numpy as np
 
+from tracking_pipeline.application.performance import derive_hz
 from tracking_pipeline.application.replay_run import replay_run
 from tracking_pipeline.application.run_pipeline import run_pipeline
 from tracking_pipeline.config.models import (
     AggregationConfig,
     ClusteringConfig,
+    ClassNormalizationConfig,
     InputConfig,
     OutputConfig,
     PipelineConfig,
@@ -21,6 +23,7 @@ from tracking_pipeline.domain.models import (
     ActiveTrackState,
     AggregateResult,
     ClusterResult,
+    ClassificationPrediction,
     Detection,
     FrameData,
     FrameTrackerDebug,
@@ -163,8 +166,10 @@ class _FakeWriter:
         self.base = base
         self.object_labels = None
         self.aggregate_write_intensity_flags: list[bool] = []
+        self.aggregate_write_metrics: list[dict[str, object]] = []
         self.tracker_debug_states = None
         self.track_outcomes = None
+        self.class_stats = None
         self.written_tracks = None
         self.written_aggregate_results = None
         self.gt_matches = None
@@ -183,8 +188,8 @@ class _FakeWriter:
         (run_dir / "config.snapshot.yaml").write_text("ok\n", encoding="utf-8")
 
     def write_aggregate(self, run_dir, result, save_intensity=False):
-        _ = result
         self.aggregate_write_intensity_flags.append(bool(save_intensity))
+        self.aggregate_write_metrics.append(dict(result.metrics))
         (run_dir / "aggregate.txt").write_text("saved\n", encoding="utf-8")
 
     def write_summary(self, run_dir, summary):
@@ -202,6 +207,10 @@ class _FakeWriter:
     def write_track_outcomes(self, run_dir, track_outcomes):
         self.track_outcomes = track_outcomes
         (run_dir / "track_outcomes.txt").write_text(str(len(track_outcomes)), encoding="utf-8")
+
+    def write_class_stats(self, run_dir, class_stats):
+        self.class_stats = class_stats
+        (run_dir / "class_stats.txt").write_text(str(class_stats), encoding="utf-8")
 
     def write_object_list(self, run_dir, object_labels):
         self.object_labels = object_labels
@@ -231,6 +240,18 @@ class _FakeViewer:
         self.aggregate_results = aggregate_results
         self.track_outcomes = track_outcomes
         self.articulated_merge_debug_events = articulated_merge_debug_events
+
+
+class _FakeClassifier:
+    backend = "pointnext"
+
+    def __init__(self):
+        self.seen_points: list[np.ndarray] = []
+
+    def classify_points(self, points: np.ndarray) -> ClassificationPrediction:
+        arr = np.asarray(points, dtype=np.float32)
+        self.seen_points.append(arr.copy())
+        return ClassificationPrediction(class_id=4, class_name="trailer", score=0.88)
 
 
 class _FakeObjectReader:
@@ -412,15 +433,25 @@ def test_run_pipeline_orchestrates_dependencies(monkeypatch, tmp_path: Path) -> 
     assert (tmp_path / "run" / "summary.txt").exists()
     assert (tmp_path / "run" / "tracker_debug.txt").exists()
     assert (tmp_path / "run" / "track_outcomes.txt").exists()
+    assert (tmp_path / "run" / "class_stats.txt").exists()
     assert len(fake_writer.tracker_debug_states) == 2
     assert isinstance(fake_writer.track_outcomes[1], TrackOutcomeDebug)
     assert fake_writer.track_outcomes[1].status == "saved"
+    assert summary.predicted_class_counts == {}
+    assert summary.gt_class_counts == {}
+    assert summary.matched_gt_class_counts == {}
+    assert summary.class_comparison_count == 0
+    assert summary.class_match_count == 0
+    assert summary.class_mismatch_count == 0
+    assert summary.class_count_rows == []
     assert summary.performance is not None
     assert summary.performance.aggregation_components["registration"].wall_seconds == 0.0
     assert summary.performance.aggregation_components["fusion_core"].wall_seconds == 0.2
     assert summary.performance.aggregation_components["fusion_post"].wall_seconds == 0.3
     assert summary.performance.aggregation_components["fusion_total"].wall_seconds == 0.5
     assert summary.performance.aggregation_components["fusion_total"].call_count == 1
+    assert summary.performance.total_hz == derive_hz(summary.frame_count, summary.performance.total_wall_seconds)
+    assert summary.performance.compute_hz == derive_hz(summary.frame_count, summary.performance.compute_wall_seconds)
 
 
 def test_run_pipeline_exports_latest_object_list_observation(monkeypatch, tmp_path: Path) -> None:
@@ -458,8 +489,26 @@ def test_run_pipeline_exports_latest_object_list_observation(monkeypatch, tmp_pa
     assert len(fake_writer.gt_matches) == 1
     assert fake_writer.gt_matches[0].track_id == 1
     assert fake_writer.gt_matches[0].gt_object_id == 7
+    assert fake_writer.gt_matches[0].gt_obj_class == "car"
     assert len(fake_writer.gt_unmatched_objects) == 1
     assert fake_writer.gt_unmatched_objects[0].gt_object_id == 8
+    assert fake_writer.gt_unmatched_objects[0].gt_obj_class == "van"
+    assert fake_writer.aggregate_write_metrics[0]["gt_obj_class"] == "car"
+    assert fake_writer.aggregate_write_metrics[0]["gt_obj_class_score"] == 0.95
+    assert summary.gt_class_counts == {"car": 1, "van": 1}
+    assert summary.matched_gt_class_counts == {"car": 1}
+    assert summary.class_comparison_count == 0
+    assert summary.class_match_count == 0
+    assert summary.class_mismatch_count == 0
+    assert summary.class_count_rows == [
+        {"class_name": "car", "predicted_count": 0, "gt_match_count": 1},
+        {"class_name": "TOTAL", "predicted_count": 0, "gt_match_count": 1},
+    ]
+    assert fake_writer.class_stats["gt_class_counts"] == {"car": 1, "van": 1}
+    assert fake_writer.class_stats["matched_gt_class_counts"] == {"car": 1}
+    assert fake_writer.class_stats["class_comparison_count"] == 0
+    assert fake_writer.class_stats["class_match_count"] == 0
+    assert fake_writer.class_stats["class_mismatch_count"] == 0
 
 
 def test_run_pipeline_passes_aggregate_intensity_flag_to_writer(monkeypatch, tmp_path: Path) -> None:
@@ -481,7 +530,7 @@ def test_run_pipeline_passes_aggregate_intensity_flag_to_writer(monkeypatch, tmp
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda root: fake_writer)
 
-    run_pipeline(config, tmp_path)
+    summary = run_pipeline(config, tmp_path)
 
     assert fake_writer.aggregate_write_intensity_flags == [True]
 
@@ -534,6 +583,63 @@ def test_run_pipeline_merges_articulated_vehicle_tracks(monkeypatch, tmp_path: P
     assert rear_result.metrics["merged_target_track_id"] == 11
 
 
+def test_run_pipeline_propagates_classification_to_results_and_track_outcomes(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(paths=["ignored_a.pb"]),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(root_dir=str(tmp_path)),
+        visualization=VisualizationConfig(),
+    )
+
+    fake_writer = _FakeWriter(tmp_path)
+    fake_classifier = _FakeClassifier()
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_reader", lambda cfg: _FakeReader())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: _FakeTracker())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_classifier", lambda cfg: fake_classifier)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda root: fake_writer)
+
+    summary = run_pipeline(config, tmp_path)
+
+    assert len(fake_classifier.seen_points) == 1
+    result = fake_writer.written_aggregate_results[0]
+    assert result.metrics["predicted_class_id"] == 4
+    assert result.metrics["predicted_class_name"] == "trailer"
+    assert result.metrics["predicted_class_score"] == 0.88
+    assert result.metrics["classification_backend"] == "pointnext"
+    assert result.metrics["classification_point_source"] == "result_points"
+    assert result.metrics["classification_input_point_count"] == 1
+    outcome = fake_writer.track_outcomes[1]
+    assert outcome.predicted_class_id == 4
+    assert outcome.predicted_class_name == "trailer"
+    assert outcome.predicted_class_score == 0.88
+    assert outcome.classification_backend == "pointnext"
+    assert outcome.classification_point_source == "result_points"
+    assert outcome.classification_input_point_count == 1
+    assert summary.predicted_class_counts == {"trailer": 1}
+    assert summary.matched_gt_class_counts == {}
+    assert summary.class_comparison_count == 0
+    assert summary.class_match_count == 0
+    assert summary.class_mismatch_count == 0
+    assert summary.class_count_rows == [
+        {"class_name": "trailer", "predicted_count": 1, "gt_match_count": 0},
+        {"class_name": "TOTAL", "predicted_count": 1, "gt_match_count": 0},
+    ]
+    assert fake_writer.class_stats["predicted_class_counts"] == {"trailer": 1}
+    assert fake_writer.class_stats["class_comparison_count"] == 0
+    assert fake_writer.class_stats["class_match_count"] == 0
+    assert fake_writer.class_stats["class_mismatch_count"] == 0
+    assert fake_writer.class_stats["class_count_rows"] == [
+        {"class_name": "trailer", "predicted_count": 1, "gt_match_count": 0},
+        {"class_name": "TOTAL", "predicted_count": 1, "gt_match_count": 0},
+    ]
+
+
 def test_replay_run_uses_multi_file_input_without_tracker_reset(monkeypatch, tmp_path: Path) -> None:
     config = PipelineConfig(
         input=InputConfig(paths=["ignored_a.pb", "ignored_b.pb"]),
@@ -565,6 +671,157 @@ def test_replay_run_uses_multi_file_input_without_tracker_reset(monkeypatch, tmp
     assert set(fake_viewer.aggregate_results.keys()) == {1}
     assert set(fake_viewer.track_outcomes.keys()) == {1}
     assert fake_viewer.articulated_merge_debug_events == []
+
+
+def test_replay_run_propagates_classification_to_viewer_data(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(paths=["ignored_a.pb"]),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(root_dir=str(tmp_path)),
+        visualization=VisualizationConfig(),
+    )
+
+    fake_classifier = _FakeClassifier()
+    fake_viewer = _FakeViewer()
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_reader", lambda cfg: _FakeReader())
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_tracker", lambda cfg: _FakeTracker())
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_track_postprocessors", lambda cfg: [])
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_accumulator", lambda cfg: _FakeAccumulator())
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_classifier", lambda cfg: fake_classifier)
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_viewer", lambda cfg: fake_viewer)
+
+    replay_run(config, tmp_path)
+
+    assert len(fake_classifier.seen_points) == 1
+    result = fake_viewer.aggregate_results[1]
+    assert result.metrics["predicted_class_name"] == "trailer"
+    assert result.metrics["predicted_class_score"] == 0.88
+    outcome = fake_viewer.track_outcomes[1]
+    assert outcome.predicted_class_id == 4
+    assert outcome.predicted_class_name == "trailer"
+    assert outcome.predicted_class_score == 0.88
+
+
+def test_replay_run_propagates_gt_class_to_viewer_data(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(paths=["ignored_a.pb"]),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(root_dir=str(tmp_path)),
+        visualization=VisualizationConfig(),
+    )
+
+    fake_viewer = _FakeViewer()
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_reader", lambda cfg: _FakeObjectReader())
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_tracker", lambda cfg: _FakeTracker())
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_track_postprocessors", lambda cfg: [])
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_accumulator", lambda cfg: _FakeAccumulator())
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_viewer", lambda cfg: fake_viewer)
+
+    replay_run(config, tmp_path)
+
+    result = fake_viewer.aggregate_results[1]
+    assert result.metrics["gt_obj_class"] == "car"
+    assert result.metrics["gt_obj_class_score"] == 0.95
+    outcome = fake_viewer.track_outcomes[1]
+    assert outcome.gt_obj_class == "car"
+    assert outcome.gt_obj_class_score == 0.95
+
+
+def test_run_pipeline_normalizes_class_names_in_results_and_stats(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(paths=["ignored_a.pb"]),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        class_normalization=ClassNormalizationConfig(
+            enabled=True,
+            aliases={
+                "trailer": "TLS_VEHICLE_TRUCK_WITH_TRAILER",
+                "car": "TLS_VEHICLE_CAR",
+                "van": "TLS_VEHICLE_VAN",
+            },
+        ),
+        output=OutputConfig(root_dir=str(tmp_path)),
+        visualization=VisualizationConfig(),
+    )
+
+    fake_writer = _FakeWriter(tmp_path)
+    fake_classifier = _FakeClassifier()
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_reader", lambda cfg: _FakeObjectReader())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: _FakeTracker())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_classifier", lambda cfg: fake_classifier)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda root: fake_writer)
+
+    summary = run_pipeline(config, tmp_path)
+
+    result = fake_writer.written_aggregate_results[0]
+    assert result.metrics["predicted_class_name"] == "TLS_VEHICLE_TRUCK_WITH_TRAILER"
+    assert result.metrics["gt_obj_class"] == "TLS_VEHICLE_CAR"
+    assert fake_writer.gt_matches[0].gt_obj_class == "TLS_VEHICLE_CAR"
+    assert fake_writer.gt_unmatched_objects[0].gt_obj_class == "TLS_VEHICLE_VAN"
+    assert fake_writer.object_labels[7].obj_class == "TLS_VEHICLE_CAR"
+    assert fake_writer.object_labels[8].obj_class == "TLS_VEHICLE_VAN"
+    assert summary.predicted_class_counts == {"TLS_VEHICLE_TRUCK_WITH_TRAILER": 1}
+    assert summary.gt_class_counts == {"TLS_VEHICLE_CAR": 1, "TLS_VEHICLE_VAN": 1}
+    assert summary.matched_gt_class_counts == {"TLS_VEHICLE_CAR": 1}
+    assert summary.class_comparison_count == 1
+    assert summary.class_match_count == 0
+    assert summary.class_mismatch_count == 1
+    assert summary.class_count_rows == [
+        {"class_name": "TLS_VEHICLE_CAR", "predicted_count": 0, "gt_match_count": 1},
+        {"class_name": "TLS_VEHICLE_TRUCK_WITH_TRAILER", "predicted_count": 1, "gt_match_count": 0},
+        {"class_name": "TOTAL", "predicted_count": 1, "gt_match_count": 1},
+    ]
+
+
+def test_replay_run_normalizes_class_names_before_viewer_receives_data(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(paths=["ignored_a.pb"]),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        class_normalization=ClassNormalizationConfig(
+            enabled=True,
+            aliases={
+                "trailer": "TLS_VEHICLE_TRUCK_WITH_TRAILER",
+                "car": "TLS_VEHICLE_CAR",
+            },
+        ),
+        output=OutputConfig(root_dir=str(tmp_path)),
+        visualization=VisualizationConfig(),
+    )
+
+    fake_classifier = _FakeClassifier()
+    fake_viewer = _FakeViewer()
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_reader", lambda cfg: _FakeObjectReader())
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_tracker", lambda cfg: _FakeTracker())
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_track_postprocessors", lambda cfg: [])
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_accumulator", lambda cfg: _FakeAccumulator())
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_classifier", lambda cfg: fake_classifier)
+    monkeypatch.setattr("tracking_pipeline.application.replay_run.build_viewer", lambda cfg: fake_viewer)
+
+    replay_run(config, tmp_path)
+
+    result = fake_viewer.aggregate_results[1]
+    assert result.metrics["predicted_class_name"] == "TLS_VEHICLE_TRUCK_WITH_TRAILER"
+    assert result.metrics["gt_obj_class"] == "TLS_VEHICLE_CAR"
+    outcome = fake_viewer.track_outcomes[1]
+    assert outcome.predicted_class_name == "TLS_VEHICLE_TRUCK_WITH_TRAILER"
+    assert outcome.gt_obj_class == "TLS_VEHICLE_CAR"
 
 
 def test_replay_run_passes_articulated_merge_debug_events_to_viewer(monkeypatch, tmp_path: Path) -> None:

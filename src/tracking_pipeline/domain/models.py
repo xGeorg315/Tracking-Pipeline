@@ -219,6 +219,13 @@ class AggregateResult:
 
 
 @dataclass(slots=True)
+class ClassificationPrediction:
+    class_id: int
+    class_name: str
+    score: float
+
+
+@dataclass(slots=True)
 class GTMatchResult:
     track_id: int
     gt_object_id: int | None
@@ -230,6 +237,8 @@ class GTMatchResult:
     assignment_cost: float | None
     matched: bool
     unmatched_reason: str = ""
+    gt_obj_class: str = ""
+    gt_obj_class_score: float | None = None
 
 
 @dataclass(slots=True)
@@ -249,6 +258,14 @@ class TrackOutcomeDebug:
     quality_score: float | None = None
     selected_frame_ids: list[int] = field(default_factory=list)
     tracker_debug_summary: dict[str, int] = field(default_factory=dict)
+    predicted_class_id: int | None = None
+    predicted_class_name: str = ""
+    predicted_class_score: float | None = None
+    classification_backend: str = ""
+    classification_point_source: str = ""
+    classification_input_point_count: int = 0
+    gt_obj_class: str = ""
+    gt_obj_class_score: float | None = None
 
 
 @dataclass(slots=True)
@@ -283,6 +300,8 @@ class RunPerformance:
     compute_wall_seconds: float = 0.0
     compute_cpu_seconds: float = 0.0
     io_wall_seconds: float = 0.0
+    total_hz: float = 0.0
+    compute_hz: float = 0.0
     peak_rss_mb: float | None = None
     stages: dict[str, StagePerformance] = field(default_factory=dict)
     aggregation_components: dict[str, StagePerformance] = field(default_factory=dict)
@@ -316,4 +335,11 @@ class RunSummary:
     gt_match_assignment: str = ""
     gt_match_mean_timestamp_delta_ns: float = 0.0
     gt_match_max_timestamp_delta_ns: int = 0
+    predicted_class_counts: dict[str, int] = field(default_factory=dict)
+    gt_class_counts: dict[str, int] = field(default_factory=dict)
+    matched_gt_class_counts: dict[str, int] = field(default_factory=dict)
+    class_comparison_count: int = 0
+    class_match_count: int = 0
+    class_mismatch_count: int = 0
+    class_count_rows: list[dict[str, int | str]] = field(default_factory=list)
     performance: RunPerformance | None = None

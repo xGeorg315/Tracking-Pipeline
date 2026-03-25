@@ -44,6 +44,18 @@ def build_track_outcomes(
             quality_score=None if track.quality_score is None else float(track.quality_score),
             selected_frame_ids=[] if result is None else [int(frame_id) for frame_id in result.selected_frame_ids],
             tracker_debug_summary=_track_debug_summary(track),
+            predicted_class_id=None if metrics.get("predicted_class_id") is None else int(metrics.get("predicted_class_id")),
+            predicted_class_name=str(metrics.get("predicted_class_name", "")),
+            predicted_class_score=None
+            if metrics.get("predicted_class_score") is None
+            else float(metrics.get("predicted_class_score")),
+            classification_backend=str(metrics.get("classification_backend", "")),
+            classification_point_source=str(metrics.get("classification_point_source", "")),
+            classification_input_point_count=int(metrics.get("classification_input_point_count", 0) or 0),
+            gt_obj_class=str(metrics.get("gt_obj_class", "")),
+            gt_obj_class_score=None
+            if metrics.get("gt_obj_class_score") is None
+            else float(metrics.get("gt_obj_class_score")),
         )
     return outcomes
 

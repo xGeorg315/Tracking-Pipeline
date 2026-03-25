@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import struct
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +10,7 @@ import numpy as np
 from tracking_pipeline.application.run_pipeline import run_pipeline
 from tracking_pipeline.config.loader import load_config
 from tracking_pipeline.infrastructure.readers.a42_proto import common, data, frame, label, sensors
+from tracking_pipeline.shared.ids import aggregate_file_stem
 
 
 def _pack_xyz(points: list[list[float]]) -> bytes:
@@ -93,6 +95,7 @@ def test_run_pipeline_creates_run_artifacts(tmp_path: Path) -> None:
     assert run_dir.exists()
     assert (run_dir / "config.snapshot.yaml").exists()
     assert (run_dir / "summary.json").exists()
+    assert (run_dir / "class_stats.json").exists()
     assert (run_dir / "tracks.jsonl").exists()
     assert (run_dir / "gt_matching").exists()
     assert (run_dir / "gt_matching" / "matches.jsonl").exists()
@@ -105,14 +108,27 @@ def test_run_pipeline_creates_run_artifacts(tmp_path: Path) -> None:
         for line in (run_dir / "tracks.jsonl").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+    outcome_rows = [
+        json.loads(line)
+        for line in (run_dir / "track_outcomes.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
     assert payload["tracker_algorithm"] == "euclidean_nn"
     assert payload["accumulator_algorithm"] == "voxel_fusion"
     assert payload["input_paths"] == config.input.paths
+    assert "predicted_class_counts" in payload
+    assert "gt_class_counts" in payload
+    assert "matched_gt_class_counts" in payload
+    assert "class_comparison_count" in payload
+    assert "class_match_count" in payload
+    assert "class_mismatch_count" in payload
+    assert "class_count_rows" in payload
     assert payload["gt_match_mode"] == "timestamp_only"
     assert payload["gt_match_assignment"] == "one_to_one"
     assert "performance" in payload
     assert "read_frames" in payload["performance"]["stages"]
     assert "cluster_frames" in payload["performance"]["stages"]
+    assert "classify_aggregates" in payload["performance"]["stages"]
     assert "aggregation_components" in payload["performance"]
     assert set(payload["performance"]["aggregation_components"]) == {
         "registration",
@@ -128,6 +144,16 @@ def test_run_pipeline_creates_run_artifacts(tmp_path: Path) -> None:
     assert payload["performance"]["aggregation_components"]["tail_bridge"]["wall_seconds"] == 0.0
     assert payload["performance"]["aggregation_components"]["tail_bridge"]["call_count"] == 0
     assert payload["performance"]["total_wall_seconds"] >= payload["performance"]["compute_wall_seconds"]
+    assert "total_hz" in payload["performance"]
+    assert "compute_hz" in payload["performance"]
+    expected_total_hz = 0.0
+    if payload["frame_count"] > 0 and payload["performance"]["total_wall_seconds"] > 0.0:
+        expected_total_hz = float(payload["frame_count"]) / float(payload["performance"]["total_wall_seconds"])
+    expected_compute_hz = 0.0
+    if payload["frame_count"] > 0 and payload["performance"]["compute_wall_seconds"] > 0.0:
+        expected_compute_hz = float(payload["frame_count"]) / float(payload["performance"]["compute_wall_seconds"])
+    assert abs(float(payload["performance"]["total_hz"]) - expected_total_hz) < 1e-9
+    assert abs(float(payload["performance"]["compute_hz"]) - expected_compute_hz) < 1e-9
     assert track_rows
     assert "registration_wall_seconds" in track_rows[0]["aggregation_metrics"]
     assert "post_filter_wall_seconds" in track_rows[0]["aggregation_metrics"]
@@ -201,6 +227,7 @@ def test_run_pipeline_exports_latest_object_list_artifacts(tmp_path: Path) -> No
     summary = run_pipeline(config, project_root)
     run_dir = Path(summary.output_dir)
     payload = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    class_stats_payload = json.loads((run_dir / "class_stats.json").read_text(encoding="utf-8"))
     manifest_rows = [
         json.loads(line)
         for line in (run_dir / "object_list" / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
@@ -237,7 +264,60 @@ def test_run_pipeline_exports_latest_object_list_artifacts(tmp_path: Path) -> No
     assert payload["gt_match_saved_track_count"] >= 0
     assert payload["gt_match_mode"] == "timestamp_only"
     assert payload["gt_match_assignment"] == "one_to_one"
+    assert payload["gt_class_counts"] == {"TLS_VEHICLE_CAR": 1}
+    assert class_stats_payload["gt_class_counts"] == {"TLS_VEHICLE_CAR": 1}
+    expected_matched_gt_counts = dict(
+        sorted(Counter(str(row.get("gt_obj_class", "")) for row in gt_match_rows if row.get("gt_obj_class")).items())
+    )
+    assert payload["matched_gt_class_counts"] == expected_matched_gt_counts
+    assert class_stats_payload["matched_gt_class_counts"] == expected_matched_gt_counts
+    expected_comparison_count = sum(
+        1
+        for row in track_rows
+        if row.get("aggregate_status") == "saved" and row.get("predicted_class_name") and row.get("gt_matched") is True and row.get("gt_obj_class")
+    )
+    expected_match_count = sum(
+        1
+        for row in track_rows
+        if row.get("aggregate_status") == "saved"
+        and row.get("predicted_class_name")
+        and row.get("gt_matched") is True
+        and row.get("gt_obj_class")
+        and str(row.get("predicted_class_name")) == str(row.get("gt_obj_class"))
+    )
+    assert payload["class_comparison_count"] == expected_comparison_count
+    assert payload["class_match_count"] == expected_match_count
+    assert payload["class_mismatch_count"] == expected_comparison_count - expected_match_count
+    assert class_stats_payload["class_comparison_count"] == payload["class_comparison_count"]
+    assert class_stats_payload["class_match_count"] == payload["class_match_count"]
+    assert class_stats_payload["class_mismatch_count"] == payload["class_mismatch_count"]
+    assert isinstance(payload["predicted_class_counts"], dict)
+    assert isinstance(class_stats_payload["predicted_class_counts"], dict)
+    if expected_matched_gt_counts:
+        assert any(
+            row["class_name"] == "TLS_VEHICLE_CAR"
+            and row["gt_match_count"] == expected_matched_gt_counts.get("TLS_VEHICLE_CAR", 0)
+            for row in payload["class_count_rows"]
+        )
+        assert payload["class_count_rows"][-1]["class_name"] == "TOTAL"
+    assert class_stats_payload["class_count_rows"] == payload["class_count_rows"]
     assert len(gt_match_rows) + len(unmatched_gt_rows) >= 1
     matched_track_rows = [row for row in track_rows if row.get("gt_matched") is True]
     if matched_track_rows:
         assert matched_track_rows[0]["matched_gt_pcd_path"] == "object_list/object_0007.pcd"
+        assert matched_track_rows[0]["gt_obj_class"] == "TLS_VEHICLE_CAR"
+        assert matched_track_rows[0]["gt_obj_class_score"] == 0.95
+        aggregate_payload = json.loads(
+            (run_dir / "aggregates" / f"{aggregate_file_stem(int(matched_track_rows[0]['track_id']))}.json").read_text(encoding="utf-8")
+        )
+        assert aggregate_payload["metrics"]["gt_obj_class"] == "TLS_VEHICLE_CAR"
+        assert aggregate_payload["metrics"]["gt_obj_class_score"] == 0.95
+        matched_outcomes = [row for row in outcome_rows if int(row["track_id"]) == int(matched_track_rows[0]["track_id"])]
+        assert matched_outcomes[0]["gt_obj_class"] == "TLS_VEHICLE_CAR"
+        assert matched_outcomes[0]["gt_obj_class_score"] == 0.95
+    if gt_match_rows:
+        assert gt_match_rows[0]["gt_obj_class"] == "TLS_VEHICLE_CAR"
+        assert abs(float(gt_match_rows[0]["gt_obj_class_score"]) - 0.95) < 1e-6
+    if unmatched_gt_rows:
+        assert unmatched_gt_rows[0]["gt_obj_class"] == "TLS_VEHICLE_CAR"
+        assert abs(float(unmatched_gt_rows[0]["gt_obj_class_score"]) - 0.95) < 1e-6

@@ -200,6 +200,297 @@ def test_load_config_reads_registration_underfill_fallback_settings(tmp_path: Pa
     assert config.aggregation.registration_min_kept_chunks == 5
 
 
+def test_load_config_reads_classification_settings_and_resolves_paths(tmp_path: Path) -> None:
+    fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+    pointnext_root = tmp_path / "PointNeXt"
+    (pointnext_root / "openpoints").mkdir(parents=True)
+    checkpoint_path = tmp_path / "ckpt" / "bestckpt.pth"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_bytes(b"checkpoint")
+    model_cfg_path = pointnext_root / "cfgs" / "modelnet40ply2048" / "pointnext-s.yaml"
+    model_cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    model_cfg_path.write_text(
+        "\n".join(
+            [
+                "model:",
+                "  NAME: BaseCls",
+                "  extra_global_channels: 0",
+                "  cls_args:",
+                "    NAME: ClsHead",
+                "    num_classes: 2",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config_path = tmp_path / "config_classification.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "classification:",
+                "  enabled: true",
+                "  pointnext_root: PointNeXt",
+                "  checkpoint_path: ckpt/bestckpt.pth",
+                "  model_cfg_path: PointNeXt/cfgs/modelnet40ply2048/pointnext-s.yaml",
+                "  class_names: [truck, car]",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.input.paths == [str(fixture_dst.resolve())]
+    assert config.classification.enabled is True
+    assert config.classification.pointnext_root == str(pointnext_root.resolve())
+    assert config.classification.checkpoint_path == str(checkpoint_path.resolve())
+    assert config.classification.model_cfg_path == str(model_cfg_path.resolve())
+    assert config.classification.class_names == ["car", "truck"]
+
+
+def test_load_config_rejects_enabled_classification_without_class_names(tmp_path: Path) -> None:
+    fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+    pointnext_root = tmp_path / "PointNeXt"
+    (pointnext_root / "openpoints").mkdir(parents=True)
+    checkpoint_path = tmp_path / "ckpt" / "bestckpt.pth"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_bytes(b"checkpoint")
+    model_cfg_path = tmp_path / "pointnext-s.yaml"
+    model_cfg_path.write_text(
+        "\n".join(
+            [
+                "model:",
+                "  NAME: BaseCls",
+                "  extra_global_channels: 0",
+                "  cls_args:",
+                "    NAME: ClsHead",
+                "    num_classes: 2",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config_path = tmp_path / "config_missing_class_names.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "classification:",
+                "  enabled: true",
+                f"  pointnext_root: {pointnext_root}",
+                f"  checkpoint_path: {checkpoint_path}",
+                f"  model_cfg_path: {model_cfg_path}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="classification.class_names must not be empty"):
+        load_config(config_path)
+
+    assert fixture_dst.exists()
+
+
+def test_load_config_rejects_enabled_classification_with_wrong_class_count(tmp_path: Path) -> None:
+    _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+    pointnext_root = tmp_path / "PointNeXt"
+    (pointnext_root / "openpoints").mkdir(parents=True)
+    checkpoint_path = tmp_path / "ckpt" / "bestckpt.pth"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_bytes(b"checkpoint")
+    model_cfg_path = tmp_path / "pointnext-s.yaml"
+    model_cfg_path.write_text(
+        "\n".join(
+            [
+                "model:",
+                "  NAME: BaseCls",
+                "  extra_global_channels: 0",
+                "  cls_args:",
+                "    NAME: ClsHead",
+                "    num_classes: 3",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config_path = tmp_path / "config_wrong_class_count.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "classification:",
+                "  enabled: true",
+                f"  pointnext_root: {pointnext_root}",
+                f"  checkpoint_path: {checkpoint_path}",
+                f"  model_cfg_path: {model_cfg_path}",
+                "  class_names: [car, truck]",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="classification.class_names length must match"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_enabled_classification_with_non_xyz_input_channels(tmp_path: Path) -> None:
+    _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+    pointnext_root = tmp_path / "PointNeXt"
+    (pointnext_root / "openpoints").mkdir(parents=True)
+    checkpoint_path = tmp_path / "ckpt" / "bestckpt.pth"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_bytes(b"checkpoint")
+    model_cfg_path = tmp_path / "pointnext-s.yaml"
+    model_cfg_path.write_text(
+        "\n".join(
+            [
+                "model:",
+                "  NAME: BaseCls",
+                "  extra_global_channels: 0",
+                "  encoder_args:",
+                "    in_channels: 4",
+                "  cls_args:",
+                "    NAME: ClsHead",
+                "    num_classes: 2",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config_path = tmp_path / "config_non_xyz_channels.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "classification:",
+                "  enabled: true",
+                f"  pointnext_root: {pointnext_root}",
+                f"  checkpoint_path: {checkpoint_path}",
+                f"  model_cfg_path: {model_cfg_path}",
+                "  class_names: [car, truck]",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="model.encoder_args.in_channels == 3"):
+        load_config(config_path)
+
+
+def test_load_config_accepts_mps_classification_device(tmp_path: Path) -> None:
+    _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+    pointnext_root = tmp_path / "PointNeXt"
+    openpoints_dir = pointnext_root / "openpoints"
+    openpoints_dir.mkdir(parents=True)
+    (openpoints_dir / "__init__.py").write_text("", encoding="utf-8")
+    checkpoint_path = tmp_path / "ckpt" / "bestckpt.pth"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_bytes(b"checkpoint")
+    model_cfg_path = tmp_path / "pointnext-s.yaml"
+    model_cfg_path.write_text(
+        "\n".join(
+            [
+                "model:",
+                "  NAME: BaseCls",
+                "  extra_global_channels: 0",
+                "  cls_args:",
+                "    NAME: ClsHead",
+                "    num_classes: 2",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config_path = tmp_path / "config_mps_device.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "classification:",
+                "  enabled: true",
+                f"  pointnext_root: {pointnext_root}",
+                f"  checkpoint_path: {checkpoint_path}",
+                f"  model_cfg_path: {model_cfg_path}",
+                "  class_names: [car, truck]",
+                "  device: mps",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.classification.device == "mps"
+
+
+def test_load_config_reads_class_normalization_aliases(tmp_path: Path) -> None:
+    _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+    config_path = tmp_path / "config_class_normalization.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "class_normalization:",
+                "  enabled: true",
+                "  aliases:",
+                "    PKW: TLS_VEHICLE_CAR",
+                "    car: TLS_VEHICLE_CAR",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.class_normalization.enabled is True
+    assert config.class_normalization.aliases == {
+        "PKW": "TLS_VEHICLE_CAR",
+        "car": "TLS_VEHICLE_CAR",
+    }
+
+
 def test_load_config_accepts_voxel_grid_connected_components_clusterer(tmp_path: Path) -> None:
     fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
 

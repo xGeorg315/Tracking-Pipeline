@@ -207,6 +207,74 @@ def test_outcome_hud_text_and_colors_cover_saved_and_failed_tracks() -> None:
     assert Open3DReplayViewer._outcome_label_text(active[1]) == "skip #3 min_saved_points 84/180"
 
 
+def test_prediction_labels_include_class_and_score_for_outcomes_and_aggregates() -> None:
+    events = Open3DReplayViewer._build_outcome_events(
+        {
+            7: TrackOutcomeDebug(
+                track_id=7,
+                status="saved",
+                decision_stage="saved",
+                decision_reason_code="saved",
+                decision_summary="saved points=248",
+                last_frame_id=105,
+                last_playback_index=5,
+                last_center=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+                predicted_class_name="trailer",
+                predicted_class_score=0.88,
+                gt_obj_class="LKW-Anhaenger",
+            )
+        },
+        duration_frames=2,
+    )
+    active = Open3DReplayViewer._active_outcome_events(events, playback_index=5, show_track_outcome_debug=True)
+    aggregate_result = AggregateResult(
+        track_id=7,
+        points=np.ones((2, 3), dtype=np.float32),
+        selected_frame_ids=[100],
+        status="saved",
+        metrics={
+            "predicted_class_name": "trailer",
+            "predicted_class_score": 0.88,
+            "gt_obj_class": "LKW-Anhaenger",
+        },
+    )
+
+    assert Open3DReplayViewer._outcome_label_text(active[0]) == "saved #7 trailer 0.88 | gt:LKW-Anhaenger"
+    assert Open3DReplayViewer._active_track_prediction_label_text(7, aggregate_result) == "#7 trailer 0.88 | gt:LKW-Anhaenger"
+    assert Open3DReplayViewer._aggregate_prediction_label_text(7, aggregate_result) == "agg #7 trailer 0.88 | gt:LKW-Anhaenger"
+
+
+def test_gt_only_labels_render_without_prediction() -> None:
+    events = Open3DReplayViewer._build_outcome_events(
+        {
+            8: TrackOutcomeDebug(
+                track_id=8,
+                status="saved",
+                decision_stage="saved",
+                decision_reason_code="saved",
+                decision_summary="saved points=128",
+                last_frame_id=106,
+                last_playback_index=6,
+                last_center=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+                gt_obj_class="PKW",
+            )
+        },
+        duration_frames=2,
+    )
+    active = Open3DReplayViewer._active_outcome_events(events, playback_index=6, show_track_outcome_debug=True)
+    aggregate_result = AggregateResult(
+        track_id=8,
+        points=np.ones((2, 3), dtype=np.float32),
+        selected_frame_ids=[101],
+        status="saved",
+        metrics={"gt_obj_class": "PKW"},
+    )
+
+    assert Open3DReplayViewer._outcome_label_text(active[0]) == "saved #8 gt:PKW"
+    assert Open3DReplayViewer._active_track_prediction_label_text(8, aggregate_result) == "#8 gt:PKW"
+    assert Open3DReplayViewer._aggregate_prediction_label_text(8, aggregate_result) == "agg #8 gt:PKW"
+
+
 def test_tracker_debug_hud_text_lists_frame_decisions() -> None:
     debug = FrameTrackerDebug(
         assignment_method="hungarian",

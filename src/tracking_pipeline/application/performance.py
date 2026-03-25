@@ -24,6 +24,7 @@ STAGE_NAMES = (
     "tracker_finalize",
     "postprocess_tracks",
     "accumulate_tracks",
+    "classify_aggregates",
     "match_gt",
     "write_aggregates",
     "write_object_list",
@@ -37,6 +38,7 @@ COMPUTE_STAGE_NAMES = (
     "tracker_finalize",
     "postprocess_tracks",
     "accumulate_tracks",
+    "classify_aggregates",
     "match_gt",
 )
 IO_STAGE_NAMES = (
@@ -77,6 +79,14 @@ def build_component_snapshot(
     }
 
 
+def derive_hz(frame_count: int, seconds: float) -> float:
+    frames = int(frame_count)
+    elapsed_seconds = float(seconds)
+    if frames <= 0 or elapsed_seconds <= 0.0:
+        return 0.0
+    return float(frames) / elapsed_seconds
+
+
 @dataclass(slots=True)
 class PerformanceProfiler:
     _stage_wall: dict[str, float] = field(default_factory=lambda: defaultdict(float))
@@ -114,6 +124,8 @@ class PerformanceProfiler:
             compute_wall_seconds=compute_wall_seconds,
             compute_cpu_seconds=compute_cpu_seconds,
             io_wall_seconds=io_wall_seconds,
+            total_hz=0.0,
+            compute_hz=0.0,
             peak_rss_mb=_peak_rss_mb(),
             stages=stages,
             aggregation_components=build_component_snapshot(),

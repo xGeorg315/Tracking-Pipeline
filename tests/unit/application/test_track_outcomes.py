@@ -32,6 +32,14 @@ def test_build_track_outcomes_uses_track_and_aggregate_result_fields() -> None:
             "decision_stage": "quality_gate",
             "decision_reason_code": "quality_threshold",
             "decision_summary": "quality 0.42<0.50",
+            "predicted_class_id": 3,
+            "predicted_class_name": "truck",
+            "predicted_class_score": 0.91,
+            "classification_backend": "pointnext",
+            "classification_point_source": "candidate_points_world",
+            "classification_input_point_count": 128,
+            "gt_obj_class": "car",
+            "gt_obj_class_score": 0.97,
         },
     )
     states = [
@@ -58,6 +66,14 @@ def test_build_track_outcomes_uses_track_and_aggregate_result_fields() -> None:
     assert outcome.quality_score == 0.42
     assert outcome.selected_frame_ids == [101, 102]
     assert outcome.tracker_debug_summary["matched_count"] == 3
+    assert outcome.predicted_class_id == 3
+    assert outcome.predicted_class_name == "truck"
+    assert outcome.predicted_class_score == 0.91
+    assert outcome.classification_backend == "pointnext"
+    assert outcome.classification_point_source == "candidate_points_world"
+    assert outcome.classification_input_point_count == 128
+    assert outcome.gt_obj_class == "car"
+    assert outcome.gt_obj_class_score == 0.97
 
 
 def test_build_track_outcomes_prefers_last_active_predicted_state_for_playback_position() -> None:

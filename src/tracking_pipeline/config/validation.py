@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
+from typing import Any
+
+import yaml
 
 from tracking_pipeline.config.models import BenchmarkConfig, PipelineConfig
 
@@ -43,10 +47,53 @@ SUPPORTED_REGISTRATION_BACKENDS = {
     "kiss_matcher_then_icp",
 }
 SUPPORTED_FUSION_WEIGHT_MODES = {"uniform", "point_count", "quality"}
+SUPPORTED_CLASSIFICATION_BACKENDS = {"pointnext"}
+SUPPORTED_CLASSIFICATION_DEVICES = {"auto", "cpu", "cuda", "mps"}
 
 
 class ConfigError(ValueError):
     """Raised when the pipeline configuration is invalid."""
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _read_yaml(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
+
+
+def _resolve_support_path(value: str | Path, config: PipelineConfig) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path.resolve()
+    base_dir = None if config.config_path is None else config.config_path.parent
+    candidates: list[Path] = []
+    if base_dir is not None:
+        candidates.append(base_dir / path)
+        if base_dir.parent != base_dir:
+            candidates.append(base_dir.parent / path)
+    candidates.append(Path.cwd() / path)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return candidates[0].resolve()
+
+
+def _load_classification_model_cfg(config: PipelineConfig) -> dict[str, Any]:
+    cfg_path = _resolve_support_path(config.classification.model_cfg_path, config)
+    raw = _read_yaml(cfg_path)
+    base_path = cfg_path.with_name("default.yaml")
+    if cfg_path.name != "default.yaml" and base_path.exists():
+        raw = _deep_merge(_read_yaml(base_path), raw)
+    return raw
 
 
 def validate_config(config: PipelineConfig) -> None:
@@ -69,6 +116,10 @@ def validate_config(config: PipelineConfig) -> None:
         raise ConfigError(f"Unsupported registration backend: {config.aggregation.registration_backend}")
     if config.aggregation.fusion_weight_mode not in SUPPORTED_FUSION_WEIGHT_MODES:
         raise ConfigError(f"Unsupported fusion weight mode: {config.aggregation.fusion_weight_mode}")
+    if config.classification.backend not in SUPPORTED_CLASSIFICATION_BACKENDS:
+        raise ConfigError(f"Unsupported classification backend: {config.classification.backend}")
+    if config.classification.device not in SUPPORTED_CLASSIFICATION_DEVICES:
+        raise ConfigError(f"Unsupported classification device: {config.classification.device}")
     if not isinstance(config.aggregation.symmetry_completion, bool):
         raise ConfigError("aggregation.symmetry_completion must be a boolean")
     if not isinstance(config.aggregation.motion_deskew, bool):
@@ -159,6 +210,48 @@ def validate_config(config: PipelineConfig) -> None:
         raise ConfigError("clustering sensor neighbor windows must be >= 0")
     if config.clustering.sensor_ground_row_ignore < 0:
         raise ConfigError("clustering.sensor_ground_row_ignore must be >= 0")
+    if not isinstance(config.classification.enabled, bool):
+        raise ConfigError("classification.enabled must be a boolean")
+    if not isinstance(config.class_normalization.enabled, bool):
+        raise ConfigError("class_normalization.enabled must be a boolean")
+    if not isinstance(config.class_normalization.aliases, dict):
+        raise ConfigError("class_normalization.aliases must be a mapping")
+    for raw_name, canonical_name in config.class_normalization.aliases.items():
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise ConfigError("class_normalization.aliases keys must be non-empty strings")
+        if not isinstance(canonical_name, str) or not canonical_name.strip():
+            raise ConfigError("class_normalization.aliases values must be non-empty strings")
+    if config.classification.enabled:
+        pointnext_root = _resolve_support_path(config.classification.pointnext_root, config)
+        checkpoint_path = _resolve_support_path(config.classification.checkpoint_path, config)
+        model_cfg_path = _resolve_support_path(config.classification.model_cfg_path, config)
+        if not pointnext_root.exists() or not pointnext_root.is_dir():
+            raise ConfigError(f"classification.pointnext_root does not exist: {pointnext_root}")
+        if not checkpoint_path.exists() or not checkpoint_path.is_file():
+            raise ConfigError(f"classification.checkpoint_path does not exist: {checkpoint_path}")
+        if not model_cfg_path.exists() or not model_cfg_path.is_file():
+            raise ConfigError(f"classification.model_cfg_path does not exist: {model_cfg_path}")
+        if not config.classification.class_names:
+            raise ConfigError("classification.class_names must not be empty when classification.enabled is true")
+        if any(not str(class_name).strip() for class_name in config.classification.class_names):
+            raise ConfigError("classification.class_names must not contain empty values")
+
+        model_cfg = _load_classification_model_cfg(config)
+        model_data = model_cfg.get("model") or {}
+        cls_args = model_data.get("cls_args") or {}
+        expected_num_classes = cls_args.get("num_classes")
+        if expected_num_classes is not None and len(config.classification.class_names) != int(expected_num_classes):
+            raise ConfigError(
+                "classification.class_names length must match the PointNeXt model num_classes "
+                f"({int(expected_num_classes)})"
+            )
+        extra_global_channels = int(model_data.get("extra_global_channels", 0) or 0)
+        if extra_global_channels != 0:
+            raise ConfigError("PointNeXt classification currently supports only model.extra_global_channels == 0")
+        encoder_args = model_data.get("encoder_args") or {}
+        in_channels = int(encoder_args.get("in_channels", 3) or 0)
+        if in_channels != 3:
+            raise ConfigError("PointNeXt classification currently supports only model.encoder_args.in_channels == 3")
 
 
 def validate_benchmark_config(config: BenchmarkConfig) -> None:

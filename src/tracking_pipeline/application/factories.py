@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tracking_pipeline.application.ports import Accumulator, ArtifactWriter, Clusterer, FrameReader, ReplayViewer, TrackPostprocessor, Tracker
+from tracking_pipeline.application.ports import Accumulator, ArtifactWriter, Clusterer, FrameReader, ObjectClassifier, ReplayViewer, TrackPostprocessor, Tracker
 from tracking_pipeline.config.models import PipelineConfig
 from tracking_pipeline.domain.value_objects import LaneBox
 from tracking_pipeline.infrastructure.aggregation.occupancy_consensus_fusion import OccupancyConsensusFusionAccumulator
 from tracking_pipeline.infrastructure.aggregation.registration_voxel_fusion import RegistrationVoxelFusionAccumulator
 from tracking_pipeline.infrastructure.aggregation.voxel_fusion import VoxelFusionAccumulator
 from tracking_pipeline.infrastructure.aggregation.weighted_voxel_fusion import WeightedVoxelFusionAccumulator
+from tracking_pipeline.infrastructure.classification.pointnext_classifier import PointNextObjectClassifier
 from tracking_pipeline.infrastructure.clustering.dbscan_clusterer import DBSCANClusterer
 from tracking_pipeline.infrastructure.clustering.euclidean_clustering import EuclideanClusteringClusterer
 from tracking_pipeline.infrastructure.clustering.ground_removed_dbscan import GroundRemovedDBSCANClusterer
@@ -115,6 +116,14 @@ def build_accumulator(config: PipelineConfig) -> Accumulator:
     if algorithm == "occupancy_consensus_fusion":
         return OccupancyConsensusFusionAccumulator(config.aggregation, config.output, config.tracking)
     raise ValueError(f"Unsupported accumulator: {algorithm}")
+
+
+def build_classifier(config: PipelineConfig) -> ObjectClassifier | None:
+    if not config.classification.enabled:
+        return None
+    if config.classification.backend == "pointnext":
+        return PointNextObjectClassifier(config.classification)
+    raise ValueError(f"Unsupported classifier: {config.classification.backend}")
 
 
 def build_artifact_writer(project_root: Path) -> ArtifactWriter:

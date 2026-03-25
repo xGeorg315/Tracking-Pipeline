@@ -40,3 +40,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+filterwarnings = [
+  "ignore:Pandas requires version '.*' or newer of 'numexpr'.*:UserWarning",
+  "ignore:Pandas requires version '.*' or newer of 'bottleneck'.*:UserWarning",
+]

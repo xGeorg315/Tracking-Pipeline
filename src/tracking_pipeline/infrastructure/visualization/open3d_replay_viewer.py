@@ -32,6 +32,9 @@ class _OutcomeEvent:
     playback_end_index: int
     frame_index: int
     center: np.ndarray
+    predicted_class_name: str = ""
+    predicted_class_score: float | None = None
+    gt_obj_class: str = ""
 
 
 @dataclass(slots=True)
@@ -424,6 +427,7 @@ class Open3DReplayViewer:
             track_id = int(active_track.track_id)
             active_track_ids.add(track_id)
             outcome_event = active_outcome_by_track.get(track_id)
+            aggregate_result = aggregate_results.get(track_id)
             is_saved_flash = outcome_event is not None and outcome_event.status == "saved"
             cluster_color = self._track_color(track_id)
             highlight_color = self._outcome_color(outcome_event) if outcome_event is not None else tuple(cluster_color)
@@ -481,6 +485,16 @@ class Open3DReplayViewer:
                 ui_state.active_3d_labels.append(label)
                 if ui_state.show_track_outcome_debug and outcome_event.status != "saved":
                     self._add_outcome_tail(scene_widget, ui_state, states, outcome_event)
+            elif aggregate_result is not None:
+                prediction_label = self._active_track_prediction_label_text(track_id, aggregate_result)
+                if prediction_label:
+                    label = scene_widget.add_3d_label(
+                        np.asarray(active_track.center, dtype=np.float32),
+                        prediction_label,
+                    )
+                    label.color = self._gui_color(rendered_highlight_color)
+                    label.scale = 0.95
+                    ui_state.active_3d_labels.append(label)
 
             if track_id in self._visible_aggregate_track_ids(frame, aggregate_results, ui_state.show_aggregate):
                 aggregate_result = aggregate_results[track_id]
@@ -496,6 +510,17 @@ class Open3DReplayViewer:
                     aggregate_pcd,
                     self._point_material((1.0, 0.20, 0.20), point_size=2.6, use_vertex_colors=aggregate_colors is not None),
                 )
+                aggregate_label = self._aggregate_prediction_label_text(track_id, aggregate_result)
+                if aggregate_label:
+                    label_center = (
+                        np.mean(aggregate_points, axis=0, dtype=np.float32)
+                        if len(aggregate_points) > 0
+                        else np.asarray(active_track.center, dtype=np.float32)
+                    )
+                    label = scene_widget.add_3d_label(np.asarray(label_center, dtype=np.float32), aggregate_label)
+                    label.color = gui.Color(1.00, 0.45, 0.45)
+                    label.scale = 0.95
+                    ui_state.active_3d_labels.append(label)
 
         if ui_state.show_tracker_debug and frame.tracker_debug is not None:
             self._render_tracker_debug_overlay(scene_widget, ui_state, frame)
@@ -693,6 +718,11 @@ class Open3DReplayViewer:
                 playback_end_index=end_index,
                 frame_index=int(outcome.last_frame_id),
                 center=np.asarray(outcome.last_center, dtype=np.float32).copy(),
+                predicted_class_name=str(outcome.predicted_class_name or ""),
+                predicted_class_score=None
+                if outcome.predicted_class_score is None
+                else float(outcome.predicted_class_score),
+                gt_obj_class=str(outcome.gt_obj_class or ""),
             )
             for playback_index in range(start_index, end_index + 1):
                 events_by_frame.setdefault(int(playback_index), []).append(event)
@@ -848,9 +878,60 @@ class Open3DReplayViewer:
 
     @staticmethod
     def _outcome_label_text(event: _OutcomeEvent) -> str:
+        prediction_suffix = Open3DReplayViewer._classification_suffix(
+            event.predicted_class_name,
+            event.predicted_class_score,
+            event.gt_obj_class,
+        )
         if event.status == "saved":
-            return f"saved #{int(event.track_id)}"
-        return f"skip #{int(event.track_id)} {event.decision_summary}"
+            return f"saved #{int(event.track_id)}{prediction_suffix}"
+        return f"skip #{int(event.track_id)} {event.decision_summary}{prediction_suffix}"
+
+    @staticmethod
+    def _prediction_suffix(class_name: str, score: float | None) -> str:
+        if not class_name:
+            return ""
+        if score is None or not np.isfinite(float(score)):
+            return f" {str(class_name)}"
+        return f" {str(class_name)} {float(score):.2f}"
+
+    @classmethod
+    def _classification_suffix(cls, predicted_class_name: str, predicted_class_score: float | None, gt_obj_class: str) -> str:
+        prediction_suffix = cls._prediction_suffix(predicted_class_name, predicted_class_score)
+        gt_class = str(gt_obj_class or "")
+        if prediction_suffix and gt_class:
+            return f"{prediction_suffix} | gt:{gt_class}"
+        if gt_class:
+            return f" gt:{gt_class}"
+        return prediction_suffix
+
+    @classmethod
+    def _active_track_prediction_label_text(cls, track_id: int, aggregate_result: AggregateResult | None) -> str:
+        if aggregate_result is None:
+            return ""
+        metrics = aggregate_result.metrics or {}
+        suffix = cls._classification_suffix(
+            str(metrics.get("predicted_class_name", "")),
+            None if metrics.get("predicted_class_score") is None else float(metrics.get("predicted_class_score")),
+            str(metrics.get("gt_obj_class", "")),
+        )
+        if not suffix:
+            return ""
+        return f"#{int(track_id)}{suffix}"
+
+    @classmethod
+    def _aggregate_prediction_label_text(cls, track_id: int, aggregate_result: AggregateResult | None) -> str:
+        if aggregate_result is None:
+            return ""
+        metrics = aggregate_result.metrics or {}
+        suffix = cls._classification_suffix(
+            str(metrics.get("predicted_class_name", "")),
+            None if metrics.get("predicted_class_score") is None else float(metrics.get("predicted_class_score")),
+            str(metrics.get("gt_obj_class", "")),
+        )
+        if not suffix:
+            return ""
+        return f"agg #{int(track_id)}{suffix}"
 
     @staticmethod
     def _articulated_merge_color(event: ArticulatedMergeDebugEvent, playback_index: int, final_only: bool = False) -> tuple[float, float, float]:

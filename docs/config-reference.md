@@ -7,6 +7,7 @@ Diese Seite beschreibt die YAML-Konfiguration der Pipeline auf Basis der aktuell
 - `tracking-pipeline run -c <preset>.yaml` laedt das angegebene YAML und merged es automatisch mit `base.yaml` im selben Verzeichnis.
 - Der Merge ist ein **Deep Merge**: nur ueberschriebene Schluessel werden ersetzt.
 - Relative `input.paths` werden relativ zur Config-Datei aufgeloest.
+- Relative `classification.pointnext_root`, `classification.checkpoint_path` und `classification.model_cfg_path` werden zuerst relativ zur Config-Datei, dann relativ zu deren Parent und zuletzt relativ zum aktuellen Arbeitsverzeichnis aufgeloest.
 - `input.paths` akzeptiert Dateien und Ordner. Ordner werden nicht rekursiv durchsucht; alle direkten `.pb`-Dateien werden lexikographisch nach Dateiname als eine Multi-File-Sequenz expandiert.
 - Benchmark-Configs loesen `sequences` und `presets` ebenfalls relativ zur Manifestdatei auf.
 - `benchmark.sequences` akzeptiert ebenfalls Dateien und Ordner. Ein Ordner repraesentiert genau eine Sequenz und wird erst pro Benchmark-Lauf zu seinen direkten `.pb`-Dateien expandiert.
@@ -214,6 +215,44 @@ output:
 | `enable_trajectory_smoothing` | `false` | aktiviert Glaettung der Track-Zentren |
 | `smoothing_window` | `3` | Fensterbreite fuer Glaettung |
 | `enable_track_quality_scoring` | `true` | berechnet Track-Qualitaet vor der Aggregation |
+
+## `classification`
+
+| Feld | Default | Bedeutung |
+| --- | --- | --- |
+| `enabled` | `false` | schaltet die optionale Objektklassifikation nach der finalen Aggregation ein |
+| `backend` | `pointnext` | Klassifikationsbackend; aktuell nur PointNeXt |
+| `pointnext_root` | `PointNeXt` | Root des eingecheckten PointNeXt-Repos; `openpoints` muss darunter importierbar sein |
+| `checkpoint_path` | `ckpt/bestckpt.pth` | Checkpoint fuer die Inferenz |
+| `model_cfg_path` | `PointNeXt/cfgs/modelnet40ply2048/pointnext-s.yaml` | PointNeXt-Model-Config fuer Build und `num_points` |
+| `class_names` | `[]` | fixe Klassenliste; beim Laden und in der PointNeXt-Initialisierung wird sie auf `sorted(class_dir.name)` normalisiert |
+| `device` | `auto` | `auto`, `cpu`, `cuda` oder `mps`; `auto` nutzt zuerst CUDA, sonst MPS, sonst CPU |
+
+Wichtige Einschraenkungen:
+
+- Die aktuelle Inferenz verwendet nur `xyz` und erwartet deshalb `model.encoder_args.in_channels == 3`.
+- `model.extra_global_channels` muss `0` sein; zusaetzliche globale Features aus dem Trainings-Dataloader werden in v1 bewusst nicht unterstuetzt.
+- Wenn `classification.enabled=true` und `PointNeXt/openpoints` leer oder nicht importierbar ist, bricht die Pipeline frueh mit einer klaren Fehlermeldung ab.
+- `device: mps` benoetigt eine PyTorch-Version, die MPS fuer deine aktuelle macOS-Version korrekt freischaltet; bei neueren macOS-Releases kann dafuer ein Torch-Upgrade noetig sein.
+
+## `class_normalization`
+
+| Feld | Default | Bedeutung |
+| --- | --- | --- |
+| `enabled` | `false` | aktiviert die Klassen-Normalisierung auf eine gemeinsame Zieltaxonomie |
+| `aliases` | `{}` | Mapping von rohen Klassenamen auf kanonische Zielnamen; Lookup ist case-insensitive und trimmt Whitespace |
+
+Typischer Einsatz:
+
+- Modellklassen wie `PKW`, `LKW` oder `Transporter` auf TLS-Klassen mappen
+- GT-Labels wie `car`, `truck` oder `van` auf dieselbe TLS-Taxonomie mappen
+- dadurch Statistik, Viewer und Exporte im selben Klassenraum halten
+
+Wichtige Semantik:
+
+- die Normalisierung schreibt bestehende Felder wie `predicted_class_name` und `gt_obj_class` bewusst um
+- unbekannte Klassen bleiben unveraendert
+- `TLS_VEHICLE_OTHER` wird nicht automatisch aus unbekannten Prediction-Klassen erzeugt; dafuer braucht es einen expliziten Alias
 
 ## `output`
 

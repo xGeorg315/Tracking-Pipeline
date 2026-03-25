@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import numpy as np
 
+from tracking_pipeline.application.class_normalization import ClassNormalizer
 from tracking_pipeline.application.gt_matching import apply_gt_matches_to_results, match_saved_aggregates_to_gt
+from tracking_pipeline.config.models import ClassNormalizationConfig
 from tracking_pipeline.domain.models import AggregateResult, ObjectLabelData, Track
 
 
@@ -33,6 +35,8 @@ def _gt_label(object_id: int, *, frame_index: int, timestamp_ns: int) -> ObjectL
         object_id=int(object_id),
         timestamp_ns=int(timestamp_ns),
         points=np.array([[float(object_id), 0.0, 0.0]], dtype=np.float32),
+        obj_class=f"class_{int(object_id)}",
+        obj_class_score=0.5 + 0.01 * float(object_id),
         frame_index=int(frame_index),
         source_path="fixture.pb",
         sensor_name="sensor_a",
@@ -55,6 +59,7 @@ def test_gt_matching_assigns_saved_tracks_one_to_one_by_min_timestamp_delta() ->
     assert unmatched_saved == []
     assert unmatched_gt == []
     assert {(match.track_id, match.gt_object_id) for match in matches} == {(1, 7), (2, 8)}
+    assert {(match.track_id, match.gt_obj_class) for match in matches} == {(1, "class_7"), (2, "class_8")}
     assert summary["gt_match_saved_track_count"] == 2
     assert summary["gt_match_matched_count"] == 2
 
@@ -99,6 +104,7 @@ def test_gt_matching_marks_extra_gt_objects_as_unmatched() -> None:
     assert unmatched_saved == []
     assert len(unmatched_gt) == 1
     assert unmatched_gt[0].gt_object_id == 9
+    assert unmatched_gt[0].gt_obj_class == "class_9"
     assert unmatched_gt[0].unmatched_reason == "unmatched_gt"
     assert summary["gt_match_unmatched_gt_count"] == 1
 
@@ -139,4 +145,22 @@ def test_gt_matching_only_annotates_saved_results() -> None:
 
     assert saved.metrics["gt_matched"] is True
     assert saved.metrics["gt_object_id"] == 7
+    assert saved.metrics["gt_obj_class"] == "class_7"
+    assert abs(float(saved.metrics["gt_obj_class_score"]) - 0.57) < 1e-6
     assert "gt_matched" not in skipped.metrics
+
+
+def test_gt_matching_normalizes_gt_class_names_when_normalizer_is_provided() -> None:
+    tracks = {1: _saved_track(1, frame_id=10, timestamp_ns=100)}
+    saved = _saved_result(1)
+    labels = {7: _gt_label(7, frame_index=10, timestamp_ns=99)}
+    labels[7].obj_class = "car"
+    normalizer = ClassNormalizer.from_config(
+        ClassNormalizationConfig(enabled=True, aliases={"car": "TLS_VEHICLE_CAR"})
+    )
+
+    matches, unmatched_saved, _, _ = match_saved_aggregates_to_gt(tracks, [saved], labels, normalizer)
+    apply_gt_matches_to_results([saved], matches, unmatched_saved)
+
+    assert matches[0].gt_obj_class == "TLS_VEHICLE_CAR"
+    assert saved.metrics["gt_obj_class"] == "TLS_VEHICLE_CAR"

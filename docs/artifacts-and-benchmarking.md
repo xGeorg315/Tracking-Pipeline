@@ -9,6 +9,7 @@ Ein typischer Run unter `runs/<timestamp>_<tracker>_<accumulator>/` sieht so aus
 ```text
 runs/<run_name>/
 ├── config.snapshot.yaml
+├── class_stats.json
 ├── summary.json
 ├── tracker_debug.jsonl
 ├── track_outcomes.jsonl
@@ -45,7 +46,28 @@ Wichtige Felder:
 | `registration_rejected` | abgelehnte Registrierungen |
 | `aggregate_status_counts` | Statusverteilung ueber alle Tracks |
 | `track_quality_mean` | mittlere Track-Qualitaet |
+| `predicted_class_counts` | Klassenverteilung der final gespeicherten Net-Vorhersagen; bei aktiver Klassen-Normalisierung im kanonischen Zielraum |
+| `gt_class_counts` | Klassenverteilung der vorhandenen GT-Objektlabels im Run; bei aktiver Klassen-Normalisierung im kanonischen Zielraum |
+| `matched_gt_class_counts` | Klassenverteilung nur ueber gematchte Saved-Tracks; bei aktiver Klassen-Normalisierung im kanonischen Zielraum |
+| `class_comparison_count` | Anzahl gematchter Saved-Tracks mit gesetzter Prediction- und GT-Klasse, die direkt verglichen wurden |
+| `class_match_count` | Anzahl dieser Vergleiche, bei denen Prediction und GT dieselbe Klasse haben |
+| `class_mismatch_count` | Anzahl dieser Vergleiche, bei denen Prediction und GT unterschiedliche Klassen haben |
+| `class_count_rows` | tabellarische Zeilen fuer `Class | Net | GT matches` inklusive `TOTAL` |
 | `output_dir` | Zielverzeichnis des Runs |
+
+## `class_stats.json`
+
+`class_stats.json` enthaelt dieselbe kompakte Klassenstatistik wie `summary.json`, aber separat als leicht auswertbare Datei:
+
+- `predicted_class_counts`: Anzahl gespeicherter Aggregate pro vorhergesagter Klasse
+- `gt_class_counts`: Anzahl vorhandener GT-Objektlabels pro GT-Klasse
+- `matched_gt_class_counts`: Anzahl gematchter Saved-Tracks pro GT-Klasse
+- `class_comparison_count`: Anzahl direkter Klassenvergleiche zwischen Prediction und GT
+- `class_match_count`: Anzahl gleicher Klassen unter diesen Vergleichen
+- `class_mismatch_count`: Anzahl ungleicher Klassen unter diesen Vergleichen
+- `class_count_rows`: tabellarische Zeilen fuer CLI und Datei-Auswertung
+
+`predicted_class_counts` zaehlt nur finale `saved`-Aggregate mit gesetzter `predicted_class_name`. `gt_class_counts` basiert auf den exportierten, nicht-leeren GT-Objektlabels des Runs. `matched_gt_class_counts` und die GT-Spalte in `class_count_rows` zaehlen dagegen nur gematchte Saved-Tracks. `class_comparison_count`, `class_match_count` und `class_mismatch_count` betrachten ebenfalls nur gematchte Saved-Tracks, bei denen sowohl Prediction als auch GT-Klasse vorhanden sind. Wenn `class_normalization.enabled=true`, werden Prediction und GT vorher auf dieselbe Zieltaxonomie normalisiert.
 
 ### `summary.json.performance`
 
@@ -58,11 +80,14 @@ Seit der Performance-Erweiterung schreibt `run` ein verschachteltes `performance
 | `compute_wall_seconds` | Wall-Zeit der Rechenstages |
 | `compute_cpu_seconds` | CPU-Zeit der Rechenstages |
 | `io_wall_seconds` | Wall-Zeit von Lesen und Schreiben |
+| `total_hz` | End-to-End-Durchsatz in Frames pro Sekunde (`frame_count / total_wall_seconds`) |
+| `compute_hz` | Compute-Durchsatz in Frames pro Sekunde (`frame_count / compute_wall_seconds`) |
 | `peak_rss_mb` | maximaler Resident Set Size in MB |
-| `stages` | Timing pro Stage, z. B. `cluster_frames`, `tracker_steps`, `accumulate_tracks` |
+| `stages` | Timing pro Stage, z. B. `cluster_frames`, `tracker_steps`, `accumulate_tracks`, `classify_aggregates` |
 | `aggregation_components` | aufsummierte Teilzeiten der Aggregation fuer `registration`, `fusion_core`, `post_filter`, `tail_bridge`, `confidence_cap`, `symmetry_completion`, `fusion_post`, `fusion_total` |
 
 `compute_cpu_seconds` misst nur die eigentlichen Compute-Stages, nicht den gesamten Run.
+`compute_hz` kann deshalb hoeher sein als `total_hz`, weil Lesen und Schreiben nicht enthalten sind.
 
 `accumulate_tracks` bleibt die uebergeordnete Stage-Zeit. Sie kann groesser sein als `registration + fusion_total`, weil Selektion, Vorbereitung und andere Logik davor bzw. dazwischen bewusst nicht in den Teilkomponenten stecken.
 
@@ -91,6 +116,9 @@ Top-Level-Felder:
 | `last_center` | letzter Track-Zentrumspunkt |
 | `selected_frame_ids` | Chunks/Frames, die in die Aggregation eingegangen sind |
 | `aggregate_status` | `saved` oder Skip-/Empty-Status |
+| `predicted_class_id` / `predicted_class_name` / `predicted_class_score` | optionale PointNeXt-Top-1-Vorhersage fuer das finale Aggregat; `predicted_class_name` kann bei aktiver Klassen-Normalisierung bereits kanonisch sein |
+| `classification_backend` / `classification_point_source` / `classification_input_point_count` | Debug-Kontext zur Klassifikation |
+| `gt_obj_class` / `gt_obj_class_score` | optionale GT-Klasse des gematchten Objektlabels fuer gespeicherte Tracks; bei aktiver Klassen-Normalisierung kanonisch |
 | `aggregation_metrics` | Detailmetriken der Aggregation |
 
 ## `tracker_debug.jsonl`
@@ -129,6 +157,9 @@ Wichtige Felder:
 | `ended_by_missed` | ob der Track durch Misses finalisiert wurde |
 | `quality_score` | finaler Track-Qualitaetswert |
 | `selected_frame_ids` | Frames, die fuer die Aggregation selektiert wurden |
+| `predicted_class_id` / `predicted_class_name` / `predicted_class_score` | optionale PointNeXt-Vorhersage fuer Replay-Labels; `predicted_class_name` kann bei aktiver Klassen-Normalisierung kanonisch sein |
+| `classification_backend` / `classification_point_source` / `classification_input_point_count` | Debug-Kontext zur Klassifikation |
+| `gt_obj_class` / `gt_obj_class_score` | optionale GT-Klasse des gematchten Objektlabels fuer Replay-Labels; bei aktiver Klassen-Normalisierung kanonisch |
 | `tracker_debug_summary` | Spawn-/Match-/Miss-Summen des Track-Lifecycles |
 
 Das ist die schnellste Datei, um zu sehen, warum ein Track nicht gespeichert wurde, ohne erst alle Frame-Logs zu lesen.
@@ -154,6 +185,9 @@ Das ist die schnellste Datei, um zu sehen, warum ein Track nicht gespeichert wur
 | `component_count_post_fusion` | Anzahl Komponenten nach Fusion |
 | `tail_bridge_count` | erzeugte Bridge-Punkte fuer Long Vehicles |
 | `mode` | `local` oder `world` |
+| `predicted_class_id` / `predicted_class_name` / `predicted_class_score` | optionale PointNeXt-Top-1-Vorhersage im Aggregat; `predicted_class_name` kann bei aktiver Klassen-Normalisierung kanonisch sein |
+| `classification_backend` / `classification_point_source` / `classification_input_point_count` | Backend, verwendete Punktquelle (`result_points` oder `candidate_points_world`) und Rohpunktzahl fuer die Inferenz |
+| `gt_obj_class` / `gt_obj_class_score` | optionale GT-Klasse des gematchten Objektlabels; nur fuer gematchte gespeicherte Tracks vorhanden und bei aktiver Klassen-Normalisierung kanonisch |
 | `registration_wall_seconds` / `registration_cpu_seconds` | Zeit fuer `_prepare_for_fusion(...)` bei registrierungsbasierten Akkumulatoren |
 | `fusion_core_wall_seconds` / `fusion_core_cpu_seconds` | reine Zeit der Voxel-Akkumulation (`_fuse_chunks`) |
 | `post_filter_wall_seconds` / `post_filter_cpu_seconds` | Zeit fuer `_post_filter(...)` inklusive optionalem Statistical Outlier Removal und `aggregate_voxel` |
@@ -229,7 +263,7 @@ Zu jeder gespeicherten Punktwolke existiert eine JSON-Datei mit:
 - `track_id`
 - `status`
 - `selected_frame_ids`
-- `metrics`
+- `metrics` inklusive optionaler Klassifikations- und GT-Felder wie `predicted_class_name` oder `gt_obj_class`
 
 Diese Datei ist die leichteste Stelle, um Aggregate-Metriken ohne PCD-Parser zu lesen.
 
@@ -241,6 +275,17 @@ Falls Objektlabels im Input vorhanden sind, wird zusaetzlich `object_list/` gesc
 - `manifest.jsonl`
 
 Das ist bewusst getrennt von den Track-Aggregaten und bleibt XYZ-only.
+
+## `gt_matching/`
+
+Falls GT-Objektlabels vorhanden sind, wird zusaetzlich `gt_matching/` geschrieben:
+
+- `matches.jsonl`
+- `unmatched_saved_tracks.jsonl`
+- `unmatched_gt_objects.jsonl`
+- `summary.json`
+
+`matches.jsonl` und `unmatched_gt_objects.jsonl` enthalten neben IDs und Zeitstempeln auch `gt_obj_class` und `gt_obj_class_score`, falls das Objektlabel eine Klasse traegt.
 
 ## Benchmark-Artefakte
 
@@ -291,6 +336,7 @@ Performancewerte werden als Median/Min/Max ueber die `measure_runs` geschrieben.
 | Feldtyp | Beispiel |
 | --- | --- |
 | Gesamtzeiten | `total_wall_seconds_median`, `compute_cpu_seconds_max` |
+| Durchsatz | `total_hz_median`, `compute_hz_max` |
 | normalisierte Zeiten | `wall_ms_per_frame_median`, `accumulate_wall_ms_per_track_median` |
 | Stage-Zeiten | `stage_cluster_frames_wall_seconds_median` |
 
@@ -308,6 +354,7 @@ Gruppiert Presets nach:
 - schnellsten Gesamtlaeufen
 - rechenintensivsten Presets
 - speicherintensivsten Presets
+- inklusive `Total Hz` und `Compute Hz` als zusaetzliche Durchsatzspalten
 
 ### `performance_components.md`
 
@@ -315,7 +362,7 @@ Komponentenvergleich auf zwei Ebenen:
 
 - deskriptive Gruppierung nach Komponentenfamilien
 - gematchte Vergleiche bei gleicher Restkonfiguration
-- inklusive `ICP/Registration`, `Fusion Total`, `Post-Filter`, `Tail-Bridge`, `Conf-Cap` und `Symmetry` fuer direkte Laufzeitvergleiche
+- inklusive `Total Hz`, `Compute Hz`, `ICP/Registration`, `Fusion Total`, `Post-Filter`, `Tail-Bridge`, `Conf-Cap` und `Symmetry` fuer direkte Laufzeitvergleiche
 
 Das ist die beste Stelle fuer Fragen wie:
 

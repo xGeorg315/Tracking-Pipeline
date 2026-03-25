@@ -6,14 +6,23 @@ from pathlib import Path
 from tracking_pipeline.application.factories import (
     build_accumulator,
     build_artifact_writer,
+    build_classifier,
     build_clusterer,
     build_lane_box,
     build_reader,
     build_track_postprocessors,
     build_tracker,
 )
+from tracking_pipeline.application.classification import classify_aggregate_results
+from tracking_pipeline.application.class_normalization import ClassNormalizer
+from tracking_pipeline.application.class_statistics import build_class_statistics
 from tracking_pipeline.application.gt_matching import apply_gt_matches_to_results, match_saved_aggregates_to_gt
-from tracking_pipeline.application.performance import AGGREGATION_COMPONENT_NAMES, PerformanceProfiler, build_component_snapshot
+from tracking_pipeline.application.performance import (
+    AGGREGATION_COMPONENT_NAMES,
+    PerformanceProfiler,
+    build_component_snapshot,
+    derive_hz,
+)
 from tracking_pipeline.application.track_outcomes import build_track_outcomes
 from tracking_pipeline.config.models import PipelineConfig
 from tracking_pipeline.domain.models import AggregateResult, ObjectLabelData, RunPerformance, RunSummary
@@ -21,6 +30,7 @@ from tracking_pipeline.domain.models import AggregateResult, ObjectLabelData, Ru
 
 def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
     profiler = PerformanceProfiler()
+    class_normalizer = ClassNormalizer.from_config(config.class_normalization)
     with profiler.stage("build_components"):
         lane_box = build_lane_box(config)
         reader = build_reader(config)
@@ -28,6 +38,7 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
         tracker = build_tracker(config)
         postprocessors = build_track_postprocessors(config)
         accumulator = build_accumulator(config)
+        classifier = build_classifier(config)
         writer = build_artifact_writer(project_root)
 
     with profiler.stage("prepare_output"):
@@ -46,9 +57,10 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
             if len(object_label.points) == 0:
                 object_list_skipped_empty += 1
                 continue
+            normalized_object_label = class_normalizer.normalize_object_label(object_label)
             current = latest_object_labels.get(int(object_label.object_id))
-            if _is_newer_object_label(object_label, current):
-                latest_object_labels[int(object_label.object_id)] = object_label
+            if _is_newer_object_label(normalized_object_label, current):
+                latest_object_labels[int(object_label.object_id)] = normalized_object_label
         with profiler.stage("cluster_frames"):
             cluster_result = clusterer.cluster(frame, lane_box)
         with profiler.stage("tracker_steps"):
@@ -89,17 +101,21 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
     if hasattr(accumulator, "merge_long_vehicle_aggregates"):
         with profiler.stage("accumulate_tracks"):
             aggregate_results = accumulator.merge_long_vehicle_aggregates(tracks, aggregate_results, lane_box)
-    for result in aggregate_results:
-        if result.status == "saved":
-            with profiler.stage("write_aggregates"):
-                writer.write_aggregate(run_dir, result, save_intensity=config.output.save_aggregate_intensity)
+    with profiler.stage("classify_aggregates"):
+        aggregate_results = classify_aggregate_results(aggregate_results, classifier, class_normalizer)
     with profiler.stage("match_gt"):
         matched_gt, unmatched_saved_tracks, unmatched_gt_objects, gt_match_summary = match_saved_aggregates_to_gt(
             tracks,
             aggregate_results,
             latest_object_labels,
+            class_normalizer,
         )
         apply_gt_matches_to_results(aggregate_results, matched_gt, unmatched_saved_tracks)
+    class_stats = build_class_statistics(aggregate_results, latest_object_labels, class_normalizer)
+    for result in aggregate_results:
+        if result.status == "saved":
+            with profiler.stage("write_aggregates"):
+                writer.write_aggregate(run_dir, result, save_intensity=config.output.save_aggregate_intensity)
     track_outcomes = build_track_outcomes(tracks, aggregate_results, tracker_states)
 
     with profiler.stage("write_object_list"):
@@ -136,22 +152,32 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
         gt_match_assignment=str(gt_match_summary["gt_match_assignment"]),
         gt_match_mean_timestamp_delta_ns=float(gt_match_summary["gt_match_mean_timestamp_delta_ns"]),
         gt_match_max_timestamp_delta_ns=int(gt_match_summary["gt_match_max_timestamp_delta_ns"]),
+        predicted_class_counts=dict(class_stats["predicted_class_counts"]),
+        gt_class_counts=dict(class_stats["gt_class_counts"]),
+        matched_gt_class_counts=dict(class_stats["matched_gt_class_counts"]),
+        class_comparison_count=int(class_stats["class_comparison_count"]),
+        class_match_count=int(class_stats["class_match_count"]),
+        class_mismatch_count=int(class_stats["class_mismatch_count"]),
+        class_count_rows=[dict(row) for row in class_stats["class_count_rows"]],
         performance=_snapshot_with_aggregation_components(
             profiler,
             aggregation_component_wall,
             aggregation_component_cpu,
             aggregation_component_calls,
+            len(frames),
         ),
     )
     with profiler.stage("write_tracks"):
         writer.write_tracks(run_dir, tracks, aggregate_results)
         writer.write_tracker_debug(run_dir, tracker_states)
         writer.write_track_outcomes(run_dir, track_outcomes)
+        writer.write_class_stats(run_dir, class_stats)
     summary.performance = _snapshot_with_aggregation_components(
         profiler,
         aggregation_component_wall,
         aggregation_component_cpu,
         aggregation_component_calls,
+        summary.frame_count,
     )
     with profiler.stage("write_summary"):
         writer.write_summary(run_dir, summary)
@@ -161,6 +187,7 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
         aggregation_component_wall,
         aggregation_component_cpu,
         aggregation_component_calls,
+        summary.frame_count,
     )
     writer.write_summary(run_dir, summary)
     return summary
@@ -209,7 +236,10 @@ def _snapshot_with_aggregation_components(
     wall_totals: dict[str, float],
     cpu_totals: dict[str, float],
     call_totals: dict[str, int],
+    frame_count: int,
 ) -> RunPerformance:
     snapshot = profiler.snapshot()
     snapshot.aggregation_components = build_component_snapshot(wall_totals, cpu_totals, call_totals)
+    snapshot.total_hz = derive_hz(frame_count, snapshot.total_wall_seconds)
+    snapshot.compute_hz = derive_hz(frame_count, snapshot.compute_wall_seconds)
     return snapshot

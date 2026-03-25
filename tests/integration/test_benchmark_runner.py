@@ -59,6 +59,8 @@ def test_benchmark_runner_writes_proxy_reports(tmp_path: Path) -> None:
         assert "long_vehicle_saved_count" in row
         assert row["performance_samples"] == 2
         assert "total_wall_seconds_median" in row
+        assert "total_hz_median" in row
+        assert "compute_hz_median" in row
         assert "aggregation_registration_wall_seconds_median" in row
         assert "aggregation_post_filter_wall_seconds_median" in row
         assert "aggregation_tail_bridge_wall_seconds_median" in row
@@ -81,6 +83,15 @@ def test_benchmark_runner_writes_proxy_reports(tmp_path: Path) -> None:
     assert "aggregation_confidence_cap_wall_seconds" in perf_rows[0]
     assert "aggregation_symmetry_completion_wall_seconds" in perf_rows[0]
     assert "aggregation_fusion_total_wall_seconds" in perf_rows[0]
+    assert "total_hz" in perf_rows[0]
+    assert "compute_hz" in perf_rows[0]
+
+    performance_markdown = (output_dir / "performance_leaderboard.md").read_text(encoding="utf-8")
+    component_markdown = (output_dir / "performance_components.md").read_text(encoding="utf-8")
+    assert "Total Hz Median" in performance_markdown
+    assert "Compute Hz Median" in performance_markdown
+    assert "Total Hz Median" in component_markdown
+    assert "Compute Hz Median" in component_markdown
 
 
 def test_benchmark_runner_records_registration_time_only_for_registration_presets(tmp_path: Path) -> None:

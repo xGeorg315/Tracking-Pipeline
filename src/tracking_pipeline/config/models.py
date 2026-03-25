@@ -139,6 +139,23 @@ class PostprocessingConfig:
 
 
 @dataclass(slots=True)
+class ClassificationConfig:
+    enabled: bool = False
+    backend: str = "pointnext"
+    pointnext_root: str = "PointNeXt"
+    checkpoint_path: str = "ckpt/bestckpt.pth"
+    model_cfg_path: str = "PointNeXt/cfgs/modelnet40ply2048/pointnext-s.yaml"
+    class_names: list[str] = field(default_factory=list)
+    device: str = "auto"
+
+
+@dataclass(slots=True)
+class ClassNormalizationConfig:
+    enabled: bool = False
+    aliases: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class OutputConfig:
     root_dir: str = "runs"
     save_world: bool = False
@@ -168,6 +185,8 @@ class PipelineConfig:
     tracking: TrackingConfig = field(default_factory=TrackingConfig)
     aggregation: AggregationConfig = field(default_factory=AggregationConfig)
     postprocessing: PostprocessingConfig = field(default_factory=PostprocessingConfig)
+    classification: ClassificationConfig = field(default_factory=ClassificationConfig)
+    class_normalization: ClassNormalizationConfig = field(default_factory=ClassNormalizationConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
     config_path: Path | None = None

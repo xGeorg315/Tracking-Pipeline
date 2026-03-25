@@ -10,6 +10,8 @@ from tracking_pipeline.config.models import (
     AggregationConfig,
     BenchmarkConfig,
     ClusteringConfig,
+    ClassificationConfig,
+    ClassNormalizationConfig,
     InputConfig,
     OutputConfig,
     PipelineConfig,
@@ -64,6 +66,24 @@ def resolve_input_paths(values: list[str | Path], base_dir: Path, *, field_name:
     return resolved_paths
 
 
+def _resolve_support_path(value: str | Path, config_path: Path) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path.resolve()
+    candidates = [config_path.parent / path]
+    if config_path.parent.parent != config_path.parent:
+        candidates.append(config_path.parent.parent / path)
+    candidates.append(Path.cwd() / path)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return candidates[0].resolve()
+
+
+def _sorted_class_names(values: list[str] | tuple[str, ...]) -> list[str]:
+    return sorted(str(value) for value in values)
+
+
 def load_config(path: str | Path) -> PipelineConfig:
     cfg_path = Path(path).resolve()
     raw = _read_yaml(cfg_path)
@@ -74,6 +94,21 @@ def load_config(path: str | Path) -> PipelineConfig:
 
     input_cfg = dict(raw["input"])
     input_cfg["paths"] = resolve_input_paths(input_cfg.get("paths", []), cfg_path.parent, field_name="input.paths")
+    classification_defaults = ClassificationConfig()
+    classification_cfg = dict(raw.get("classification", {}))
+    classification_cfg["pointnext_root"] = str(
+        _resolve_support_path(classification_cfg.get("pointnext_root", classification_defaults.pointnext_root), cfg_path)
+    )
+    classification_cfg["checkpoint_path"] = str(
+        _resolve_support_path(classification_cfg.get("checkpoint_path", classification_defaults.checkpoint_path), cfg_path)
+    )
+    classification_cfg["model_cfg_path"] = str(
+        _resolve_support_path(classification_cfg.get("model_cfg_path", classification_defaults.model_cfg_path), cfg_path)
+    )
+    classification_cfg["class_names"] = _sorted_class_names(
+        classification_cfg.get("class_names", classification_defaults.class_names)
+    )
+    class_normalization_cfg = dict(raw.get("class_normalization", {}))
 
     config = PipelineConfig(
         input=InputConfig(**input_cfg),
@@ -82,6 +117,8 @@ def load_config(path: str | Path) -> PipelineConfig:
         tracking=TrackingConfig(**raw.get("tracking", {})),
         aggregation=AggregationConfig(**raw.get("aggregation", {})),
         postprocessing=PostprocessingConfig(**raw.get("postprocessing", {})),
+        classification=ClassificationConfig(**classification_cfg),
+        class_normalization=ClassNormalizationConfig(**class_normalization_cfg),
         output=OutputConfig(**raw.get("output", {})),
         visualization=VisualizationConfig(**raw.get("visualization", {})),
         config_path=cfg_path,

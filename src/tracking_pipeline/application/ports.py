@@ -3,10 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol
 
+import numpy as np
+
 from tracking_pipeline.config.models import PipelineConfig
 from tracking_pipeline.domain.models import (
     AggregateResult,
     ArticulatedMergeDebugEvent,
+    ClassificationPrediction,
     ClusterResult,
     FrameData,
     FrameTrackingState,
@@ -57,8 +60,15 @@ class ArtifactWriter(Protocol):
     ) -> None: ...
     def write_tracker_debug(self, run_dir: Path, states: list[FrameTrackingState]) -> None: ...
     def write_track_outcomes(self, run_dir: Path, track_outcomes: dict[int, TrackOutcomeDebug]) -> None: ...
+    def write_class_stats(self, run_dir: Path, class_stats: dict[str, object]) -> None: ...
     def write_summary(self, run_dir: Path, summary: RunSummary) -> None: ...
     def write_tracks(self, run_dir: Path, tracks: dict[int, Track], aggregate_results: list[AggregateResult]) -> None: ...
+
+
+class ObjectClassifier(Protocol):
+    backend: str
+
+    def classify_points(self, points: np.ndarray) -> ClassificationPrediction: ...
 
 
 class ReplayViewer(Protocol):

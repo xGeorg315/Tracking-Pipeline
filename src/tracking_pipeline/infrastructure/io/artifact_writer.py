@@ -110,8 +110,11 @@ class JsonArtifactWriter:
         self.manifest_writer.write_jsonl(run_dir / "tracker_debug.jsonl", rows)
 
     def write_track_outcomes(self, run_dir: Path, track_outcomes: dict[int, TrackOutcomeDebug]) -> None:
-        rows = [asdict(track_outcomes[track_id]) for track_id in sorted(track_outcomes)]
+        rows = [self._track_outcome_row(track_outcomes[track_id]) for track_id in sorted(track_outcomes)]
         self.manifest_writer.write_jsonl(run_dir / "track_outcomes.jsonl", rows)
+
+    def write_class_stats(self, run_dir: Path, class_stats: dict[str, object]) -> None:
+        self.manifest_writer.write_json(run_dir / "class_stats.json", dict(class_stats))
 
     def write_tracks(self, run_dir: Path, tracks: dict[int, Track], aggregate_results: list[AggregateResult]) -> None:
         by_track_id = {result.track_id: result for result in aggregate_results}
@@ -156,6 +159,10 @@ class JsonArtifactWriter:
                     row["gt_frame_index"] = int(result_metrics.get("gt_frame_index"))
                 if result_metrics.get("gt_unmatched_reason"):
                     row["gt_unmatched_reason"] = str(result_metrics.get("gt_unmatched_reason"))
+            if result_metrics.get("gt_obj_class"):
+                row["gt_obj_class"] = str(result_metrics.get("gt_obj_class"))
+            if result_metrics.get("gt_obj_class_score") is not None and result_metrics.get("gt_obj_class"):
+                row["gt_obj_class_score"] = float(result_metrics.get("gt_obj_class_score"))
             if articulated_vehicle:
                 row["articulated_vehicle"] = True
                 row["articulated_component_track_ids"] = list(
@@ -189,5 +196,38 @@ class JsonArtifactWriter:
                 row["long_vehicle_lead_track_id"] = int(result_metrics.get("long_vehicle_lead_track_id"))
             if result_metrics.get("long_vehicle_local_anchor_value_world") is not None:
                 row["long_vehicle_local_anchor_value_world"] = float(result_metrics.get("long_vehicle_local_anchor_value_world"))
+            if result_metrics.get("predicted_class_id") is not None:
+                row["predicted_class_id"] = int(result_metrics.get("predicted_class_id"))
+            if result_metrics.get("predicted_class_name"):
+                row["predicted_class_name"] = str(result_metrics.get("predicted_class_name"))
+            if result_metrics.get("predicted_class_score") is not None:
+                row["predicted_class_score"] = float(result_metrics.get("predicted_class_score"))
+            if result_metrics.get("classification_backend"):
+                row["classification_backend"] = str(result_metrics.get("classification_backend"))
+            if result_metrics.get("classification_point_source"):
+                row["classification_point_source"] = str(result_metrics.get("classification_point_source"))
+            if result_metrics.get("classification_input_point_count") is not None and result_metrics.get("predicted_class_name"):
+                row["classification_input_point_count"] = int(result_metrics.get("classification_input_point_count"))
             rows.append(row)
         self.manifest_writer.write_jsonl(run_dir / "tracks.jsonl", rows)
+
+    @staticmethod
+    def _track_outcome_row(outcome: TrackOutcomeDebug) -> dict[str, object]:
+        row = asdict(outcome)
+        if row.get("predicted_class_id") is None:
+            row.pop("predicted_class_id", None)
+        if not row.get("predicted_class_name"):
+            row.pop("predicted_class_name", None)
+        if row.get("predicted_class_score") is None:
+            row.pop("predicted_class_score", None)
+        if not row.get("classification_backend"):
+            row.pop("classification_backend", None)
+        if not row.get("classification_point_source"):
+            row.pop("classification_point_source", None)
+        if not row.get("classification_input_point_count"):
+            row.pop("classification_input_point_count", None)
+        if not row.get("gt_obj_class"):
+            row.pop("gt_obj_class", None)
+        if row.get("gt_obj_class_score") is None:
+            row.pop("gt_obj_class_score", None)
+        return row

@@ -4,6 +4,7 @@ from dataclasses import asdict
 
 import numpy as np
 
+from tracking_pipeline.application.class_normalization import ClassNormalizer
 from tracking_pipeline.domain.models import AggregateResult, GTMatchResult, ObjectLabelData, Track
 from tracking_pipeline.infrastructure.tracking.assignment import assign_cost_matrix
 
@@ -12,6 +13,7 @@ def match_saved_aggregates_to_gt(
     tracks: dict[int, Track],
     aggregate_results: list[AggregateResult],
     latest_object_labels: dict[int, ObjectLabelData],
+    class_normalizer: ClassNormalizer | None = None,
 ) -> tuple[list[GTMatchResult], list[GTMatchResult], list[GTMatchResult], dict[str, int | float | str]]:
     saved_results = sorted(
         [result for result in aggregate_results if str(result.status) == "saved"],
@@ -35,6 +37,8 @@ def match_saved_aggregates_to_gt(
                 assignment_cost=None,
                 matched=False,
                 unmatched_reason="unmatched_gt",
+                gt_obj_class=_normalize_gt_class_name(str(label.obj_class or ""), class_normalizer),
+                gt_obj_class_score=float(label.obj_class_score),
             )
             for label in gt_labels
         ]
@@ -77,6 +81,8 @@ def match_saved_aggregates_to_gt(
                 gt_frame_index=int(label.frame_index),
                 assignment_cost=float(timestamp_cost[int(row), col]),
                 matched=True,
+                gt_obj_class=_normalize_gt_class_name(str(label.obj_class or ""), class_normalizer),
+                gt_obj_class_score=float(label.obj_class_score),
             )
         )
 
@@ -107,6 +113,8 @@ def match_saved_aggregates_to_gt(
             assignment_cost=None,
             matched=False,
             unmatched_reason="unmatched_gt",
+            gt_obj_class=_normalize_gt_class_name(str(gt_labels[int(col)].obj_class or ""), class_normalizer),
+            gt_obj_class_score=float(gt_labels[int(col)].obj_class_score),
         )
         for col in sorted(unmatched_cols)
     ]
@@ -135,8 +143,19 @@ def apply_gt_matches_to_results(
             result.metrics["gt_timestamp_delta_ns"] = int(match.timestamp_delta_ns)
             result.metrics["gt_frame_index"] = int(match.gt_frame_index)
             result.metrics["gt_assignment_cost"] = float(match.assignment_cost)
+            result.metrics.pop("gt_unmatched_reason", None)
+            if match.gt_obj_class:
+                result.metrics["gt_obj_class"] = str(match.gt_obj_class)
+            else:
+                result.metrics.pop("gt_obj_class", None)
+            if match.gt_obj_class_score is not None:
+                result.metrics["gt_obj_class_score"] = float(match.gt_obj_class_score)
+            else:
+                result.metrics.pop("gt_obj_class_score", None)
         else:
             result.metrics["gt_unmatched_reason"] = str(match.unmatched_reason)
+            result.metrics.pop("gt_obj_class", None)
+            result.metrics.pop("gt_obj_class_score", None)
 
 
 def match_rows(matches: list[GTMatchResult]) -> list[dict[str, object]]:
@@ -171,6 +190,12 @@ def _track_last_timestamp_ns(track: Track) -> int:
     if track.frame_timestamps_ns:
         return int(track.frame_timestamps_ns[-1])
     return int(track.last_frame)
+
+
+def _normalize_gt_class_name(class_name: str, class_normalizer: ClassNormalizer | None) -> str:
+    if class_normalizer is None:
+        return str(class_name or "")
+    return class_normalizer.normalize(class_name)
 
 
 def _summary_metrics(saved_results: list[GTMatchResult], unmatched_gt: list[GTMatchResult] | None = None) -> dict[str, int | float | str]:

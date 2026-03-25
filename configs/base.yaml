@@ -38,7 +38,7 @@ tracking:
   association_size_weight: 0.05
 aggregation:
   algorithm: voxel_fusion
-  symmetry_completion: true
+  symmetry_completion: false
   motion_deskew: true
   truncate_after_lane_end_touch: true
   frame_selection_method: auto
@@ -91,6 +91,31 @@ postprocessing:
   enable_trajectory_smoothing: false
   smoothing_window: 3
   enable_track_quality_scoring: true
+classification:
+  enabled: true
+  backend: pointnext
+  pointnext_root: PointNeXt
+  checkpoint_path: ckpt/bestckpt.pth
+  model_cfg_path: PointNeXt/cfgs/modelnet40ply2048/pointnext-s.yaml
+  class_names: [PKW, LKW, Bus, Motorrad, Sattelzugmaschine, Transporter, LKW-Anhänger, PKW-Anhänger]
+  device: cpu
+class_normalization:
+  enabled: true
+  aliases:
+    PKW: TLS_VEHICLE_CAR
+    PKW-Anhänger: TLS_VEHICLE_CAR_WITH_TRAILER
+    LKW: TLS_VEHICLE_TRUCK
+    LKW-Anhänger: TLS_VEHICLE_TRUCK_WITH_TRAILER
+    Sattelzugmaschine: TLS_VEHICLE_SEMI_TRAILER_TRUCK
+    Transporter: TLS_VEHICLE_VAN
+    Bus: TLS_VEHICLE_BUS
+    Motorrad: TLS_VEHICLE_MOTORBIKE
+    car: TLS_VEHICLE_CAR
+    truck: TLS_VEHICLE_TRUCK
+    van: TLS_VEHICLE_VAN
+    bus: TLS_VEHICLE_BUS
+    motorbike: TLS_VEHICLE_MOTORBIKE
+    motorcycle: TLS_VEHICLE_MOTORBIKE
 output:
   root_dir: runs
   save_world: false
