@@ -17,7 +17,20 @@ Kurz gesagt: `pb -> clustering -> tracking -> aggregation -> artifacts/replay`.
 
 ### Installation
 
+Python `3.10+` wird benoetigt. Empfohlen ist ein frisches virtuelles Environment:
+
 ```bash
+./scripts/setup.sh
+```
+
+Das Skript bevorzugt `python3.12`, faellt lokal aber auf `python3.10` zurueck und installiert das Projekt in `.venv`.
+
+Manuell geht es auch:
+
+```bash
+python3.10 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip setuptools wheel
 pip install -e .
 ```
 
@@ -32,6 +45,16 @@ Mit Dev- und Benchmark-Extras:
 ```bash
 pip install -e '.[dev,registration,benchmark]'
 ```
+
+Klassifikation ist standardmaessig deaktiviert. Wenn du sie aktivieren willst, brauchst du zusaetzlich ein passendes PointNeXt-Checkout, einen Checkpoint und eine installierte PyTorch-Version.
+
+PointNeXt kann in dieselbe `.venv` integriert werden:
+
+```bash
+./scripts/setup_pointnext.sh
+```
+
+Das Skript initialisiert das `openpoints`-Submodul und installiert eine CPU-taugliche PointNeXt-Inferenzumgebung in die bestehende `.venv`. Fuer echte Klassifikation brauchst du danach weiterhin einen passenden Checkpoint unter `ckpt/`.
 
 ### Pipeline ausfuehren
 

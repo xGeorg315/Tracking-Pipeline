@@ -1,7 +1,6 @@
 input:
   paths:
-    - ../data/medium # 115 Vehicles
-    # - ../data/medium_energy # 159 Vehicles
+    - ../data/medium
 tracking:
   algorithm: kalman_nn
   max_dist: 7.5
@@ -14,24 +13,27 @@ tracking:
   association_size_weight: 0.05
 aggregation:
   algorithm: registration_voxel_fusion
-  registration_backend: icp_point_to_plane
+  registration_backend: small_gicp
   frame_selection_method: keyframe_motion
-  keyframe_keep: 8
+  use_all_frames: false
+  top_k_frames: 6
+  keyframe_keep: 5
+  frame_downsample_voxel: 0.12
   enable_registration_underfill_fallback: true
   enable_tail_bridge: false
   enable_post_filter_stat_outlier_removal: true
   registration_min_kept_chunks: 2
-  registration_max_iter: 30
+  registration_max_iter: 12
   registration_max_translation: 3.5
   registration_min_fitness: 0.3
-  registration_max_corr_dist: 0.5
+  registration_max_corr_dist: 0.45
   shape_consistency_filter: false
   truncate_after_lane_end_touch: true
   enable_confidence_point_cap: false
   confidence_point_cap_max_points: 2048
   confidence_point_cap_bins: 16
 postprocessing:
-  enable_trajectory_smoothing: false 
+  enable_trajectory_smoothing: false
   enable_articulated_vehicle_merge: true
   articulated_gap_eval_window_frames: 5
   articulated_min_overlap_frames: 3

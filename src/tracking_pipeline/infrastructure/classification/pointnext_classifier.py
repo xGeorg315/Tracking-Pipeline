@@ -7,12 +7,16 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import numpy as np
-import torch
 import yaml
 
 from tracking_pipeline.config.models import ClassificationConfig
 from tracking_pipeline.config.validation import ConfigError
 from tracking_pipeline.domain.models import ClassificationPrediction
+
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
 
 
 class _AttrDict(dict):
@@ -60,6 +64,11 @@ class PointNextObjectClassifier:
     backend = "pointnext"
 
     def __init__(self, config: ClassificationConfig):
+        if torch is None:
+            raise ConfigError(
+                "PyTorch ist nicht installiert. Installiere die optionalen Klassifikationsabhaengigkeiten, "
+                "bevor du classification.enabled=true verwendest."
+            )
         self.config = config
         self.pointnext_root = Path(config.pointnext_root).resolve()
         self.checkpoint_path = Path(config.checkpoint_path).resolve()

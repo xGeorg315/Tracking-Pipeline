@@ -9,7 +9,6 @@ from tracking_pipeline.infrastructure.aggregation.occupancy_consensus_fusion imp
 from tracking_pipeline.infrastructure.aggregation.registration_voxel_fusion import RegistrationVoxelFusionAccumulator
 from tracking_pipeline.infrastructure.aggregation.voxel_fusion import VoxelFusionAccumulator
 from tracking_pipeline.infrastructure.aggregation.weighted_voxel_fusion import WeightedVoxelFusionAccumulator
-from tracking_pipeline.infrastructure.classification.pointnext_classifier import PointNextObjectClassifier
 from tracking_pipeline.infrastructure.clustering.dbscan_clusterer import DBSCANClusterer
 from tracking_pipeline.infrastructure.clustering.euclidean_clustering import EuclideanClusteringClusterer
 from tracking_pipeline.infrastructure.clustering.ground_removed_dbscan import GroundRemovedDBSCANClusterer
@@ -122,6 +121,8 @@ def build_classifier(config: PipelineConfig) -> ObjectClassifier | None:
     if not config.classification.enabled:
         return None
     if config.classification.backend == "pointnext":
+        from tracking_pipeline.infrastructure.classification.pointnext_classifier import PointNextObjectClassifier
+
         return PointNextObjectClassifier(config.classification)
     raise ValueError(f"Unsupported classifier: {config.classification.backend}")
 

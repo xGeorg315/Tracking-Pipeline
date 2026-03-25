@@ -1,7 +1,12 @@
 betterproto<2,>=1.2.5
+dbscan
 numpy>=1.26
 open3d>=0.18
 PyYAML>=6.0
+scipy>=1.10
+
+[benchmark]
+hdbscan>=0.8
 
 [dev]
 pytest>=8.0
