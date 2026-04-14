@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from collections import deque
 import copy
+from dataclasses import dataclass
 import math
 import threading
 import time
@@ -15,6 +16,14 @@ from tracking_pipeline.domain.rules import axis_to_index, track_exit_line_value
 from tracking_pipeline.domain.value_objects import LaneBox
 
 _NSEC_PER_SEC = 1_000_000_000
+
+
+@dataclass(slots=True)
+class _PendingFrame:
+    sequence_id: int
+    frame: FrameData
+    cluster_result: ClusterResult
+    tracking_state: FrameTrackingState
 
 
 class LiveFramePublisher:
@@ -34,6 +43,7 @@ class LiveFramePublisher:
         run_label: str = "",
         max_frames: int | None = None,
         reader_status_provider: Callable[[], dict[str, object]] | None = None,
+        async_publish: bool = True,
     ) -> None:
         self._lane_box = lane_box
         self._track_exit_line_axis = str(track_exit_line_axis)
@@ -55,11 +65,17 @@ class LiveFramePublisher:
         self._show_track_outcomes = bool(show_track_outcomes)
         self._run_label = str(run_label)
         self._reader_status_provider = reader_status_provider
+        self._async_publish = bool(async_publish)
         self._lock = threading.Lock()
+        self._publish_condition = threading.Condition(self._lock)
         self._frames: deque[dict[str, Any]] = deque()
         self._sequence_id = 0
         self._track_outcome_version = 0
         self._track_outcomes: list[dict[str, Any]] = []
+        self._pending_frame: _PendingFrame | None = None
+        self._worker_busy = False
+        self._closed = False
+        self._publish_thread: threading.Thread | None = None
         self._status: dict[str, Any] = {
             "pipeline_phase": "waiting_for_frames",
             "processed_frames": 0,
@@ -69,9 +85,20 @@ class LiveFramePublisher:
             "finished_track_count": 0,
             "saved_aggregates": 0,
             "interrupted": False,
+            "live_web_pending_frame": False,
+            "live_web_worker_busy": False,
+            "live_web_dropped_frame_count": 0,
+            "live_web_latest_sequence_id": -1,
             "updated_at_unix_sec": float(time.time()),
         }
         self._summary: dict[str, Any] = {}
+        if self._async_publish:
+            self._publish_thread = threading.Thread(
+                target=self._publish_worker_main,
+                name="tracking_pipeline_live_frame_publisher",
+                daemon=True,
+            )
+            self._publish_thread.start()
 
     def update_status(self, **updates: object) -> None:
         if not updates:
@@ -125,26 +152,25 @@ class LiveFramePublisher:
         cluster_result: ClusterResult,
         tracking_state: FrameTrackingState,
     ) -> int:
-        points, _intensity = self._select_points(frame, cluster_result, tracking_state)
-        capped_points, _capped_intensity = _cap_points(points, None, self._max_points)
-
-        payload = {
-            "sequence_id": -1,
-            "frame_index": int(frame.frame_index),
-            "timestamp_ns": int(frame.timestamp_ns),
-            "point_count": int(len(capped_points)),
-            "points_xyz_encoding": "f16",
-            "points_xyz_b64": _serialize_float16_base64(capped_points),
-            "detections": _serialize_detection_states(cluster_result, tracking_state),
-            "track_states": _serialize_track_states(tracking_state),
-        }
-        with self._lock:
-            self._sequence_id += 1
-            payload["sequence_id"] = int(self._sequence_id)
-            self._frames.append(payload)
-            self._prune_frames_locked(int(frame.timestamp_ns))
+        if not self._async_publish:
+            sequence_id = self._reserve_sequence_id()
+            payload = self._build_frame_payload(sequence_id, frame, cluster_result, tracking_state)
+            self._store_frame_payload(payload, int(frame.timestamp_ns))
+            return int(sequence_id)
+        with self._publish_condition:
+            sequence_id = self._reserve_sequence_id_locked()
+            if self._pending_frame is not None:
+                self._status["live_web_dropped_frame_count"] = int(self._status.get("live_web_dropped_frame_count", 0)) + 1
+            self._pending_frame = _PendingFrame(
+                sequence_id=int(sequence_id),
+                frame=frame,
+                cluster_result=cluster_result,
+                tracking_state=tracking_state,
+            )
+            self._status["live_web_pending_frame"] = True
             self._status["updated_at_unix_sec"] = float(time.time())
-            return int(self._sequence_id)
+            self._publish_condition.notify_all()
+            return int(sequence_id)
 
     def get_frame(self, sequence_id: int) -> dict[str, Any] | None:
         requested = int(sequence_id)
@@ -216,6 +242,32 @@ class LiveFramePublisher:
     def mark_stopped(self, *, pipeline_phase: str = "stopped") -> None:
         self.update_status(pipeline_phase=pipeline_phase)
 
+    def flush_pending(self, timeout: float | None = None) -> None:
+        if not self._async_publish:
+            return
+        deadline = None if timeout is None else float(time.monotonic()) + max(0.0, float(timeout))
+        with self._publish_condition:
+            while self._worker_busy or self._pending_frame is not None:
+                if deadline is None:
+                    self._publish_condition.wait()
+                    continue
+                remaining = deadline - float(time.monotonic())
+                if remaining <= 0.0:
+                    break
+                self._publish_condition.wait(timeout=remaining)
+
+    def close(self, timeout: float | None = 2.0) -> None:
+        if not self._async_publish:
+            return
+        self.flush_pending(timeout=timeout)
+        with self._publish_condition:
+            self._closed = True
+            self._publish_condition.notify_all()
+        thread = self._publish_thread
+        if isinstance(thread, threading.Thread):
+            thread.join(timeout=timeout)
+        self._publish_thread = None
+
     def _prune_frames_locked(self, newest_timestamp_ns: int) -> None:
         if self._retain_all_frames:
             return
@@ -253,6 +305,75 @@ class LiveFramePublisher:
         points = np.asarray(frame.points, dtype=np.float32)
         intensity = None if frame.point_intensity is None else np.asarray(frame.point_intensity, dtype=np.float32)
         return points, intensity
+
+    def _reserve_sequence_id(self) -> int:
+        with self._lock:
+            return self._reserve_sequence_id_locked()
+
+    def _reserve_sequence_id_locked(self) -> int:
+        self._sequence_id += 1
+        return int(self._sequence_id)
+
+    def _build_frame_payload(
+        self,
+        sequence_id: int,
+        frame: FrameData,
+        cluster_result: ClusterResult,
+        tracking_state: FrameTrackingState,
+    ) -> dict[str, Any]:
+        points, _intensity = self._select_points(frame, cluster_result, tracking_state)
+        capped_points, _capped_intensity = _cap_points(points, None, self._max_points)
+        return {
+            "sequence_id": int(sequence_id),
+            "frame_index": int(frame.frame_index),
+            "timestamp_ns": int(frame.timestamp_ns),
+            "point_count": int(len(capped_points)),
+            "points_xyz_encoding": "f16",
+            "points_xyz_b64": _serialize_float16_base64(capped_points),
+            "detections": _serialize_detection_states(cluster_result, tracking_state),
+            "track_states": _serialize_track_states(tracking_state),
+        }
+
+    def _store_frame_payload(self, payload: dict[str, Any], timestamp_ns: int) -> None:
+        with self._lock:
+            self._frames.append(payload)
+            self._prune_frames_locked(int(timestamp_ns))
+            self._status["live_web_latest_sequence_id"] = int(payload.get("sequence_id", -1))
+            self._status["updated_at_unix_sec"] = float(time.time())
+
+    def _publish_worker_main(self) -> None:
+        while True:
+            with self._publish_condition:
+                while not self._closed and self._pending_frame is None:
+                    self._publish_condition.wait()
+                if self._closed and self._pending_frame is None:
+                    self._worker_busy = False
+                    self._status["live_web_worker_busy"] = False
+                    self._status["live_web_pending_frame"] = False
+                    self._status["updated_at_unix_sec"] = float(time.time())
+                    self._publish_condition.notify_all()
+                    return
+                pending = self._pending_frame
+                self._pending_frame = None
+                self._worker_busy = pending is not None
+                self._status["live_web_pending_frame"] = self._pending_frame is not None
+                self._status["live_web_worker_busy"] = self._worker_busy
+                self._status["updated_at_unix_sec"] = float(time.time())
+            if pending is None:
+                continue
+            payload = self._build_frame_payload(
+                pending.sequence_id,
+                pending.frame,
+                pending.cluster_result,
+                pending.tracking_state,
+            )
+            self._store_frame_payload(payload, int(pending.frame.timestamp_ns))
+            with self._publish_condition:
+                self._worker_busy = False
+                self._status["live_web_pending_frame"] = self._pending_frame is not None
+                self._status["live_web_worker_busy"] = False
+                self._status["updated_at_unix_sec"] = float(time.time())
+                self._publish_condition.notify_all()
 
 
 def _cap_points(

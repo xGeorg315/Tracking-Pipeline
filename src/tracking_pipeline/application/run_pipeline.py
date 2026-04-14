@@ -667,9 +667,16 @@ def _stop_live_web_viewer(runtime) -> None:
     publisher = runtime.get("publisher")
     if isinstance(publisher, LiveFramePublisher):
         publisher.mark_stopped(pipeline_phase="stopped")
+        flush_pending = getattr(publisher, "flush_pending", None)
+        if callable(flush_pending):
+            flush_pending(timeout=0.5)
     server = runtime.get("server")
     if isinstance(server, LivePCDWebServer):
         server.stop()
+    if isinstance(publisher, LiveFramePublisher):
+        close = getattr(publisher, "close", None)
+        if callable(close):
+            close(timeout=2.0)
 
 
 def _update_live_status_reporter(reporter, **updates: object) -> None:
@@ -864,6 +871,8 @@ def _maybe_write_live_artifact_snapshot(
     save_aggregate_intensity: bool,
 ) -> None:
     if live_artifact_state is None:
+        return
+    if live_web_runtime is not None and not force:
         return
     now = time.monotonic()
     last_flush_monotonic = live_artifact_state.get("last_flush_monotonic")

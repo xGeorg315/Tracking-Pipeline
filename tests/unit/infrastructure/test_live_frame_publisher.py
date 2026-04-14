@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import threading
 import numpy as np
 
 from tracking_pipeline.domain.models import (
@@ -26,6 +27,7 @@ def _publisher(
     history_sec: float = 1.0,
     max_frames: int | None = None,
     retain_all_frames: bool = True,
+    async_publish: bool = False,
 ) -> LiveFramePublisher:
     return LiveFramePublisher(
         lane_box=LaneBox.from_values([-2.0, 2.0, 0.0, 12.0, 0.0, 3.0]),
@@ -40,6 +42,7 @@ def _publisher(
         show_track_outcomes=True,
         run_label="run_live_001",
         max_frames=max_frames,
+        async_publish=async_publish,
     )
 
 
@@ -272,6 +275,7 @@ def test_live_frame_publisher_uses_full_frame_points_when_configured() -> None:
         show_track_outcomes=True,
         run_label="run_live_001",
         max_frames=2,
+        async_publish=False,
     )
 
     publisher.publish_frame(_frame(0, 0, point_count=5), _cluster_result(), _tracking_state(0))
@@ -281,6 +285,40 @@ def test_live_frame_publisher_uses_full_frame_points_when_configured() -> None:
     assert payload["points_xyz_encoding"] == "f16"
     assert payload["point_count"] == 4
     assert len(base64.b64decode(payload["points_xyz_b64"])) == 12 * 2
+
+
+def test_live_frame_publisher_async_mode_drops_stale_pending_frames() -> None:
+    publisher = _publisher(max_points=3, history_sec=1.0, max_frames=4, async_publish=True)
+    original_serializer = live_frame_publisher_module._serialize_float16_base64
+    serializer_started = threading.Event()
+    serializer_release = threading.Event()
+
+    def _slow_serializer(values):
+        serializer_started.set()
+        serializer_release.wait(timeout=2.0)
+        return original_serializer(values)
+
+    try:
+        live_frame_publisher_module._serialize_float16_base64 = _slow_serializer
+        first_seq = publisher.publish_frame(_frame(0, 0, point_count=6), _cluster_result(), _tracking_state(0))
+        assert serializer_started.wait(timeout=2.0)
+        second_seq = publisher.publish_frame(_frame(1, 400_000_000, point_count=6), _cluster_result(), _tracking_state(1))
+        third_seq = publisher.publish_frame(_frame(2, 800_000_000, point_count=6), _cluster_result(), _tracking_state(2))
+    finally:
+        serializer_release.set()
+        live_frame_publisher_module._serialize_float16_base64 = original_serializer
+
+    publisher.flush_pending(timeout=2.0)
+    meta = publisher.current_meta()
+    publisher.close(timeout=2.0)
+
+    assert first_seq == 1
+    assert second_seq == 2
+    assert third_seq == 3
+    assert publisher.get_frame(first_seq) is not None
+    assert publisher.get_frame(second_seq) is None
+    assert publisher.get_frame(third_seq) is not None
+    assert meta["status"]["live_web_dropped_frame_count"] >= 1
 
 
 def test_live_frame_publisher_preserves_outcome_timestamp_for_unchanged_rows() -> None:

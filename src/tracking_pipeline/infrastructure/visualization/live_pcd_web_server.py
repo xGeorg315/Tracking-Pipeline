@@ -326,16 +326,16 @@ Mouse wheel: zoom
     const helpBtn = document.getElementById("helpBtn");
     const helpBox = document.getElementById("helpBox");
 
-    const META_POLL_INTERVAL_MS = 100;
-    const FRAME_BATCH_LIMIT = 6;
-    const FRAME_QUEUE_TARGET = 4;
-    const FRAME_QUEUE_MAX = 8;
+    const META_POLL_INTERVAL_MS = 40;
+    const FRAME_BATCH_LIMIT = 4;
+    const FRAME_QUEUE_TARGET = 3;
+    const FRAME_QUEUE_MAX = 6;
     const LAG_DROP_THRESHOLD = 12;
     const LAG_TAIL_KEEP = 3;
-    const PLAYBACK_IDLE_INTERVAL_MS = 78;
-    const PLAYBACK_NORMAL_INTERVAL_MS = 54;
-    const PLAYBACK_FAST_INTERVAL_MS = 34;
-    const PLAYBACK_CATCH_UP_INTERVAL_MS = 22;
+    const PLAYBACK_IDLE_INTERVAL_MS = 64;
+    const PLAYBACK_NORMAL_INTERVAL_MS = 46;
+    const PLAYBACK_FAST_INTERVAL_MS = 30;
+    const PLAYBACK_CATCH_UP_INTERVAL_MS = 18;
     const OUTCOME_VISIBILITY_SEC = 3.0;
     const MAX_VISIBLE_OUTCOMES = 5;
 
@@ -371,6 +371,9 @@ Mouse wheel: zoom
       },
       displayHz: 0,
       lastDisplayedAtMs: 0,
+      canvasPixelWidth: 0,
+      canvasPixelHeight: 0,
+      canvasDpr: 0,
     };
 
     function clamp(value, lo, hi) {
@@ -381,11 +384,24 @@ Mouse wheel: zoom
       button.classList.toggle("active", Boolean(active));
     }
 
-    function resizeCanvas() {
+    function resizeCanvas(force = false) {
       const dpr = window.devicePixelRatio || 1;
       const rect = canvas.getBoundingClientRect();
-      canvas.width = Math.max(1, Math.floor(rect.width * dpr));
-      canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+      const nextWidth = Math.max(1, Math.floor(rect.width * dpr));
+      const nextHeight = Math.max(1, Math.floor(rect.height * dpr));
+      if (
+        !force
+        && nextWidth === state.canvasPixelWidth
+        && nextHeight === state.canvasPixelHeight
+        && dpr === state.canvasDpr
+      ) {
+        return;
+      }
+      state.canvasPixelWidth = nextWidth;
+      state.canvasPixelHeight = nextHeight;
+      state.canvasDpr = dpr;
+      canvas.width = nextWidth;
+      canvas.height = nextHeight;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
 
@@ -506,7 +522,10 @@ Mouse wheel: zoom
       return result;
     }
 
-    function decodeFramePayload(payload) {
+    function materializeFramePayload(payload) {
+      if (!payload || payload.points_xyz) {
+        return payload;
+      }
       payload.points_xyz = decodeBase64Float16(payload.points_xyz_b64 || "");
       delete payload.points_xyz_b64;
       delete payload.points_xyz_encoding;
@@ -522,7 +541,7 @@ Mouse wheel: zoom
         throw new Error(`${response.status} ${response.statusText}`);
       }
       const payload = await response.json();
-      return (payload.frames || []).map((frame) => decodeFramePayload(frame));
+      return payload.frames || [];
     }
 
     function currentLag(meta = state.meta) {
@@ -799,7 +818,7 @@ Mouse wheel: zoom
         scheduleFramePump();
         return;
       }
-      state.currentFrame = nextFrame;
+      state.currentFrame = materializeFramePayload(nextFrame);
       state.displayedSeq = Number(nextFrame.sequence_id || -1);
       noteDisplayedFrame();
       scheduleRender();
@@ -1227,7 +1246,10 @@ Mouse wheel: zoom
       scheduleRender();
     }, { passive: false });
 
-    window.addEventListener("resize", scheduleRender);
+    window.addEventListener("resize", () => {
+      resizeCanvas(true);
+      scheduleRender();
+    });
 
     async function main() {
       await pollMeta(true);
@@ -1316,6 +1338,7 @@ class LivePCDWebServer:
                             "start_sequence_id": int(start_sequence_id),
                             "limit": int(clamped_limit),
                         },
+                        allow_gzip=False,
                     )
                     return
                 if path.startswith("/api/live/frame/") and path.endswith(".json"):
@@ -1337,14 +1360,14 @@ class LivePCDWebServer:
                 body = payload.encode("utf-8")
                 self._write_bytes(HTTPStatus.OK, "text/html; charset=utf-8", body)
 
-            def _write_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+            def _write_json(self, status: HTTPStatus, payload: dict[str, Any], *, allow_gzip: bool = True) -> None:
                 body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-                self._write_bytes(status, "application/json; charset=utf-8", body)
+                self._write_bytes(status, "application/json; charset=utf-8", body, allow_gzip=allow_gzip)
 
-            def _write_bytes(self, status: HTTPStatus, content_type: str, body: bytes) -> None:
+            def _write_bytes(self, status: HTTPStatus, content_type: str, body: bytes, *, allow_gzip: bool = True) -> None:
                 payload = body
                 accepted = str(self.headers.get("Accept-Encoding", ""))
-                use_gzip = "gzip" in accepted.lower() and len(body) >= 1024
+                use_gzip = allow_gzip and "gzip" in accepted.lower() and len(body) >= 1024
                 if use_gzip:
                     payload = gzip.compress(body, compresslevel=5)
                 self.send_response(int(status))

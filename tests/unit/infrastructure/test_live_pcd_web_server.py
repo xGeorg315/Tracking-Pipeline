@@ -21,6 +21,7 @@ def _publisher() -> LiveFramePublisher:
         show_tracker_debug=True,
         show_track_outcomes=False,
         run_label="embedded_live_run",
+        async_publish=False,
     )
 
 
@@ -30,7 +31,7 @@ def _dispatch(server: LivePCDWebServer, path: str) -> dict[str, object]:
     captured: dict[str, object] = {}
     handler.path = path
     handler._write_html = lambda payload: captured.update({"kind": "html", "payload": payload})
-    handler._write_json = lambda status, payload: captured.update(
+    handler._write_json = lambda status, payload, **_kwargs: captured.update(
         {"kind": "json", "status": int(status), "payload": json.loads(json.dumps(payload))}
     )
     handler.do_GET()
