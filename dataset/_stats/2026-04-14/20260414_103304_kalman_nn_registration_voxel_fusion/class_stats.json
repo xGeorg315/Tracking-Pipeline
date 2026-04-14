@@ -1,0 +1,76 @@
+{
+  "class_comparison_count": 82,
+  "class_count_rows": [
+    {
+      "class_name": "TLS_VEHICLE_CAR",
+      "gt_match_count": 37,
+      "predicted_count": 40
+    },
+    {
+      "class_name": "TLS_VEHICLE_CAR_WITH_TRAILER",
+      "gt_match_count": 0,
+      "predicted_count": 3
+    },
+    {
+      "class_name": "TLS_VEHICLE_MOTORBIKE",
+      "gt_match_count": 0,
+      "predicted_count": 2
+    },
+    {
+      "class_name": "TLS_VEHICLE_OTHER",
+      "gt_match_count": 10,
+      "predicted_count": 0
+    },
+    {
+      "class_name": "TLS_VEHICLE_SEMI_TRAILER_TRUCK",
+      "gt_match_count": 17,
+      "predicted_count": 12
+    },
+    {
+      "class_name": "TLS_VEHICLE_TRUCK",
+      "gt_match_count": 9,
+      "predicted_count": 14
+    },
+    {
+      "class_name": "TLS_VEHICLE_TRUCK_WITH_TRAILER",
+      "gt_match_count": 0,
+      "predicted_count": 4
+    },
+    {
+      "class_name": "TLS_VEHICLE_VAN",
+      "gt_match_count": 9,
+      "predicted_count": 7
+    },
+    {
+      "class_name": "TOTAL",
+      "gt_match_count": 82,
+      "predicted_count": 82
+    }
+  ],
+  "class_match_count": 38,
+  "class_mismatch_count": 44,
+  "gt_class_counts": {
+    "TLS_VEHICLE_CAR": 51,
+    "TLS_VEHICLE_CAR_WITH_TRAILER": 1,
+    "TLS_VEHICLE_OTHER": 27,
+    "TLS_VEHICLE_SEMI_TRAILER_TRUCK": 23,
+    "TLS_VEHICLE_TRUCK": 16,
+    "TLS_VEHICLE_VAN": 15
+  },
+  "matched_gt_class_counts": {
+    "TLS_VEHICLE_CAR": 37,
+    "TLS_VEHICLE_OTHER": 10,
+    "TLS_VEHICLE_SEMI_TRAILER_TRUCK": 17,
+    "TLS_VEHICLE_TRUCK": 9,
+    "TLS_VEHICLE_VAN": 9
+  },
+  "predicted_class_counts": {
+    "TLS_VEHICLE_CAR": 40,
+    "TLS_VEHICLE_CAR_WITH_TRAILER": 3,
+    "TLS_VEHICLE_MOTORBIKE": 2,
+    "TLS_VEHICLE_SEMI_TRAILER_TRUCK": 12,
+    "TLS_VEHICLE_TRUCK": 14,
+    "TLS_VEHICLE_TRUCK_WITH_TRAILER": 4,
+    "TLS_VEHICLE_VAN": 7
+  }
+}

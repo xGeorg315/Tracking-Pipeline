@@ -9,3 +9,4 @@ ckpt/
 venv/
 __pycache__/
 *.pyc
+configs/apikey.txt

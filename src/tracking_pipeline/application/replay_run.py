@@ -25,6 +25,8 @@ from tracking_pipeline.infrastructure.postprocessing.articulated_vehicle_merge i
 
 def replay_run(config: PipelineConfig, project_root: Path) -> None:
     _ = project_root
+    if config.input.format == "qb2_live":
+        raise ValueError("Live input is only supported for `run`")
     class_normalizer = ClassNormalizer.from_config(config.class_normalization)
     lane_box = build_lane_box(config)
     reader = build_reader(config)
@@ -37,24 +39,28 @@ def replay_run(config: PipelineConfig, project_root: Path) -> None:
 
     states = []
     latest_object_labels: dict[int, ObjectLabelData] = {}
-    frames = reader.iter_frames(config.input.paths)
-    for frame in frames:
-        for object_label in frame.object_labels:
-            if len(object_label.points) == 0:
-                continue
-            normalized_object_label = class_normalizer.normalize_object_label(object_label)
-            current = latest_object_labels.get(int(object_label.object_id))
-            if _is_newer_object_label(normalized_object_label, current):
-                latest_object_labels[int(object_label.object_id)] = normalized_object_label
-        cluster_result = clusterer.cluster(frame, lane_box)
-        state = tracker.step(cluster_result.detections, frame.frame_index, frame.timestamp_ns)
-        state.full_frame_points = frame.points
-        state.full_frame_intensity = frame.point_intensity
-        state.lane_points = cluster_result.lane_points
-        state.lane_intensity = cluster_result.lane_intensity
-        state.detections = cluster_result.detections
-        state.cluster_metrics = cluster_result.metrics
-        states.append(state)
+    try:
+        for frame in reader.iter_frames(config.input.paths):
+            for object_label in frame.object_labels:
+                if len(object_label.points) == 0:
+                    continue
+                normalized_object_label = class_normalizer.normalize_object_label(object_label)
+                current = latest_object_labels.get(int(object_label.object_id))
+                if _is_newer_object_label(normalized_object_label, current):
+                    latest_object_labels[int(object_label.object_id)] = normalized_object_label
+            cluster_result = clusterer.cluster(frame, lane_box)
+            state = tracker.step(cluster_result.detections, frame.frame_index, frame.timestamp_ns)
+            state.full_frame_points = frame.points
+            state.full_frame_intensity = frame.point_intensity
+            state.lane_points = cluster_result.lane_points
+            state.lane_intensity = cluster_result.lane_intensity
+            state.detections = cluster_result.detections
+            state.cluster_metrics = cluster_result.metrics
+            states.append(state)
+    finally:
+        close = getattr(reader, "close", None)
+        if callable(close):
+            close()
 
     tracks = tracker.finalize()
     articulated_merge_debug_events: list[ArticulatedMergeDebugEvent] = []

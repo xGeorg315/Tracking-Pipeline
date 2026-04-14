@@ -321,3 +321,28 @@ def test_run_pipeline_exports_latest_object_list_artifacts(tmp_path: Path) -> No
     if unmatched_gt_rows:
         assert unmatched_gt_rows[0]["gt_obj_class"] == "TLS_VEHICLE_CAR"
         assert abs(float(unmatched_gt_rows[0]["gt_obj_class_score"]) - 0.95) < 1e-6
+
+
+def test_run_pipeline_writes_dataset_mode_without_run_directory(tmp_path: Path) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    fixture = _write_object_list_fixture(tmp_path / "object_list_dataset.pb")
+    config = load_config(project_root / "configs" / "euclidean_voxel.yaml")
+    config.input.paths = [str(fixture)]
+    config.output.mode = "dataset"
+    config.output.root_dir = str(tmp_path / "runs_unused")
+    config.output.dataset_root_dir = str(tmp_path / "dataset")
+
+    summary = run_pipeline(config, project_root)
+    dataset_root = Path(summary.output_dir)
+
+    assert summary.output_mode == "dataset"
+    assert dataset_root == (tmp_path / "dataset")
+    assert dataset_root.exists()
+    assert not (tmp_path / "runs_unused").exists()
+    assert (dataset_root / "TLS_VEHICLE_CAR" / "1970-01-01" / "unmatched_gt" / "gt").exists()
+    assert (dataset_root / "TLS_VEHICLE_CAR" / "1970-01-01" / "unmatched_gt" / "gt_matching").exists()
+    stats_dirs = sorted(path for path in (dataset_root / "_stats" / "1970-01-01").iterdir() if path.is_dir() and path.name != "_active")
+    assert stats_dirs
+    assert (stats_dirs[0] / "summary.json").exists()
+    assert (stats_dirs[0] / "class_stats.json").exists()
+    assert (stats_dirs[0] / "gt_matching" / "summary.json").exists()

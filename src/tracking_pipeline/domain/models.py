@@ -311,6 +311,7 @@ class RunPerformance:
 class RunSummary:
     input_path: str
     input_paths: list[str]
+    output_mode: str
     tracker_algorithm: str
     accumulator_algorithm: str
     clusterer_algorithm: str

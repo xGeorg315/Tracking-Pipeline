@@ -1,0 +1,242 @@
+{
+  "accumulator_algorithm": "registration_voxel_fusion",
+  "aggregate_status_counts": {
+    "merged_into_long_vehicle_group": 4,
+    "saved": 81,
+    "skipped_min_hits": 53,
+    "skipped_track_exit": 33
+  },
+  "class_comparison_count": 81,
+  "class_count_rows": [
+    {
+      "class_name": "TLS_VEHICLE_CAR",
+      "gt_match_count": 36,
+      "predicted_count": 40
+    },
+    {
+      "class_name": "TLS_VEHICLE_CAR_WITH_TRAILER",
+      "gt_match_count": 0,
+      "predicted_count": 3
+    },
+    {
+      "class_name": "TLS_VEHICLE_MOTORBIKE",
+      "gt_match_count": 0,
+      "predicted_count": 1
+    },
+    {
+      "class_name": "TLS_VEHICLE_OTHER",
+      "gt_match_count": 10,
+      "predicted_count": 0
+    },
+    {
+      "class_name": "TLS_VEHICLE_SEMI_TRAILER_TRUCK",
+      "gt_match_count": 17,
+      "predicted_count": 12
+    },
+    {
+      "class_name": "TLS_VEHICLE_TRUCK",
+      "gt_match_count": 9,
+      "predicted_count": 14
+    },
+    {
+      "class_name": "TLS_VEHICLE_TRUCK_WITH_TRAILER",
+      "gt_match_count": 0,
+      "predicted_count": 4
+    },
+    {
+      "class_name": "TLS_VEHICLE_VAN",
+      "gt_match_count": 9,
+      "predicted_count": 7
+    },
+    {
+      "class_name": "TOTAL",
+      "gt_match_count": 81,
+      "predicted_count": 81
+    }
+  ],
+  "class_match_count": 40,
+  "class_mismatch_count": 41,
+  "clusterer_algorithm": "dbscan",
+  "finished_track_count": 171,
+  "frame_count": 2031,
+  "gt_class_counts": {
+    "TLS_VEHICLE_CAR": 51,
+    "TLS_VEHICLE_CAR_WITH_TRAILER": 1,
+    "TLS_VEHICLE_OTHER": 28,
+    "TLS_VEHICLE_SEMI_TRAILER_TRUCK": 23,
+    "TLS_VEHICLE_TRUCK": 15,
+    "TLS_VEHICLE_VAN": 15
+  },
+  "gt_match_assignment": "one_to_one",
+  "gt_match_matched_count": 81,
+  "gt_match_max_timestamp_delta_ns": 8742141526,
+  "gt_match_mean_timestamp_delta_ns": 1920517520.728395,
+  "gt_match_mode": "timestamp_only",
+  "gt_match_saved_track_count": 81,
+  "gt_match_unmatched_gt_count": 52,
+  "gt_match_unmatched_saved_count": 0,
+  "input_path": "qb2_live://class_qb2@10.16.3.160",
+  "input_paths": [
+    "qb2_live://class_qb2@10.16.3.160"
+  ],
+  "matched_gt_class_counts": {
+    "TLS_VEHICLE_CAR": 36,
+    "TLS_VEHICLE_OTHER": 10,
+    "TLS_VEHICLE_SEMI_TRAILER_TRUCK": 17,
+    "TLS_VEHICLE_TRUCK": 9,
+    "TLS_VEHICLE_VAN": 9
+  },
+  "object_list_exported_count": 133,
+  "object_list_seen_ids": 133,
+  "object_list_skipped_empty": 0,
+  "output_dir": "/home/vsv-admin/workspace/Tracking-Pipeline/dataset",
+  "output_mode": "dataset",
+  "performance": {
+    "aggregation_components": {
+      "confidence_cap": {
+        "call_count": 85,
+        "cpu_seconds": 0.002458931001001474,
+        "wall_seconds": 0.0005276899995578788
+      },
+      "fusion_core": {
+        "call_count": 85,
+        "cpu_seconds": 5.360097943000255,
+        "wall_seconds": 0.9366542159990559
+      },
+      "fusion_post": {
+        "call_count": 85,
+        "cpu_seconds": 9.4257085929994,
+        "wall_seconds": 1.7288928629993734
+      },
+      "fusion_total": {
+        "call_count": 85,
+        "cpu_seconds": 14.785806535999654,
+        "wall_seconds": 2.6655470789984292
+      },
+      "post_filter": {
+        "call_count": 85,
+        "cpu_seconds": 8.802689900001042,
+        "wall_seconds": 1.609079160999272
+      },
+      "registration": {
+        "call_count": 85,
+        "cpu_seconds": 17.52708676199927,
+        "wall_seconds": 2.5967307229996095
+      },
+      "symmetry_completion": {
+        "call_count": 85,
+        "cpu_seconds": 0.1320743319988651,
+        "wall_seconds": 0.024351230000434043
+      },
+      "tail_bridge": {
+        "call_count": 0,
+        "cpu_seconds": 0.0,
+        "wall_seconds": 0.0
+      }
+    },
+    "compute_cpu_seconds": 2990.7816499949995,
+    "compute_hz": 4.051015041986829,
+    "compute_wall_seconds": 501.3558278479983,
+    "io_wall_seconds": 231.6695186429985,
+    "peak_rss_mb": 1289.2890625,
+    "stages": {
+      "accumulate_tracks": {
+        "call_count": 5939,
+        "cpu_seconds": 1397.9711811089937,
+        "wall_seconds": 234.851128256001
+      },
+      "build_components": {
+        "call_count": 1,
+        "cpu_seconds": 0.3356213239999999,
+        "wall_seconds": 0.3214769129999997
+      },
+      "classify_aggregates": {
+        "call_count": 78,
+        "cpu_seconds": 1556.8664219760003,
+        "wall_seconds": 257.4750078439998
+      },
+      "cluster_frames": {
+        "call_count": 2031,
+        "cpu_seconds": 14.680964583005348,
+        "wall_seconds": 3.741005470999582
+      },
+      "match_gt": {
+        "call_count": 78,
+        "cpu_seconds": 0.48667137400050287,
+        "wall_seconds": 0.06788705999986533
+      },
+      "postprocess_tracks": {
+        "call_count": 156,
+        "cpu_seconds": 15.729882930000153,
+        "wall_seconds": 3.9461561589996847
+      },
+      "prepare_output": {
+        "call_count": 1,
+        "cpu_seconds": 0.024766011999999726,
+        "wall_seconds": 0.008322589000000491
+      },
+      "read_frames": {
+        "call_count": 2031,
+        "cpu_seconds": 193.5468345490085,
+        "wall_seconds": 55.782357104999406
+      },
+      "tracker_finalize": {
+        "call_count": 0,
+        "cpu_seconds": 0.0,
+        "wall_seconds": 0.0
+      },
+      "tracker_steps": {
+        "call_count": 2031,
+        "cpu_seconds": 5.0465280229991425,
+        "wall_seconds": 1.2746430579984143
+      },
+      "write_aggregates": {
+        "call_count": 2769,
+        "cpu_seconds": 0.06092431001066245,
+        "wall_seconds": 0.011604460999194544
+      },
+      "write_gt_matching": {
+        "call_count": 78,
+        "cpu_seconds": 96.8594176240014,
+        "wall_seconds": 24.471323780000258
+      },
+      "write_object_list": {
+        "call_count": 580,
+        "cpu_seconds": 522.2449435149997,
+        "wall_seconds": 131.2211355849995
+      },
+      "write_summary": {
+        "call_count": 77,
+        "cpu_seconds": 17.358790559003243,
+        "wall_seconds": 4.3602559580002165
+      },
+      "write_tracks": {
+        "call_count": 78,
+        "cpu_seconds": 63.13709986900202,
+        "wall_seconds": 15.822841753999949
+      }
+    },
+    "total_cpu_seconds": 3899.373351003,
+    "total_hz": 2.7502510434006995,
+    "total_wall_seconds": 738.478039986
+  },
+  "postprocessing_methods": [
+    "articulated_vehicle_merge",
+    "track_quality_scoring"
+  ],
+  "predicted_class_counts": {
+    "TLS_VEHICLE_CAR": 40,
+    "TLS_VEHICLE_CAR_WITH_TRAILER": 3,
+    "TLS_VEHICLE_MOTORBIKE": 1,
+    "TLS_VEHICLE_SEMI_TRAILER_TRUCK": 12,
+    "TLS_VEHICLE_TRUCK": 14,
+    "TLS_VEHICLE_TRUCK_WITH_TRAILER": 4,
+    "TLS_VEHICLE_VAN": 7
+  },
+  "registration_accepted": 303,
+  "registration_attempts": 304,
+  "registration_rejected": 1,
+  "saved_aggregates": 81,
+  "track_quality_mean": 0.6708298678475907,
+  "tracker_algorithm": "kalman_nn"
+}

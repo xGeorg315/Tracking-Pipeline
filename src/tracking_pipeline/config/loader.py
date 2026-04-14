@@ -17,6 +17,9 @@ from tracking_pipeline.config.models import (
     PipelineConfig,
     PostprocessingConfig,
     PreprocessingConfig,
+    QB2LiveInputConfig,
+    QB2LiveMQTTConfig,
+    RuntimeConfig,
     TrackingConfig,
     VisualizationConfig,
 )
@@ -84,6 +87,41 @@ def _sorted_class_names(values: list[str] | tuple[str, ...]) -> list[str]:
     return sorted(str(value) for value in values)
 
 
+def _qb2_live_source_path(sensor_name: str, ip: str) -> str:
+    return f"qb2_live://{sensor_name}@{ip}"
+
+
+def _load_input_config(raw_input: dict[str, Any], config_path: Path) -> InputConfig:
+    input_cfg = dict(raw_input)
+    format_name = str(input_cfg.get("format", "a42_pb"))
+    qb2_live_raw = dict(input_cfg.get("qb2_live", {}) or {})
+    qb2_live = None
+    if qb2_live_raw:
+        mqtt_raw = dict(qb2_live_raw.get("mqtt", {}) or {})
+        qb2_live = QB2LiveInputConfig(
+            sensor_name=str(qb2_live_raw.get("sensor_name", "")),
+            ip=str(qb2_live_raw.get("ip", "")),
+            api_key=str(qb2_live_raw.get("api_key", "")),
+            mqtt=QB2LiveMQTTConfig(
+                host=str(mqtt_raw.get("host", "")),
+                port=int(mqtt_raw.get("port", 1883) or 1883),
+                topic=str(mqtt_raw.get("topic", "")),
+                keepalive=int(mqtt_raw.get("keepalive", 60) or 60),
+            ),
+            max_frames=int(qb2_live_raw.get("max_frames", 0) or 0),
+            idle_timeout_sec=float(qb2_live_raw.get("idle_timeout_sec", 5.0) or 0.0),
+            mqtt_drain_tolerance_sec=float(qb2_live_raw.get("mqtt_drain_tolerance_sec", 0.25) or 0.0),
+            mqtt_max_pending_age_sec=float(qb2_live_raw.get("mqtt_max_pending_age_sec", 3.0) or 0.0),
+        )
+    if format_name == "qb2_live":
+        paths = [str(value) for value in input_cfg.get("paths", [])]
+        if not paths and qb2_live is not None:
+            paths = [_qb2_live_source_path(qb2_live.sensor_name, qb2_live.ip)]
+        return InputConfig(paths=paths, format=format_name, qb2_live=qb2_live)
+    paths = resolve_input_paths(input_cfg.get("paths", []), config_path.parent, field_name="input.paths")
+    return InputConfig(paths=paths, format=format_name, qb2_live=qb2_live)
+
+
 def load_config(path: str | Path) -> PipelineConfig:
     cfg_path = Path(path).resolve()
     raw = _read_yaml(cfg_path)
@@ -92,8 +130,6 @@ def load_config(path: str | Path) -> PipelineConfig:
     if cfg_path.name != "base.yaml" and base_path.exists():
         raw = _deep_merge(_read_yaml(base_path), raw)
 
-    input_cfg = dict(raw["input"])
-    input_cfg["paths"] = resolve_input_paths(input_cfg.get("paths", []), cfg_path.parent, field_name="input.paths")
     classification_defaults = ClassificationConfig()
     classification_cfg = dict(raw.get("classification", {}))
     classification_cfg["pointnext_root"] = str(
@@ -111,7 +147,7 @@ def load_config(path: str | Path) -> PipelineConfig:
     class_normalization_cfg = dict(raw.get("class_normalization", {}))
 
     config = PipelineConfig(
-        input=InputConfig(**input_cfg),
+        input=_load_input_config(raw["input"], cfg_path),
         preprocessing=PreprocessingConfig(**raw["preprocessing"]),
         clustering=ClusteringConfig(**raw.get("clustering", {})),
         tracking=TrackingConfig(**raw.get("tracking", {})),
@@ -120,6 +156,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         classification=ClassificationConfig(**classification_cfg),
         class_normalization=ClassNormalizationConfig(**class_normalization_cfg),
         output=OutputConfig(**raw.get("output", {})),
+        runtime=RuntimeConfig(**raw.get("runtime", {})),
         visualization=VisualizationConfig(**raw.get("visualization", {})),
         config_path=cfg_path,
     )

@@ -1,0 +1,16 @@
+{
+  "bucket": "gt-pred-same",
+  "class_name": "TLS_VEHICLE_CAR",
+  "day": "2026-04-14",
+  "frame_index": 2273,
+  "obj_class": "TLS_VEHICLE_CAR",
+  "obj_class_score": 0.0,
+  "object_id": 28381,
+  "pcd_path": "TLS_VEHICLE_CAR/2026-04-14/gt-pred-same/gt/run_20260414_101243_kalman_nn_registration_voxel_fusion__track_0192__object_28381.pcd",
+  "point_count": 248,
+  "run_id": "20260414_101243_kalman_nn_registration_voxel_fusion",
+  "sample_id": "run_20260414_101243_kalman_nn_registration_voxel_fusion__track_0192__object_28381",
+  "sensor_name": "class_qb2",
+  "source_path": "qb2_live://class_qb2@10.16.3.160",
+  "timestamp_ns": 1776155183938418020
+}

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from tracking_pipeline.cli import _format_class_comparison_line, _format_class_count_table, _format_throughput_line
+from tracking_pipeline.cli import (
+    _format_class_comparison_line,
+    _format_class_count_table,
+    _format_throughput_line,
+    build_parser,
+)
 
 
 def test_format_class_count_table_returns_markdown_table() -> None:
@@ -34,3 +39,27 @@ def test_format_class_comparison_line_formats_match_and_mismatch_counts() -> Non
 
 def test_format_class_comparison_line_returns_none_for_empty_comparisons() -> None:
     assert _format_class_comparison_line(0, 0, 0) == "Class Compare: none"
+
+
+def test_build_parser_accepts_live_view_command_and_run_id() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(["live-view", "-c", "configs/qb2_live_example.yaml", "--run-id", "run_123"])
+
+    assert args.command == "live-view"
+    assert args.config == "configs/qb2_live_example.yaml"
+    assert args.run_id == "run_123"
+
+
+def test_build_parser_accepts_live_web_command_with_host_and_port() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        ["live-web", "-c", "configs/qb2_live_example.yaml", "--run-id", "run_123", "--host", "0.0.0.0", "--port", "9001"]
+    )
+
+    assert args.command == "live-web"
+    assert args.config == "configs/qb2_live_example.yaml"
+    assert args.run_id == "run_123"
+    assert args.host == "0.0.0.0"
+    assert args.port == 9001

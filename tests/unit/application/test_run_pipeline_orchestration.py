@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from tracking_pipeline.application.performance import derive_hz
 from tracking_pipeline.application.replay_run import replay_run
-from tracking_pipeline.application.run_pipeline import run_pipeline
+from tracking_pipeline.application.run_pipeline import _live_snapshot_tracker_states, run_pipeline
 from tracking_pipeline.config.models import (
     AggregationConfig,
     ClusteringConfig,
@@ -16,6 +18,8 @@ from tracking_pipeline.config.models import (
     PipelineConfig,
     PostprocessingConfig,
     PreprocessingConfig,
+    QB2LiveInputConfig,
+    QB2LiveMQTTConfig,
     TrackingConfig,
     VisualizationConfig,
 )
@@ -165,6 +169,13 @@ class _FakeWriter:
     def __init__(self, base: Path):
         self.base = base
         self.object_labels = None
+        self.object_list_write_count = 0
+        self.summary_write_count = 0
+        self.track_write_count = 0
+        self.tracker_debug_write_count = 0
+        self.track_outcomes_write_count = 0
+        self.class_stats_write_count = 0
+        self.gt_matching_write_count = 0
         self.aggregate_write_intensity_flags: list[bool] = []
         self.aggregate_write_metrics: list[dict[str, object]] = []
         self.tracker_debug_states = None
@@ -193,30 +204,37 @@ class _FakeWriter:
         (run_dir / "aggregate.txt").write_text("saved\n", encoding="utf-8")
 
     def write_summary(self, run_dir, summary):
+        self.summary_write_count += 1
         (run_dir / "summary.txt").write_text(str(summary.saved_aggregates), encoding="utf-8")
 
     def write_tracks(self, run_dir, tracks, aggregate_results):
+        self.track_write_count += 1
         self.written_tracks = tracks
         self.written_aggregate_results = aggregate_results
         (run_dir / "tracks.txt").write_text("tracks\n", encoding="utf-8")
 
     def write_tracker_debug(self, run_dir, states):
+        self.tracker_debug_write_count += 1
         self.tracker_debug_states = states
         (run_dir / "tracker_debug.txt").write_text(str(len(states)), encoding="utf-8")
 
     def write_track_outcomes(self, run_dir, track_outcomes):
+        self.track_outcomes_write_count += 1
         self.track_outcomes = track_outcomes
         (run_dir / "track_outcomes.txt").write_text(str(len(track_outcomes)), encoding="utf-8")
 
     def write_class_stats(self, run_dir, class_stats):
+        self.class_stats_write_count += 1
         self.class_stats = class_stats
         (run_dir / "class_stats.txt").write_text(str(class_stats), encoding="utf-8")
 
     def write_object_list(self, run_dir, object_labels):
         self.object_labels = object_labels
+        self.object_list_write_count += 1
         (run_dir / "object_list_manifest.txt").write_text(str(sorted(object_labels)), encoding="utf-8")
 
     def write_gt_matching(self, run_dir, matches, unmatched_saved_tracks, unmatched_gt_objects, summary):
+        self.gt_matching_write_count += 1
         self.gt_matches = matches
         self.gt_unmatched_saved = unmatched_saved_tracks
         self.gt_unmatched_objects = unmatched_gt_objects
@@ -327,6 +345,78 @@ class _FakeObjectReader:
         ]
 
 
+def test_live_snapshot_tracker_states_keeps_only_latest_frame() -> None:
+    states = [
+        FrameTrackingState(frame_index=index, lane_points=np.zeros((0, 3), dtype=np.float32), detections=[], active_tracks=[])
+        for index in range(5)
+    ]
+
+    snapshot_states = _live_snapshot_tracker_states(states)
+
+    assert len(snapshot_states) == 1
+    assert snapshot_states[0].frame_index == 4
+
+
+class _InterruptingLiveReader:
+    def __init__(self, frames: list[FrameData], pending_object_labels: list[ObjectLabelData] | None = None):
+        self._frames = list(frames)
+        self._pending_object_labels = list(pending_object_labels or [])
+        self.close_calls = 0
+        self.drain_calls: list[int] = []
+        self.drain_max_timestamp_calls: list[int | None] = []
+        self._status = {
+            "reader_state": "waiting_for_raw",
+            "mqtt_connected": True,
+            "mqtt_messages_received": 1 if self._pending_object_labels else 0,
+            "mqtt_snapshots_received": 1 if self._pending_object_labels else 0,
+            "pending_snapshot_count": 1 if self._pending_object_labels else 0,
+            "pending_label_count": len(self._pending_object_labels),
+            "raw_frames_received": 0,
+            "waiting_for_first_raw_frame": not bool(self._frames),
+        }
+
+    def iter_frames(self, input_paths: list[str]):
+        _ = input_paths
+        for index, frame in enumerate(self._frames, start=1):
+            self._status.update(
+                reader_state="streaming",
+                raw_frames_received=int(index),
+                waiting_for_first_raw_frame=False,
+                last_raw_frame_index=int(frame.frame_index),
+                last_raw_frame_timestamp_ns=int(frame.timestamp_ns),
+            )
+            yield frame
+        raise KeyboardInterrupt()
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self._status["reader_state"] = "stopped"
+        self._status["mqtt_connected"] = False
+
+    def drain_pending_object_labels(self, frame_index: int, max_timestamp_ns: int | None = None) -> list[ObjectLabelData]:
+        self.drain_calls.append(int(frame_index))
+        self.drain_max_timestamp_calls.append(None if max_timestamp_ns is None else int(max_timestamp_ns))
+        self._status["pending_snapshot_count"] = 0
+        self._status["pending_label_count"] = 0
+        return [
+            ObjectLabelData(
+                object_id=int(label.object_id),
+                timestamp_ns=int(label.timestamp_ns),
+                points=np.asarray(label.points, dtype=np.float32).copy(),
+                obj_class=str(label.obj_class),
+                obj_class_score=float(label.obj_class_score),
+                sensor_name=str(label.sensor_name),
+                frame_index=int(frame_index),
+                source_path=str(label.source_path),
+            )
+            for label in self._pending_object_labels
+            if max_timestamp_ns is None or int(label.timestamp_ns) <= int(max_timestamp_ns)
+        ]
+
+    def status_snapshot(self) -> dict[str, object]:
+        return dict(self._status)
+
+
 def _box_points(center: np.ndarray, *, width: float, length: float, height: float) -> np.ndarray:
     signs = np.asarray(
         [
@@ -421,7 +511,7 @@ def test_run_pipeline_orchestrates_dependencies(monkeypatch, tmp_path: Path) -> 
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
     fake_writer = _FakeWriter(tmp_path)
-    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda root: fake_writer)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda cfg, root: fake_writer)
 
     summary = run_pipeline(config, tmp_path)
 
@@ -471,7 +561,7 @@ def test_run_pipeline_exports_latest_object_list_observation(monkeypatch, tmp_pa
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: _FakeTracker())
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
-    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda root: fake_writer)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda cfg, root: fake_writer)
 
     summary = run_pipeline(config, tmp_path)
 
@@ -528,7 +618,7 @@ def test_run_pipeline_passes_aggregate_intensity_flag_to_writer(monkeypatch, tmp
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: _FakeTracker())
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
-    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda root: fake_writer)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda cfg, root: fake_writer)
 
     summary = run_pipeline(config, tmp_path)
 
@@ -553,7 +643,7 @@ def test_run_pipeline_merges_articulated_vehicle_tracks(monkeypatch, tmp_path: P
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_clusterer", lambda cfg: _FakeClusterer())
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: fake_tracker)
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeStateAwareAccumulator())
-    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda root: fake_writer)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda cfg, root: fake_writer)
 
     summary = run_pipeline(config, tmp_path)
 
@@ -602,7 +692,7 @@ def test_run_pipeline_propagates_classification_to_results_and_track_outcomes(mo
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_classifier", lambda cfg: fake_classifier)
-    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda root: fake_writer)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda cfg, root: fake_writer)
 
     summary = run_pipeline(config, tmp_path)
 
@@ -638,6 +728,312 @@ def test_run_pipeline_propagates_classification_to_results_and_track_outcomes(mo
         {"class_name": "trailer", "predicted_count": 1, "gt_match_count": 0},
         {"class_name": "TOTAL", "predicted_count": 1, "gt_match_count": 0},
     ]
+
+
+def test_run_pipeline_finalizes_qb2_live_run_after_keyboard_interrupt(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(
+            paths=["qb2_live://class_qb2@10.16.3.160"],
+            format="qb2_live",
+            qb2_live=QB2LiveInputConfig(
+                sensor_name="class_qb2",
+                ip="10.16.3.160",
+                api_key="secret",
+                mqtt=QB2LiveMQTTConfig(host="10.16.3.111", topic="blickfeld/states_160"),
+            ),
+        ),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(root_dir=str(tmp_path)),
+        visualization=VisualizationConfig(),
+    )
+
+    pending_object = ObjectLabelData(
+        object_id=77,
+        timestamp_ns=150,
+        points=np.array([[2.0, 0.0, 0.0]], dtype=np.float32),
+        obj_class="car",
+        obj_class_score=0.9,
+        sensor_name="class_qb2",
+        frame_index=-1,
+        source_path=config.input.paths[0],
+    )
+    future_pending_object = ObjectLabelData(
+        object_id=78,
+        timestamp_ns=250,
+        points=np.array([[3.0, 0.0, 0.0]], dtype=np.float32),
+        obj_class="van",
+        obj_class_score=0.8,
+        sensor_name="class_qb2",
+        frame_index=-1,
+        source_path=config.input.paths[0],
+    )
+    reader = _InterruptingLiveReader(
+        frames=[
+            FrameData(
+                frame_index=0,
+                timestamp_ns=200,
+                points=np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+                source_path=config.input.paths[0],
+            )
+        ],
+        pending_object_labels=[pending_object, future_pending_object],
+    )
+    fake_writer = _FakeWriter(tmp_path)
+    fake_tracker = _FakeTracker()
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_reader", lambda cfg: reader)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: fake_tracker)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda cfg, root: fake_writer)
+
+    summary = run_pipeline(config, tmp_path)
+
+    assert summary.frame_count == 1
+    assert summary.input_path == "qb2_live://class_qb2@10.16.3.160"
+    assert summary.object_list_exported_count == 1
+    assert fake_tracker.seen_frame_ids == [0]
+    assert reader.close_calls >= 1
+    assert reader.drain_calls == [0]
+    assert reader.drain_max_timestamp_calls == [200]
+    assert set(fake_writer.object_labels) == {77}
+    assert fake_writer.object_labels[77].frame_index == 0
+    assert fake_writer.object_labels[77].source_path == config.input.paths[0]
+    live_status_path = tmp_path / "run" / "live_status.json"
+    assert live_status_path.exists()
+    live_status = json.loads(live_status_path.read_text(encoding="utf-8"))
+    assert live_status["pipeline_phase"] == "completed"
+    assert live_status["processed_frames"] == 1
+    assert live_status["object_list_exported_count"] == 1
+    assert "processing_total_hz" in live_status
+    assert float(live_status["processing_total_hz"]) >= 0.0
+    assert live_status["output_dir"] == str(tmp_path / "run")
+    assert live_status["status_file"] == str(live_status_path)
+    assert live_status["reader"]["raw_frames_received"] == 1
+    assert live_status["reader"]["mqtt_messages_received"] == 1
+    assert live_status["reader"]["reader_state"] == "stopped"
+
+
+def test_run_pipeline_writes_object_list_live_for_qb2_live(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(
+            paths=["qb2_live://class_qb2@10.16.3.160"],
+            format="qb2_live",
+            qb2_live=QB2LiveInputConfig(
+                sensor_name="class_qb2",
+                ip="10.16.3.160",
+                api_key="secret",
+                mqtt=QB2LiveMQTTConfig(host="10.16.3.111", topic="blickfeld/states_160"),
+            ),
+        ),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(root_dir=str(tmp_path)),
+        visualization=VisualizationConfig(),
+    )
+
+    live_object = ObjectLabelData(
+        object_id=42,
+        timestamp_ns=200,
+        points=np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
+        obj_class="car",
+        obj_class_score=0.95,
+        sensor_name="class_qb2",
+        frame_index=0,
+        source_path=config.input.paths[0],
+    )
+    reader = _InterruptingLiveReader(
+        frames=[
+            FrameData(
+                frame_index=0,
+                timestamp_ns=200,
+                points=np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+                source_path=config.input.paths[0],
+                object_labels=[live_object],
+            )
+        ]
+    )
+    fake_writer = _FakeWriter(tmp_path)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_reader", lambda cfg: reader)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: _FakeTracker())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda cfg, root: fake_writer)
+
+    summary = run_pipeline(config, tmp_path)
+
+    assert summary.object_list_exported_count == 1
+    assert fake_writer.object_list_write_count >= 2
+    assert set(fake_writer.object_labels) == {42}
+    live_status = json.loads((tmp_path / "run" / "live_status.json").read_text(encoding="utf-8"))
+    assert live_status["live_object_list_write_count"] >= 2
+    assert live_status["object_list_manifest_path"] == str(tmp_path / "run" / "object_list" / "manifest.jsonl")
+    assert live_status["last_live_object_list_write_unix_sec"] is not None
+
+
+def test_run_pipeline_writes_live_snapshot_artifacts_for_qb2_live(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(
+            paths=["qb2_live://class_qb2@10.16.3.160"],
+            format="qb2_live",
+            qb2_live=QB2LiveInputConfig(
+                sensor_name="class_qb2",
+                ip="10.16.3.160",
+                api_key="secret",
+                mqtt=QB2LiveMQTTConfig(host="10.16.3.111", topic="blickfeld/states_160"),
+            ),
+        ),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(root_dir=str(tmp_path)),
+        visualization=VisualizationConfig(),
+    )
+
+    reader = _InterruptingLiveReader(
+        frames=[
+            FrameData(
+                frame_index=0,
+                timestamp_ns=200,
+                points=np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+                source_path=config.input.paths[0],
+            )
+        ]
+    )
+    fake_writer = _FakeWriter(tmp_path)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_reader", lambda cfg: reader)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: _FakeTracker())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda cfg, root: fake_writer)
+
+    run_pipeline(config, tmp_path)
+
+    assert fake_writer.aggregate_write_intensity_flags
+    assert len(fake_writer.aggregate_write_intensity_flags) >= 2
+    assert fake_writer.summary_write_count >= 3
+    assert fake_writer.track_write_count >= 2
+    assert fake_writer.tracker_debug_write_count >= 2
+    assert fake_writer.track_outcomes_write_count >= 2
+    assert fake_writer.class_stats_write_count >= 2
+    assert fake_writer.gt_matching_write_count >= 2
+    assert (tmp_path / "run" / "aggregate.txt").exists()
+    assert (tmp_path / "run" / "summary.txt").exists()
+    assert (tmp_path / "run" / "tracks.txt").exists()
+    assert (tmp_path / "run" / "tracker_debug.txt").exists()
+    assert (tmp_path / "run" / "track_outcomes.txt").exists()
+    assert (tmp_path / "run" / "class_stats.txt").exists()
+    assert (tmp_path / "run" / "gt_matching.txt").exists()
+    live_status = json.loads((tmp_path / "run" / "live_status.json").read_text(encoding="utf-8"))
+    assert live_status["live_artifact_dir"] == str(tmp_path / "run")
+    assert live_status["live_artifact_write_count"] >= 1
+    assert live_status["last_live_artifact_write_unix_sec"] is not None
+
+
+def test_run_pipeline_writes_live_dataset_artifacts_for_qb2_live(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(
+            paths=["qb2_live://class_qb2@10.16.3.160"],
+            format="qb2_live",
+            qb2_live=QB2LiveInputConfig(
+                sensor_name="class_qb2",
+                ip="10.16.3.160",
+                api_key="secret",
+                mqtt=QB2LiveMQTTConfig(host="10.16.3.111", topic="blickfeld/states_160"),
+            ),
+        ),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(mode="dataset", dataset_root_dir=str(tmp_path / "dataset"), root_dir=str(tmp_path / "runs_unused")),
+        visualization=VisualizationConfig(),
+    )
+
+    live_object = ObjectLabelData(
+        object_id=42,
+        timestamp_ns=200,
+        points=np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
+        obj_class="car",
+        obj_class_score=0.95,
+        sensor_name="class_qb2",
+        frame_index=0,
+        source_path=config.input.paths[0],
+    )
+    reader = _InterruptingLiveReader(
+        frames=[
+            FrameData(
+                frame_index=0,
+                timestamp_ns=200,
+                points=np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+                source_path=config.input.paths[0],
+                object_labels=[live_object],
+            )
+        ]
+    )
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_reader", lambda cfg: reader)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: _FakeTracker())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
+
+    summary = run_pipeline(config, tmp_path)
+
+    dataset_root = tmp_path / "dataset"
+    assert summary.output_mode == "dataset"
+    assert summary.output_dir == str(dataset_root)
+    assert not (tmp_path / "runs_unused").exists()
+    assert (dataset_root / "car" / "1970-01-01" / "gt-pred-different" / "gt").exists()
+    assert (dataset_root / "car" / "1970-01-01" / "gt-pred-different" / "pred").exists()
+    active_status_dirs = sorted((dataset_root / "_stats" / "_active").iterdir())
+    assert len(active_status_dirs) == 1
+    active_status_path = active_status_dirs[0] / "live_status.json"
+    assert active_status_path.exists()
+    live_status = json.loads(active_status_path.read_text(encoding="utf-8"))
+    assert live_status["output_dir"] == str(dataset_root)
+    day_stats_dirs = sorted((dataset_root / "_stats" / "1970-01-01").iterdir())
+    assert len(day_stats_dirs) == 1
+    assert (day_stats_dirs[0] / "live_status.json").exists()
+
+
+def test_run_pipeline_rejects_qb2_live_interrupt_before_first_frame(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(
+            paths=["qb2_live://class_qb2@10.16.3.160"],
+            format="qb2_live",
+            qb2_live=QB2LiveInputConfig(
+                sensor_name="class_qb2",
+                ip="10.16.3.160",
+                api_key="secret",
+                mqtt=QB2LiveMQTTConfig(host="10.16.3.111", topic="blickfeld/states_160"),
+            ),
+        ),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(root_dir=str(tmp_path)),
+        visualization=VisualizationConfig(),
+    )
+
+    reader = _InterruptingLiveReader(frames=[])
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_reader", lambda cfg: reader)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: _FakeTracker())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda cfg, root: _FakeWriter(tmp_path))
+
+    with pytest.raises(RuntimeError, match="Run interrupted before any frames were received"):
+        run_pipeline(config, tmp_path)
 
 
 def test_replay_run_uses_multi_file_input_without_tracker_reset(monkeypatch, tmp_path: Path) -> None:
@@ -706,6 +1102,30 @@ def test_replay_run_propagates_classification_to_viewer_data(monkeypatch, tmp_pa
     assert outcome.predicted_class_score == 0.88
 
 
+def test_replay_run_rejects_qb2_live_input(tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(
+            paths=["qb2_live://class_qb2@10.16.3.160"],
+            format="qb2_live",
+            qb2_live=QB2LiveInputConfig(
+                sensor_name="class_qb2",
+                ip="10.16.3.160",
+                api_key="secret",
+                mqtt=QB2LiveMQTTConfig(host="10.16.3.111", topic="blickfeld/states_160"),
+            ),
+        ),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(root_dir=str(tmp_path)),
+        visualization=VisualizationConfig(),
+    )
+
+    with pytest.raises(ValueError, match="Live input is only supported for `run`"):
+        replay_run(config, tmp_path)
+
+
 def test_replay_run_propagates_gt_class_to_viewer_data(monkeypatch, tmp_path: Path) -> None:
     config = PipelineConfig(
         input=InputConfig(paths=["ignored_a.pb"]),
@@ -762,7 +1182,7 @@ def test_run_pipeline_normalizes_class_names_in_results_and_stats(monkeypatch, t
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_classifier", lambda cfg: fake_classifier)
-    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda root: fake_writer)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda cfg, root: fake_writer)
 
     summary = run_pipeline(config, tmp_path)
 
@@ -784,6 +1204,152 @@ def test_run_pipeline_normalizes_class_names_in_results_and_stats(monkeypatch, t
         {"class_name": "TLS_VEHICLE_TRUCK_WITH_TRAILER", "predicted_count": 1, "gt_match_count": 0},
         {"class_name": "TOTAL", "predicted_count": 1, "gt_match_count": 1},
     ]
+
+
+def test_run_pipeline_starts_embedded_live_web_viewer_for_qb2_live(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(
+            paths=["qb2_live://class_qb2@10.16.3.160"],
+            format="qb2_live",
+            qb2_live=QB2LiveInputConfig(
+                sensor_name="class_qb2",
+                ip="10.16.3.160",
+                api_key="secret",
+                mqtt=QB2LiveMQTTConfig(host="10.16.3.111", topic="blickfeld/states_160"),
+            ),
+        ),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, 0, 8, 0, 2]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(root_dir=str(tmp_path)),
+        visualization=VisualizationConfig(
+            live_web_enabled=True,
+            live_web_host="0.0.0.0",
+            live_web_port=8765,
+            live_web_history_sec=0.8,
+            live_web_retain_all_frames=True,
+        ),
+    )
+    reader = _InterruptingLiveReader(
+        frames=[
+            FrameData(
+                frame_index=0,
+                timestamp_ns=100,
+                points=np.array([[0.0, 0.0, 0.0], [0.2, 0.1, 0.0]], dtype=np.float32),
+                point_intensity=np.array([0.2, 0.4], dtype=np.float32),
+                source_path="qb2_live://class_qb2@10.16.3.160",
+            )
+        ]
+    )
+    fake_writer = _FakeWriter(tmp_path)
+    fake_tracker = _FakeTracker()
+    seen: dict[str, object] = {}
+
+    class _FakeLiveFramePublisher:
+        def __init__(self, **kwargs):
+            seen["publisher_kwargs"] = dict(kwargs)
+            seen["published_frames"] = []
+            seen["status_updates"] = []
+            seen["track_outcomes"] = []
+            seen["summaries"] = []
+            seen["stop_phases"] = []
+
+        def update_status(self, **updates):
+            seen["status_updates"].append(dict(updates))
+
+        def publish_frame(self, frame, cluster_result, tracking_state):
+            seen["published_frames"].append(
+                {
+                    "frame_index": int(frame.frame_index),
+                    "point_count": int(len(frame.points)),
+                    "detection_count": int(len(cluster_result.detections)),
+                    "tracking_frame_index": int(tracking_state.frame_index),
+                }
+            )
+            return len(seen["published_frames"])
+
+        def update_track_outcomes(self, track_outcomes):
+            seen["track_outcomes"].append(sorted(int(track_id) for track_id in dict(track_outcomes)))
+
+        def update_summary(self, summary):
+            seen["summaries"].append(int(summary.saved_aggregates))
+
+        def mark_stopped(self, *, pipeline_phase: str = "stopped"):
+            seen["stop_phases"].append(str(pipeline_phase))
+
+    class _FakeLivePCDWebServer:
+        def __init__(self, publisher, *, host: str, port: int):
+            seen["server_publisher"] = publisher
+            seen["server_host"] = host
+            seen["server_port"] = port
+            seen["server_started"] = False
+            seen["server_stopped"] = False
+            self.port = 9876
+
+        def start(self):
+            seen["server_started"] = True
+
+        def stop(self):
+            seen["server_stopped"] = True
+
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_reader", lambda cfg: reader)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: fake_tracker)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda cfg, root: fake_writer)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.LiveFramePublisher", _FakeLiveFramePublisher)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.LivePCDWebServer", _FakeLivePCDWebServer)
+
+    summary = run_pipeline(config, tmp_path)
+
+    assert summary.frame_count == 1
+    assert seen["server_host"] == "0.0.0.0"
+    assert seen["server_port"] == 8765
+    assert seen["publisher_kwargs"]["retain_all_frames"] is True
+    assert seen["server_started"] is True
+    assert seen["server_stopped"] is True
+    assert seen["published_frames"] == [
+        {
+            "frame_index": 0,
+            "point_count": 2,
+            "detection_count": 1,
+            "tracking_frame_index": 0,
+        }
+    ]
+    assert any(update.get("pipeline_phase") == "processing_frames" for update in seen["status_updates"])
+    assert any(update.get("pipeline_phase") == "completed" for update in seen["status_updates"])
+    assert seen["track_outcomes"][-1] == [1]
+    assert seen["summaries"][-1] == 1
+    assert seen["stop_phases"] == ["stopped"]
+
+
+def test_run_pipeline_skips_embedded_live_web_viewer_when_disabled(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(paths=["ignored_a.pb"]),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(root_dir=str(tmp_path)),
+        visualization=VisualizationConfig(live_web_enabled=True),
+    )
+
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_reader", lambda cfg: _FakeReader())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: _FakeTracker())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda cfg, root: _FakeWriter(tmp_path))
+    monkeypatch.setattr(
+        "tracking_pipeline.application.run_pipeline.LiveFramePublisher",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("live web publisher should not start for non-qb2 input")),
+    )
+
+    summary = run_pipeline(config, tmp_path)
+
+    assert summary.frame_count == 1
 
 
 def test_replay_run_normalizes_class_names_before_viewer_receives_data(monkeypatch, tmp_path: Path) -> None:

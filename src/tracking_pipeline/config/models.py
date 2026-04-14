@@ -6,9 +6,30 @@ from typing import Any
 
 
 @dataclass(slots=True)
+class QB2LiveMQTTConfig:
+    host: str = ""
+    port: int = 1883
+    topic: str = ""
+    keepalive: int = 60
+
+
+@dataclass(slots=True)
+class QB2LiveInputConfig:
+    sensor_name: str = ""
+    ip: str = ""
+    api_key: str = ""
+    mqtt: QB2LiveMQTTConfig = field(default_factory=QB2LiveMQTTConfig)
+    max_frames: int = 0
+    idle_timeout_sec: float = 5.0
+    mqtt_drain_tolerance_sec: float = 0.25
+    mqtt_max_pending_age_sec: float = 3.0
+
+
+@dataclass(slots=True)
 class InputConfig:
     paths: list[str]
     format: str = "a42_pb"
+    qb2_live: QB2LiveInputConfig | None = None
 
 
 @dataclass(slots=True)
@@ -157,11 +178,18 @@ class ClassNormalizationConfig:
 
 @dataclass(slots=True)
 class OutputConfig:
+    mode: str = "run"
     root_dir: str = "runs"
+    dataset_root_dir: str = "dataset"
     save_world: bool = False
     save_aggregate_intensity: bool = False
     require_track_exit: bool = True
     track_exit_edge_margin: float = 0.9
+
+
+@dataclass(slots=True)
+class RuntimeConfig:
+    cpu_cores: int = 0
 
 
 @dataclass(slots=True)
@@ -172,6 +200,12 @@ class VisualizationConfig:
     show_tracker_debug: bool = False
     show_track_outcome_debug: bool = False
     show_articulated_merge_debug: bool = False
+    live_web_enabled: bool = False
+    live_web_host: str = "0.0.0.0"
+    live_web_port: int = 8765
+    live_web_history_sec: float = 0.8
+    live_web_retain_all_frames: bool = True
+    live_web_point_source: str = "lane"
     max_points: int = 120000
     max_cluster_points: int = 15000
     max_assoc_dist: float = 4.2
@@ -188,6 +222,7 @@ class PipelineConfig:
     classification: ClassificationConfig = field(default_factory=ClassificationConfig)
     class_normalization: ClassNormalizationConfig = field(default_factory=ClassNormalizationConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
     config_path: Path | None = None
 

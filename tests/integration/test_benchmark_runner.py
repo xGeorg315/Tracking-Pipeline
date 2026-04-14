@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 
 from tracking_pipeline.application.benchmark_run import BenchmarkRunner
 from tracking_pipeline.config.loader import load_benchmark_config
+from tracking_pipeline.config.validation import ConfigError
 
 
 def _copy_sample_pb(path: Path) -> Path:
@@ -210,3 +212,99 @@ def test_benchmark_runner_expands_directory_sequence_into_sorted_input_paths(tmp
     results_payload = json.loads((output_dir / "results.json").read_text(encoding="utf-8"))
     assert len(results_payload["results"]) == 1
     assert results_payload["results"][0]["sequence_name"] == sequence_dir.name
+
+
+def test_benchmark_runner_rejects_qb2_live_presets(tmp_path: Path) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    fixture = project_root / "tests" / "fixtures" / "sample_a42.pb"
+    preset_path = tmp_path / "qb2_live_preset.yaml"
+    preset_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  format: qb2_live",
+                "  paths: []",
+                "  qb2_live:",
+                "    sensor_name: class_qb2",
+                "    ip: 10.16.3.160",
+                "    api_key: secret",
+                "    mqtt:",
+                "      host: 10.16.3.111",
+                "      topic: blickfeld/states_160",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "classification:",
+                "  enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "benchmark_qb2_live.yaml"
+    manifest.write_text(
+        "\n".join(
+            [
+                "name: reject_qb2_live",
+                f"output_root: {tmp_path / 'benchmarks'}",
+                "warmup_runs: 0",
+                "measure_runs: 1",
+                "sequences:",
+                f"  - {fixture}",
+                "presets:",
+                f"  - {preset_path}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_benchmark_config(manifest)
+
+    with pytest.raises(ConfigError, match="benchmark does not support live input format: qb2_live"):
+        BenchmarkRunner(project_root).run(config)
+
+
+def test_benchmark_runner_rejects_dataset_output_mode_presets(tmp_path: Path) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    fixture = project_root / "tests" / "fixtures" / "sample_a42.pb"
+    preset_path = tmp_path / "dataset_preset.yaml"
+    preset_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  format: a42_pb",
+                "  paths:",
+                f"    - {fixture}",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "output:",
+                "  mode: dataset",
+                "classification:",
+                "  enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "benchmark_dataset_mode.yaml"
+    manifest.write_text(
+        "\n".join(
+            [
+                "name: reject_dataset_mode",
+                f"output_root: {tmp_path / 'benchmarks'}",
+                "warmup_runs: 0",
+                "measure_runs: 1",
+                "sequences:",
+                f"  - {fixture}",
+                "presets:",
+                f"  - {preset_path}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_benchmark_config(manifest)
+
+    with pytest.raises(ConfigError, match="benchmark does not support output.mode=dataset"):
+        BenchmarkRunner(project_root).run(config)

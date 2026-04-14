@@ -59,6 +59,100 @@ def test_load_config_rejects_empty_input_paths(tmp_path: Path) -> None:
         load_config(config_path)
 
 
+def test_load_config_accepts_qb2_live_with_synthesized_source_path(tmp_path: Path) -> None:
+    config_path = tmp_path / "config_qb2_live.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  format: qb2_live",
+                "  paths: []",
+                "  qb2_live:",
+                "    sensor_name: class_qb2",
+                "    ip: 10.16.3.160",
+                "    api_key: secret",
+                "    mqtt_drain_tolerance_sec: 0.4",
+                "    mqtt_max_pending_age_sec: 3.5",
+                "    mqtt:",
+                "      host: 10.16.3.111",
+                "      topic: blickfeld/states_160",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.input.format == "qb2_live"
+    assert config.input.paths == ["qb2_live://class_qb2@10.16.3.160"]
+    assert config.input.qb2_live is not None
+    assert config.input.qb2_live.mqtt.host == "10.16.3.111"
+    assert config.input.qb2_live.mqtt.topic == "blickfeld/states_160"
+    assert config.input.qb2_live.mqtt_drain_tolerance_sec == 0.4
+    assert config.input.qb2_live.mqtt_max_pending_age_sec == 3.5
+
+
+def test_load_config_rejects_qb2_live_without_required_mqtt_fields(tmp_path: Path) -> None:
+    config_path = tmp_path / "config_qb2_live_invalid.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  format: qb2_live",
+                "  paths: []",
+                "  qb2_live:",
+                "    sensor_name: class_qb2",
+                "    ip: 10.16.3.160",
+                "    api_key: secret",
+                "    mqtt:",
+                "      host: ''",
+                "      topic: ''",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="input.qb2_live.mqtt.host must not be empty"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_qb2_live_with_invalid_numeric_settings(tmp_path: Path) -> None:
+    config_path = tmp_path / "config_qb2_live_invalid_numeric.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  format: qb2_live",
+                "  paths: []",
+                "  qb2_live:",
+                "    sensor_name: class_qb2",
+                "    ip: 10.16.3.160",
+                "    api_key: secret",
+                "    max_frames: -1",
+                "    idle_timeout_sec: 0",
+                "    mqtt:",
+                "      host: 10.16.3.111",
+                "      port: 0",
+                "      topic: blickfeld/states_160",
+                "      keepalive: 0",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="input.qb2_live.max_frames must be >= 0"):
+        load_config(config_path)
+
+
 def test_load_config_reads_show_full_frame_pcd_flag(tmp_path: Path) -> None:
     fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
 
@@ -84,6 +178,81 @@ def test_load_config_reads_show_full_frame_pcd_flag(tmp_path: Path) -> None:
 
     assert config.input.paths == [str(fixture_dst.resolve())]
     assert config.visualization.show_full_frame_pcd is True
+
+
+def test_load_config_reads_live_web_visualization_settings(tmp_path: Path) -> None:
+    config_path = tmp_path / "config_qb2_live_live_web.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  format: qb2_live",
+                "  paths: []",
+                "  qb2_live:",
+                "    sensor_name: class_qb2",
+                "    ip: 10.16.3.160",
+                "    api_key: secret",
+                "    mqtt:",
+                "      host: 10.16.3.111",
+                "      topic: blickfeld/states_160",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "visualization:",
+                "  live_web_enabled: true",
+                "  live_web_host: 0.0.0.0",
+                "  live_web_port: 9001",
+                "  live_web_history_sec: 1.25",
+                "  live_web_retain_all_frames: false",
+                "  show_tracker_debug: true",
+                "  show_track_outcome_debug: true",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.visualization.live_web_enabled is True
+    assert config.visualization.live_web_host == "0.0.0.0"
+    assert config.visualization.live_web_port == 9001
+    assert config.visualization.live_web_history_sec == pytest.approx(1.25)
+    assert config.visualization.live_web_retain_all_frames is False
+    assert config.visualization.show_tracker_debug is True
+    assert config.visualization.show_track_outcome_debug is True
+
+
+def test_load_config_rejects_invalid_live_web_settings(tmp_path: Path) -> None:
+    config_path = tmp_path / "config_qb2_live_live_web_invalid.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  format: qb2_live",
+                "  paths: []",
+                "  qb2_live:",
+                "    sensor_name: class_qb2",
+                "    ip: 10.16.3.160",
+                "    api_key: secret",
+                "    mqtt:",
+                "      host: 10.16.3.111",
+                "      topic: blickfeld/states_160",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "visualization:",
+                "  live_web_enabled: true",
+                "  live_web_host: ''",
+                "  live_web_port: 0",
+                "  live_web_history_sec: 0.0",
+                "  live_web_retain_all_frames: nope",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="visualization.live_web_host must not be empty"):
+        load_config(config_path)
 
 
 def test_load_config_reads_confidence_point_cap_settings(tmp_path: Path) -> None:
@@ -142,6 +311,114 @@ def test_load_config_reads_post_filter_outlier_toggle(tmp_path: Path) -> None:
 
     assert config.input.paths == [str(fixture_dst.resolve())]
     assert config.aggregation.enable_post_filter_stat_outlier_removal is False
+
+
+def test_load_config_reads_runtime_cpu_cores(tmp_path: Path) -> None:
+    fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+
+    config_path = tmp_path / "config_runtime.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "runtime:",
+                "  cpu_cores: 4",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.input.paths == [str(fixture_dst.resolve())]
+    assert config.runtime.cpu_cores == 4
+
+
+def test_load_config_rejects_negative_runtime_cpu_cores(tmp_path: Path) -> None:
+    fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+    _ = fixture_dst
+
+    config_path = tmp_path / "config_runtime_invalid.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "runtime:",
+                "  cpu_cores: -1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="runtime.cpu_cores must be >= 0"):
+        load_config(config_path)
+
+
+def test_load_config_reads_dataset_output_mode(tmp_path: Path) -> None:
+    fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+
+    config_path = tmp_path / "config_dataset_output.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "output:",
+                "  mode: dataset",
+                "  dataset_root_dir: exported_dataset",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.input.paths == [str(fixture_dst.resolve())]
+    assert config.output.mode == "dataset"
+    assert config.output.dataset_root_dir == "exported_dataset"
+
+
+def test_load_config_rejects_invalid_output_mode(tmp_path: Path) -> None:
+    fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+    _ = fixture_dst
+
+    config_path = tmp_path / "config_invalid_output_mode.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "output:",
+                "  mode: both",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="Unsupported output mode: both"):
+        load_config(config_path)
 
 
 def test_load_config_reads_tail_bridge_toggle(tmp_path: Path) -> None:

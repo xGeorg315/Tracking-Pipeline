@@ -14,6 +14,7 @@ from tracking_pipeline.application.performance import AGGREGATION_COMPONENT_NAME
 from tracking_pipeline.application.services import build_benchmark_name, resolve_benchmark_root
 from tracking_pipeline.config.loader import load_config, resolve_input_paths
 from tracking_pipeline.config.models import BenchmarkConfig, PipelineConfig
+from tracking_pipeline.config.validation import ConfigError
 from tracking_pipeline.infrastructure.io.manifest_writer import ManifestWriter
 
 
@@ -79,6 +80,10 @@ class BenchmarkRunner:
                 for phase, count in (("warmup", config.warmup_runs), ("measure", config.measure_runs)):
                     for run_index in range(1, count + 1):
                         pipeline_config = load_config(preset_path)
+                        if pipeline_config.input.format == "qb2_live":
+                            raise ConfigError("benchmark does not support live input format: qb2_live")
+                        if str(pipeline_config.output.mode) == "dataset":
+                            raise ConfigError("benchmark does not support output.mode=dataset")
                         pipeline_config.input.paths = resolve_input_paths(
                             [sequence_path],
                             config.config_path.parent if config.config_path is not None else self.project_root,

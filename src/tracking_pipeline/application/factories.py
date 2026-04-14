@@ -18,12 +18,14 @@ from tracking_pipeline.infrastructure.clustering.range_image_depth_jump import R
 from tracking_pipeline.infrastructure.clustering.beam_neighbor_region_growing import BeamNeighborRegionGrowingClusterer
 from tracking_pipeline.infrastructure.clustering.voxel_grid_connected_components import VoxelGridConnectedComponentsClusterer
 from tracking_pipeline.infrastructure.io.artifact_writer import JsonArtifactWriter
+from tracking_pipeline.infrastructure.io.dataset_artifact_writer import DatasetArtifactWriter
 from tracking_pipeline.infrastructure.postprocessing.articulated_vehicle_merge import ArticulatedVehicleMergePostprocessor
 from tracking_pipeline.infrastructure.postprocessing.co_moving_track_merge import CoMovingTrackMergePostprocessor
 from tracking_pipeline.infrastructure.postprocessing.track_quality_scoring import TrackQualityScoringPostprocessor
 from tracking_pipeline.infrastructure.postprocessing.tracklet_stitching import TrackletStitchingPostprocessor
 from tracking_pipeline.infrastructure.postprocessing.trajectory_smoothing import TrajectorySmoothingPostprocessor
 from tracking_pipeline.infrastructure.readers.a42_pb_reader import A42PBReader
+from tracking_pipeline.infrastructure.readers.qb2_live_reader import QB2LiveReader
 from tracking_pipeline.infrastructure.tracking.euclidean_nn import EuclideanNNTracker
 from tracking_pipeline.infrastructure.tracking.hungarian_kalman import HungarianKalmanTracker
 from tracking_pipeline.infrastructure.tracking.kalman_nn import KalmanNNTracker
@@ -37,6 +39,13 @@ def build_lane_box(config: PipelineConfig) -> LaneBox:
 def build_reader(config: PipelineConfig) -> FrameReader:
     if config.input.format == "a42_pb":
         return A42PBReader(read_intensity=config.visualization.color_by_intensity or config.output.save_aggregate_intensity)
+    if config.input.format == "qb2_live":
+        if config.input.qb2_live is None:
+            raise ValueError("input.qb2_live must be configured for input.format=qb2_live")
+        return QB2LiveReader(
+            config.input.qb2_live,
+            read_intensity=config.visualization.color_by_intensity or config.output.save_aggregate_intensity,
+        )
     raise ValueError(f"Unsupported input format: {config.input.format}")
 
 
@@ -127,7 +136,9 @@ def build_classifier(config: PipelineConfig) -> ObjectClassifier | None:
     raise ValueError(f"Unsupported classifier: {config.classification.backend}")
 
 
-def build_artifact_writer(project_root: Path) -> ArtifactWriter:
+def build_artifact_writer(config: PipelineConfig, project_root: Path) -> ArtifactWriter:
+    if str(config.output.mode) == "dataset":
+        return DatasetArtifactWriter(project_root)
     return JsonArtifactWriter(project_root)
 
 

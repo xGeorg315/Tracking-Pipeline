@@ -19,8 +19,7 @@ class A42PBReader:
     def __init__(self, read_intensity: bool = False):
         self.read_intensity = bool(read_intensity)
 
-    def iter_frames(self, input_paths: list[str]) -> list[FrameData]:
-        frames: list[FrameData] = []
+    def iter_frames(self, input_paths: list[str]):
         frame_index = 0
         last_timestamp_ns: int | None = None
         for sequence_index, input_path in enumerate(input_paths):
@@ -63,24 +62,28 @@ class A42PBReader:
                             [np.asarray(scan.point_timestamp_ns, dtype=np.int64) for scan in scans if scan.point_timestamp_ns is not None],
                             axis=0,
                         ).astype(np.int64, copy=False)
-                    frames.append(
-                        FrameData(
-                            frame_index=frame_index,
-                            timestamp_ns=timestamp_ns,
-                            points=points,
-                            point_intensity=point_intensity,
-                            point_timestamp_ns=point_timestamp_ns,
-                            source_path=str(path),
-                            source_frame_index=source_frame_index,
-                            source_sequence_index=sequence_index,
-                            object_labels=object_labels,
-                            scans=scans,
-                        )
+                    yield FrameData(
+                        frame_index=frame_index,
+                        timestamp_ns=timestamp_ns,
+                        points=points,
+                        point_intensity=point_intensity,
+                        point_timestamp_ns=point_timestamp_ns,
+                        source_path=str(path),
+                        source_frame_index=source_frame_index,
+                        source_sequence_index=sequence_index,
+                        object_labels=object_labels,
+                        scans=scans,
                     )
                     last_timestamp_ns = timestamp_ns
                     frame_index += 1
                     source_frame_index += 1
-        return frames
+
+    def close(self) -> None:
+        return None
+
+    def drain_pending_object_labels(self, frame_index: int, max_timestamp_ns: int | None = None) -> list[ObjectLabelData]:
+        _ = frame_index, max_timestamp_ns
+        return []
 
     def _scan_to_data(self, scan: object) -> LidarScanData | None:
         pointcloud = getattr(scan, "pointcloud", None)

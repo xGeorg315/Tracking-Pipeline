@@ -1,0 +1,10 @@
+{
+  "gt_match_assignment": "one_to_one",
+  "gt_match_matched_count": 106,
+  "gt_match_max_timestamp_delta_ns": 20067029338,
+  "gt_match_mean_timestamp_delta_ns": 2541700932.207547,
+  "gt_match_mode": "timestamp_only",
+  "gt_match_saved_track_count": 106,
+  "gt_match_unmatched_gt_count": 67,
+  "gt_match_unmatched_saved_count": 0
+}

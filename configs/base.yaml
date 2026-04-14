@@ -117,11 +117,15 @@ class_normalization:
     motorbike: TLS_VEHICLE_MOTORBIKE
     motorcycle: TLS_VEHICLE_MOTORBIKE
 output:
+  mode: run
   root_dir: runs
+  dataset_root_dir: dataset
   save_world: false
   save_aggregate_intensity: true
   require_track_exit: true
   track_exit_edge_margin: 5 
+runtime:
+  cpu_cores: 0
 visualization:
   enabled: true
   color_by_intensity: false

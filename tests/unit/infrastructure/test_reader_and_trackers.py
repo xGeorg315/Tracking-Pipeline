@@ -104,7 +104,7 @@ def _write_object_list_fixture(path: Path) -> Path:
 
 def test_a42_reader_reads_fixture() -> None:
     fixture = Path(__file__).resolve().parents[2] / "fixtures" / "sample_a42.pb"
-    frames = A42PBReader().iter_frames([str(fixture)])
+    frames = list(A42PBReader().iter_frames([str(fixture)]))
     assert len(frames) == 10
     assert frames[0].points.shape[1] == 3
     assert frames[0].source_path == str(fixture.resolve())
@@ -119,7 +119,7 @@ def test_a42_reader_reads_fixture() -> None:
 
 def test_a42_reader_concatenates_multiple_files_with_global_frame_index() -> None:
     fixture = Path(__file__).resolve().parents[2] / "fixtures" / "sample_a42.pb"
-    frames = A42PBReader().iter_frames([str(fixture), str(fixture)])
+    frames = list(A42PBReader().iter_frames([str(fixture), str(fixture)]))
 
     assert len(frames) == 20
     assert frames[0].frame_index == 0
@@ -134,7 +134,7 @@ def test_a42_reader_concatenates_multiple_files_with_global_frame_index() -> Non
 
 def test_a42_reader_reads_object_list_labels(tmp_path: Path) -> None:
     fixture = _write_object_list_fixture(tmp_path / "object_list.pb")
-    frames = A42PBReader().iter_frames([str(fixture)])
+    frames = list(A42PBReader().iter_frames([str(fixture)]))
 
     assert len(frames) == 2
     assert len(frames[0].object_labels) == 2
@@ -171,7 +171,7 @@ def test_a42_reader_reads_range_corrected_reflectivity_from_reflectivity_field(t
         handle.write(struct.pack("<I", len(payload)))
         handle.write(payload)
 
-    frames = A42PBReader(read_intensity=True).iter_frames([str(fixture)])
+    frames = list(A42PBReader(read_intensity=True).iter_frames([str(fixture)]))
 
     assert len(frames) == 1
     assert frames[0].point_intensity is not None
@@ -206,7 +206,7 @@ def test_a42_reader_falls_back_to_intensity_for_range_corrected_reflectivity(tmp
         handle.write(struct.pack("<I", len(payload)))
         handle.write(payload)
 
-    frames = A42PBReader(read_intensity=True).iter_frames([str(fixture)])
+    frames = list(A42PBReader(read_intensity=True).iter_frames([str(fixture)]))
 
     assert len(frames) == 1
     assert frames[0].point_intensity is not None
@@ -240,7 +240,7 @@ def test_a42_reader_prefers_reflectivity_over_intensity_for_range_corrected_outp
         handle.write(struct.pack("<I", len(payload)))
         handle.write(payload)
 
-    frames = A42PBReader(read_intensity=True).iter_frames([str(fixture)])
+    frames = list(A42PBReader(read_intensity=True).iter_frames([str(fixture)]))
 
     assert len(frames) == 1
     assert frames[0].point_intensity is not None
@@ -266,7 +266,7 @@ def test_a42_reader_reads_current_dataset_reflectivity_as_range_corrected_output
     raw_signal = np.frombuffer(raw_scan.pointcloud.reflectivity, dtype="<u2").astype(np.float32) / 65535.0
     expected = raw_signal[finite_mask] * np.sum(np.square(raw_xyz[finite_mask]), axis=1, dtype=np.float32)
 
-    frames = A42PBReader(read_intensity=True).iter_frames([str(fixture)])
+    frames = list(A42PBReader(read_intensity=True).iter_frames([str(fixture)]))
 
     assert len(raw_scan.pointcloud.intensity) == 0
     assert len(raw_scan.pointcloud.reflectivity) > 0
@@ -296,7 +296,7 @@ def test_a42_reader_reads_absolute_point_timestamps_from_timestamp_offset(tmp_pa
         handle.write(struct.pack("<I", len(payload)))
         handle.write(payload)
 
-    frames = A42PBReader(read_intensity=False).iter_frames([str(fixture)])
+    frames = list(A42PBReader(read_intensity=False).iter_frames([str(fixture)]))
 
     assert len(frames) == 1
     assert frames[0].point_timestamp_ns is not None

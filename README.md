@@ -46,6 +46,12 @@ Mit Dev- und Benchmark-Extras:
 pip install -e '.[dev,registration,benchmark]'
 ```
 
+Mit Live-QB2-Input ueber QB2 API + MQTT:
+
+```bash
+pip install -e '.[live]'
+```
+
 Klassifikation ist standardmaessig deaktiviert. Wenn du sie aktivieren willst, brauchst du zusaetzlich ein passendes PointNeXt-Checkout, einen Checkpoint und eine installierte PyTorch-Version.
 
 PointNeXt kann in dieselbe `.venv` integriert werden:
@@ -62,11 +68,48 @@ Das Skript initialisiert das `openpoints`-Submodul und installiert eine CPU-taug
 tracking-pipeline run -c configs/kalman_voxel.yaml
 ```
 
+Fuer Live-QB2-Frames mit MQTT-GT:
+
+```bash
+tracking-pipeline run -c configs/qb2_live_example.yaml
+```
+
+Der Live-Run bleibt offen, bis du ihn mit `Ctrl+C` oder `SIGTERM` beendest. Dann finalisiert die Pipeline den aktuellen Stand und schreibt die normalen Run-Artefakte einmal am Ende weg. Wenn `visualization.live_web_enabled: true` gesetzt ist, startet derselbe Prozess zusaetzlich einen headless Browser-Viewer fuer die rohe Live-Punktwolke.
+
 ### Replay starten
 
 ```bash
 tracking-pipeline replay -c configs/kalman_small_gicp.yaml
 ```
+
+### Live-Viewer fuer laufenden Dataset-Run
+
+```bash
+tracking-pipeline live-view -c configs/qb2_live_example.yaml
+```
+
+Optional kannst du dich mit `--run-id <run_id>` an einen bestimmten laufenden oder zuletzt geschriebenen Dataset-Run haengen. Der Live-Viewer ist ein separater, read-only Open3D-Prozess fuer bereits geschriebene Snapshot-Stats unter `dataset/_stats/...`; v1 unterstuetzt bewusst nur `output.mode: dataset` und zeigt einen leichteren Live-Zustand statt vollem Replay.
+
+### Browser-Live-Viewer fuer headless Server
+
+```yaml
+visualization:
+  live_web_enabled: true
+  live_web_host: 0.0.0.0
+  live_web_port: 8765
+  live_web_history_sec: 0.8
+  max_points: 40000
+```
+
+Danach ist der Viewer waehrend des laufenden `tracking-pipeline run -c ...` unter `http://<server>:8765` erreichbar. Er streamt pro verarbeitetem `qb2_live`-Frame die rohe Punktwolke direkt aus dem Prozess in den Browser, haelt clientseitig einen Rolling Buffer der letzten `0.8s` und blendet optional Lane-Box, Exit-Linie, Tracker-Debug und Outcome-Beacons ein.
+
+### Snapshot-Fallback fuer bereits geschriebene Dataset-Stats
+
+```bash
+tracking-pipeline live-web -c configs/qb2_live_example.yaml --host 0.0.0.0 --port 8765
+```
+
+Dieser separate Befehl bleibt als read-only Fallback fuer bereits geschriebene `dataset/_stats/...`-Snapshots erhalten. Er liest dieselben Snapshot-Dateien wie `live-view`, laeuft aber komplett headless als HTTP-Server.
 
 ### Benchmark starten
 
@@ -125,6 +168,7 @@ flowchart LR
 | Typ | Status | Zweck |
 | --- | --- | --- |
 | `a42_pb` | implementiert | Reader fuer length-delimited `Frame`-Messages aus `.pb`-Dateien |
+| `qb2_live` | implementiert | Live-Reader fuer QB2-Rohframes ueber `QB2PointCloudService.stream()` plus GT/Object-Labels ueber MQTT |
 
 ### Clusterer
 
@@ -216,6 +260,7 @@ Die YAML-Konfiguration ist in feste Sektionen aufgeteilt:
 - `aggregation`
 - `postprocessing`
 - `output`
+- `runtime`
 - `visualization`
 
 Wichtig fuer den Alltag:
@@ -223,10 +268,17 @@ Wichtig fuer den Alltag:
 - Ein Preset wird automatisch mit `base.yaml` im selben Verzeichnis deep-merged.
 - Relative `input.paths` werden relativ zur Config-Datei aufgeloest.
 - `input.paths` akzeptiert Dateien und Ordner. Ordner werden nicht rekursiv durchsucht; alle direkten `.pb`-Dateien werden nach Dateiname als eine Sequenz genommen.
+- Fuer `input.format: qb2_live` duerfen `input.paths: []` gesetzt werden; die Pipeline synthesisiert dann automatisch einen stabilen Quellnamen `qb2_live://<sensor>@<ip>`.
 - `benchmark`-Manifeste loesen `sequences` und `presets` ebenfalls relativ zur Manifestdatei auf.
 - `benchmark.sequences` akzeptiert ebenfalls Dateien und Ordner mit derselben Ordnersemantik pro Sequence-Eintrag.
 - `postprocessing.enable_articulated_vehicle_merge` merged Zugfahrzeug und Anhaenger nur im finalen Output; die normalen Replay-Tracks bleiben unveraendert.
 - `visualization.show_articulated_merge_debug: true` blendet im Replay ein Debug-Overlay fuer Trailer-Merge-Paare ein; zur Laufzeit per `M` umschaltbar.
+- `qb2_live` wird in v1 nur von `run` unterstuetzt; `replay` und `benchmark` bleiben bewusst dateibasiert.
+- `live-view` haengt sich separat an bestehende Snapshot-Stats eines laufenden oder kuerzlich geschriebenen `dataset`-Runs; der Service selbst bleibt headless.
+- `runtime.cpu_cores` begrenzt auf Linux die Pipeline per CPU-Affinity plus numerische Thread-Limits auf die angegebene Kernzahl; `0` bedeutet keine explizite Begrenzung.
+- `output.mode` waehlt exklusiv zwischen klassischem Run-Ordner (`run`) und globalem Dataset-Baum (`dataset`); es wird nie beides gleichzeitig geschrieben.
+- Im `dataset`-Modus liegen die Tagesstatistiken unter `dataset/_stats/YYYY-MM-DD/<run_id>/`.
+- Bei `qb2_live` werden `live_status.json`, `object_list/`, `tracks.jsonl`, `summary.json`, `gt_matching/` und `aggregates/` bereits waehrend des laufenden Runs als Zwischenstand aktualisiert.
 
 Die vollstaendige Referenz steht in [docs/config-reference.md](docs/config-reference.md).
 
@@ -240,6 +292,7 @@ Die vollstaendige Referenz steht in [docs/config-reference.md](docs/config-refer
 | `configs/kalman_feature_global_then_local.yaml` | schwierigere Initiallagen mit globalem Vorab-Alignment |
 | `configs/hungarian_weighted.yaml` | globales Matching plus gewichtete Fusion |
 | `configs/benchmark_curated_real.yaml` | Vergleich mehrerer Presets auf kuratierter Sequenzmenge |
+| `configs/qb2_live_example.yaml` | Live-QB2-Frames plus MQTT-Objektlisten fuer `run` |
 
 ## Weiterfuehrende Docs
 
@@ -256,7 +309,8 @@ Die vollstaendige Referenz steht in [docs/config-reference.md](docs/config-refer
 
 ## Bekannte Grenzen
 
-- Eingangsformat ist aktuell auf `a42_pb` beschraenkt.
+- `qb2_live` ist in v1 auf genau einen QB2-Sensor pro Run ausgelegt.
+- Live-Input wird nur von `run` unterstuetzt; `replay` und `benchmark` erwarten weiterhin endliche dateibasierte Sequenzen.
 - Der Replay-Viewer ist lokal und Open3D-basiert, nicht browserbasiert.
 - Einige Clusterer oder Backends sind an optionale Extras gebunden.
 - Benchmarking nutzt Proxy-Metriken; Qualitaetsranking ist nicht automatisch Ground-Truth-Evaluation.

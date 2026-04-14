@@ -14,7 +14,7 @@ Diese Seite beschreibt die YAML-Konfiguration der Pipeline auf Basis der aktuell
 
 ## Unterstuetzte Werte
 
-- `input.format`: `a42_pb`
+- `input.format`: `a42_pb`, `qb2_live`
 - `clustering.algorithm`: `dbscan`, `euclidean_clustering`, `ground_removed_dbscan`, `hdbscan`, `voxel_grid_connected_components`, `range_image_connected_components`, `range_image_depth_jump`, `beam_neighbor_region_growing`
 - `tracking.algorithm`: `euclidean_nn`, `kalman_nn`, `hungarian_kalman`
 - `aggregation.algorithm`: `voxel_fusion`, `registration_voxel_fusion`, `weighted_voxel_fusion`, `occupancy_consensus_fusion`
@@ -44,8 +44,69 @@ output:
 
 | Feld | Default | Bedeutung |
 | --- | --- | --- |
-| `paths` | kein Default | Eingabedateien oder Ordner; Ordner werden zu direkten `.pb`-Dateien in Namensreihenfolge expandiert |
-| `format` | `a42_pb` | Reader-Auswahl |
+| `paths` | kein Default | Eingabedateien oder Ordner; Ordner werden zu direkten `.pb`-Dateien in Namensreihenfolge expandiert; bei `qb2_live` darf die Liste leer sein |
+| `format` | `a42_pb` | Reader-Auswahl (`a42_pb` fuer Dateien, `qb2_live` fuer Live-QB2 + MQTT) |
+| `qb2_live` | `{}` | Live-Konfiguration fuer `qb2_live`; wird fuer `a42_pb` ignoriert |
+
+### `input.qb2_live`
+
+| Feld | Default | Bedeutung |
+| --- | --- | --- |
+| `sensor_name` | `""` | logischer Sensorname fuer Kalibrierung, Scans und GT-Labels |
+| `ip` | `""` | QB2-IP/FQDN fuer `blickfeld_qb2.Channel` |
+| `api_key` | `""` | Application-Key-Secret fuer den QB2-Zugriff |
+| `mqtt.host` | `""` | MQTT-Broker fuer QB2-Objekt-/GT-Nachrichten |
+| `mqtt.port` | `1883` | MQTT-Port |
+| `mqtt.topic` | `""` | MQTT-Topic mit `states -> states -> trafficLane -> vehicles`-Payloads |
+| `mqtt.keepalive` | `60` | MQTT-Keepalive in Sekunden |
+| `max_frames` | `0` | optionales Live-Frame-Limit; `0` bedeutet unbegrenzt |
+| `idle_timeout_sec` | `5.0` | Abbruch, wenn so lange keine neuen QB2-Rohframes eintreffen |
+| `mqtt_drain_tolerance_sec` | `0.25` | kleine Zeit-Toleranz fuer leicht vorlaufende MQTT-Labels beim Anhaengen an Raw-Frames |
+| `mqtt_max_pending_age_sec` | `3.0` | Pending-MQTT-Labels, die relativ zum aktuellen Raw-Frame aelter sind, werden aus der Queue geloescht |
+
+Typische Live-Konfiguration:
+
+```yaml
+input:
+  format: qb2_live
+  paths: []
+  qb2_live:
+    sensor_name: class_qb2
+    ip: 10.16.3.160
+    api_key: YOUR_API_KEY
+    mqtt:
+      host: 10.16.3.111
+      port: 1883
+      topic: blickfeld/states_160
+      keepalive: 60
+    max_frames: 0
+    idle_timeout_sec: 5.0
+```
+
+Wichtige Semantik:
+
+- Wenn `paths: []` gesetzt ist, synthesisiert der Loader automatisch `qb2_live://<sensor_name>@<ip>` als stabile Run-Quelle.
+- `qb2_live` wird in v1 nur von `tracking-pipeline run` unterstuetzt.
+- `tracking-pipeline replay` und `tracking-pipeline benchmark` lehnen `qb2_live` bewusst frueh ab.
+- Live-Runs aktualisieren `live_status.json` fortlaufend und schreiben Zwischenstaende fuer Objektliste, Tracks, Summary, GT-Matching und Aggregates bereits waehrend des Laufs.
+
+## `runtime`
+
+| Feld | Default | Bedeutung |
+| --- | --- | --- |
+| `cpu_cores` | `0` | Best-Effort-Limit fuer CPU-Kerne/Threads; `0` bedeutet keine explizite Begrenzung |
+
+Beispiel:
+
+```yaml
+runtime:
+  cpu_cores: 4
+```
+
+Hinweise:
+
+- Auf Linux nutzt die Pipeline dafuer primaer CPU-Affinity auf dem Prozess.
+- Zusaetzlich werden numerische Thread-Umgebungsvariablen sowie PyTorch-Thread-Limits best effort auf dieselbe Zahl gesetzt.
 
 ## `preprocessing`
 
@@ -258,11 +319,21 @@ Wichtige Semantik:
 
 | Feld | Default | Bedeutung |
 | --- | --- | --- |
-| `root_dir` | `runs` | Zielverzeichnis fuer Run-Artefakte |
+| `mode` | `run` | exklusiver Output-Modus: `run` fuer klassischen Run-Ordner, `dataset` fuer den globalen Dataset-Baum |
+| `root_dir` | `runs` | Zielverzeichnis fuer Run-Artefakte bei `mode: run` |
+| `dataset_root_dir` | `dataset` | Zielverzeichnis fuer den globalen Dataset-Baum bei `mode: dataset` |
 | `save_world` | `false` | speichert Aggregate in Welt- statt Lokalkoordinaten |
 | `save_aggregate_intensity` | `false` | schreibt range-korrigierte Reflectivity als PCD-Feld `reflectivity` mit |
 | `require_track_exit` | `true` | speichert nur Tracks, die die Lane-Box verlassen haben |
 | `track_exit_edge_margin` | `0.9` | Offset der Exit-Linie von der Min-Seite der Lane-Laengsachse; der letzte Track-Center muss diese Linie passiert haben |
+
+Hinweise:
+
+- Es wird immer genau eines geschrieben: entweder der Run-Ordner oder der Dataset-Baum.
+- `benchmark` lehnt `output.mode: dataset` bewusst ab.
+- Im `dataset`-Modus liegen Tagesstatistiken unter `dataset/_stats/YYYY-MM-DD/<run_id>/`.
+- `tracking-pipeline live-view -c <config>` unterstuetzt in v1 nur `output.mode: dataset` und liest die bestehenden Snapshot-Dateien read-only aus diesem Baum.
+- `tracking-pipeline live-web -c <config> [--host <host>] [--port <port>]` bleibt ein Snapshot-Fallback fuer denselben Dataset-Pfad; der echte Live-Raw-PCD-Webviewer wird direkt aus `tracking-pipeline run` heraus ueber `visualization.live_web_*` gestartet.
 
 ## `visualization`
 
@@ -271,12 +342,29 @@ Wichtige Semantik:
 | `enabled` | `true` | aktiviert Replay-Visualisierung |
 | `color_by_intensity` | `false` | faerbt Lane/Cluster/Aggregate nach range-korrigierter Reflectivity; nur fuer die Anzeige robust normalisiert |
 | `show_full_frame_pcd` | `false` | blendet die komplette rohe Frame-Punktwolke als Hintergrund-Layer im Replay ein |
-| `show_tracker_debug` | `false` | zeigt Tracker-Predictions, Match-/Miss-/Spawn-Overlay und HUD im Replay |
-| `show_track_outcome_debug` | `false` | zeigt Save-/Skip-Beacons, Failure-Tails und Outcome-HUD fuer finalisierte Tracks |
+| `show_tracker_debug` | `false` | zeigt Tracker-Predictions, Match-/Miss-/Spawn-Overlay und HUD im Replay; dient auch als Default-Toggle fuer `live-view` |
+| `show_track_outcome_debug` | `false` | zeigt Save-/Skip-Beacons, Failure-Tails und Outcome-HUD fuer finalisierte Tracks; dient auch als Default-Toggle fuer `live-view` |
 | `show_articulated_merge_debug` | `false` | zeigt Trailer-Merge-Paare, Tail-/Full-Gap-HUD und Outcome-Beacons im Replay; per Taste `M` umschaltbar |
+| `live_web_enabled` | `false` | startet fuer `input.format: qb2_live` einen eingebetteten headless Browser-Viewer direkt im laufenden `run`-Prozess |
+| `live_web_host` | `0.0.0.0` | Bind-Host fuer den eingebetteten Browser-Viewer |
+| `live_web_port` | `8765` | TCP-Port fuer den eingebetteten Browser-Viewer |
+| `live_web_history_sec` | `0.8` | History-Fenster fuer den Browser-Viewer, falls `live_web_retain_all_frames: false` gesetzt ist |
+| `live_web_retain_all_frames` | `true` | behaelt alle Live-Frames waehrend des Runs im eingebetteten Browser-Viewer, statt sie auf ein Rolling Window zu beschraenken |
+| `live_web_point_source` | `lane` | Punktquelle fuer den eingebetteten Browser-Viewer; `lane` streamt nur Lane-Punkte, `all` die komplette Frame-Punktwolke |
 | `max_points` | `120000` | Punktlimit fuer den Viewer |
 | `max_cluster_points` | `15000` | Punktlimit pro Cluster im Viewer |
 | `max_assoc_dist` | `4.2` | Darstellungsdistanz fuer Assoziationshilfen |
+
+Hinweise:
+
+- `live-view` ist ein separater Open3D-Prozess fuer den aktuellen Snapshot-Zustand eines laufenden `dataset`-Runs, nicht das normale Replay.
+- V1 von `live-view` zeigt bewusst keine volle Rohpunktwolke, keine Aggregate-PCDs und keine Playback-Timeline, sondern Lane-Box, Exit-Linie, letzten Tracker-Snapshot, Outcome-Beacons und HUD.
+- Wenn `visualization.live_web_enabled: true` aktiv ist und `input.format: qb2_live` laeuft, startet `tracking-pipeline run` einen eingebetteten Browser-Viewer fuer die rohe Live-Punktwolke direkt im Pipeline-Prozess.
+- Dieser Live-Webviewer streamt pro Frame je nach `live_web_point_source` entweder nur `lane_points` oder die komplette Frame-Punktwolke als `points_xyz`, dazu Tracker-Overlay und die zuletzt bekannten `track_outcomes` in den Browser.
+- Standardmaessig werden Live-Frames fuer die gesamte Run-Dauer gehalten (`live_web_retain_all_frames: true`), damit der Browser Frames sequentiell weiterladen kann und nicht nur innerhalb eines kurzen Buffers arbeitet.
+- Wenn stattdessen ein Rolling Window gewuenscht ist, kann `live_web_retain_all_frames: false` gesetzt werden; dann greift wieder `live_web_history_sec`.
+- `max_points` dient in diesem Pfad als serverseitiges Punktbudget pro Live-Frame.
+- Der CLI-Befehl `tracking-pipeline live-web ...` bleibt als read-only Snapshot-Fallback erhalten und nutzt weiterhin die bereits geschriebenen Dataset-Stats statt den direkten Rohframe-Stream.
 
 ## Benchmark-Manifest
 

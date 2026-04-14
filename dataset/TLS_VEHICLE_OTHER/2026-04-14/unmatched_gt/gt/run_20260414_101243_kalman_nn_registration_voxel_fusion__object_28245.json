@@ -1,0 +1,16 @@
+{
+  "bucket": "unmatched_gt",
+  "class_name": "TLS_VEHICLE_OTHER",
+  "day": "2026-04-14",
+  "frame_index": 1372,
+  "obj_class": "TLS_VEHICLE_OTHER",
+  "obj_class_score": 0.0,
+  "object_id": 28245,
+  "pcd_path": "TLS_VEHICLE_OTHER/2026-04-14/unmatched_gt/gt/run_20260414_101243_kalman_nn_registration_voxel_fusion__object_28245.pcd",
+  "point_count": 314,
+  "run_id": "20260414_101243_kalman_nn_registration_voxel_fusion",
+  "sample_id": "run_20260414_101243_kalman_nn_registration_voxel_fusion__object_28245",
+  "sensor_name": "class_qb2",
+  "source_path": "qb2_live://class_qb2@10.16.3.160",
+  "timestamp_ns": 1776154704507718254
+}

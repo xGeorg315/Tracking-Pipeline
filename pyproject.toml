@@ -27,6 +27,10 @@ registration = [
 benchmark = [
   "hdbscan>=0.8",
 ]
+live = [
+  "blickfeld-qb2",
+  "paho-mqtt",
+]
 
 [project.scripts]
 tracking-pipeline = "tracking_pipeline.cli:main"

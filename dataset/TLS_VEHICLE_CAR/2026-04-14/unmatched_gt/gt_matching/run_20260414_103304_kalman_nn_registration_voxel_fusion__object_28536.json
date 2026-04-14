@@ -1,0 +1,23 @@
+{
+  "assignment_cost": null,
+  "bucket": "unmatched_gt",
+  "class_name": "TLS_VEHICLE_CAR",
+  "day": "2026-04-14",
+  "gt_frame_index": 1002,
+  "gt_obj_class": "TLS_VEHICLE_CAR",
+  "gt_obj_class_score": 0.0,
+  "gt_object_id": 28536,
+  "gt_path": "TLS_VEHICLE_CAR/2026-04-14/unmatched_gt/gt/run_20260414_103304_kalman_nn_registration_voxel_fusion__object_28536.json",
+  "gt_pcd_path": "TLS_VEHICLE_CAR/2026-04-14/unmatched_gt/gt/run_20260414_103304_kalman_nn_registration_voxel_fusion__object_28536.pcd",
+  "gt_timestamp_ns": 1776155817353131871,
+  "match_json_path": "TLS_VEHICLE_CAR/2026-04-14/unmatched_gt/gt_matching/run_20260414_103304_kalman_nn_registration_voxel_fusion__object_28536.json",
+  "matched": false,
+  "our_last_frame_id": -1,
+  "our_last_timestamp_ns": -1,
+  "predicted_class_name": "",
+  "run_id": "20260414_103304_kalman_nn_registration_voxel_fusion",
+  "sample_id": "run_20260414_103304_kalman_nn_registration_voxel_fusion__object_28536",
+  "timestamp_delta_ns": null,
+  "track_id": -1,
+  "unmatched_reason": "unmatched_gt"
+}

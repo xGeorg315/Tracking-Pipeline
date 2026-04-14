@@ -9,7 +9,7 @@ import yaml
 from tracking_pipeline.config.models import BenchmarkConfig, PipelineConfig
 
 
-SUPPORTED_INPUT_FORMATS = {"a42_pb"}
+SUPPORTED_INPUT_FORMATS = {"a42_pb", "qb2_live"}
 SUPPORTED_CLUSTERERS = {
     "dbscan",
     "euclidean_clustering",
@@ -49,6 +49,7 @@ SUPPORTED_REGISTRATION_BACKENDS = {
 SUPPORTED_FUSION_WEIGHT_MODES = {"uniform", "point_count", "quality"}
 SUPPORTED_CLASSIFICATION_BACKENDS = {"pointnext"}
 SUPPORTED_CLASSIFICATION_DEVICES = {"auto", "cpu", "cuda", "mps"}
+SUPPORTED_OUTPUT_MODES = {"run", "dataset"}
 
 
 class ConfigError(ValueError):
@@ -99,11 +100,40 @@ def _load_classification_model_cfg(config: PipelineConfig) -> dict[str, Any]:
 def validate_config(config: PipelineConfig) -> None:
     if config.input.format not in SUPPORTED_INPUT_FORMATS:
         raise ConfigError(f"Unsupported input format: {config.input.format}")
-    if not config.input.paths:
-        raise ConfigError("input.paths must not be empty")
-    for input_path in config.input.paths:
-        if not Path(input_path).exists():
-            raise ConfigError(f"Input path does not exist: {input_path}")
+    if config.input.format == "a42_pb":
+        if not config.input.paths:
+            raise ConfigError("input.paths must not be empty")
+        for input_path in config.input.paths:
+            if not Path(input_path).exists():
+                raise ConfigError(f"Input path does not exist: {input_path}")
+    elif config.input.format == "qb2_live":
+        if config.input.qb2_live is None:
+            raise ConfigError("input.qb2_live must be configured for input.format=qb2_live")
+        live = config.input.qb2_live
+        if not live.sensor_name.strip():
+            raise ConfigError("input.qb2_live.sensor_name must not be empty")
+        if not live.ip.strip():
+            raise ConfigError("input.qb2_live.ip must not be empty")
+        if not live.api_key.strip():
+            raise ConfigError("input.qb2_live.api_key must not be empty")
+        if not live.mqtt.host.strip():
+            raise ConfigError("input.qb2_live.mqtt.host must not be empty")
+        if not live.mqtt.topic.strip():
+            raise ConfigError("input.qb2_live.mqtt.topic must not be empty")
+        if int(live.max_frames) < 0:
+            raise ConfigError("input.qb2_live.max_frames must be >= 0")
+        if float(live.idle_timeout_sec) <= 0:
+            raise ConfigError("input.qb2_live.idle_timeout_sec must be > 0")
+        if float(live.mqtt_drain_tolerance_sec) < 0:
+            raise ConfigError("input.qb2_live.mqtt_drain_tolerance_sec must be >= 0")
+        if float(live.mqtt_max_pending_age_sec) <= 0:
+            raise ConfigError("input.qb2_live.mqtt_max_pending_age_sec must be > 0")
+        if int(live.mqtt.port) <= 0:
+            raise ConfigError("input.qb2_live.mqtt.port must be > 0")
+        if int(live.mqtt.keepalive) <= 0:
+            raise ConfigError("input.qb2_live.mqtt.keepalive must be > 0")
+        if not config.input.paths:
+            raise ConfigError("input.paths must not be empty")
     if config.clustering.algorithm not in SUPPORTED_CLUSTERERS:
         raise ConfigError(f"Unsupported clustering algorithm: {config.clustering.algorithm}")
     if config.tracking.algorithm not in SUPPORTED_TRACKERS:
@@ -120,6 +150,14 @@ def validate_config(config: PipelineConfig) -> None:
         raise ConfigError(f"Unsupported classification backend: {config.classification.backend}")
     if config.classification.device not in SUPPORTED_CLASSIFICATION_DEVICES:
         raise ConfigError(f"Unsupported classification device: {config.classification.device}")
+    if config.output.mode not in SUPPORTED_OUTPUT_MODES:
+        raise ConfigError(f"Unsupported output mode: {config.output.mode}")
+    if not str(config.output.root_dir).strip():
+        raise ConfigError("output.root_dir must not be empty")
+    if not str(config.output.dataset_root_dir).strip():
+        raise ConfigError("output.dataset_root_dir must not be empty")
+    if int(config.runtime.cpu_cores) < 0:
+        raise ConfigError("runtime.cpu_cores must be >= 0")
     if not isinstance(config.aggregation.symmetry_completion, bool):
         raise ConfigError("aggregation.symmetry_completion must be a boolean")
     if not isinstance(config.aggregation.motion_deskew, bool):
@@ -142,6 +180,18 @@ def validate_config(config: PipelineConfig) -> None:
         raise ConfigError("visualization.show_track_outcome_debug must be a boolean")
     if not isinstance(config.visualization.show_articulated_merge_debug, bool):
         raise ConfigError("visualization.show_articulated_merge_debug must be a boolean")
+    if not isinstance(config.visualization.live_web_enabled, bool):
+        raise ConfigError("visualization.live_web_enabled must be a boolean")
+    if not str(config.visualization.live_web_host).strip():
+        raise ConfigError("visualization.live_web_host must not be empty")
+    if int(config.visualization.live_web_port) <= 0:
+        raise ConfigError("visualization.live_web_port must be > 0")
+    if float(config.visualization.live_web_history_sec) <= 0:
+        raise ConfigError("visualization.live_web_history_sec must be > 0")
+    if not isinstance(config.visualization.live_web_retain_all_frames, bool):
+        raise ConfigError("visualization.live_web_retain_all_frames must be a boolean")
+    if str(config.visualization.live_web_point_source) not in {"lane", "all"}:
+        raise ConfigError("visualization.live_web_point_source must be one of: lane, all")
     if len(config.preprocessing.lane_box) != 6:
         raise ConfigError("preprocessing.lane_box must contain exactly 6 values")
     if config.preprocessing.bootstrap_frames < 0:

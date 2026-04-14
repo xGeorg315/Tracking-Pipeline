@@ -4,6 +4,8 @@ import argparse
 from pathlib import Path
 
 from tracking_pipeline.application.benchmark_run import BenchmarkRunner
+from tracking_pipeline.application.live_view import live_view
+from tracking_pipeline.application.live_web import live_web
 from tracking_pipeline.application.replay_run import replay_run
 from tracking_pipeline.application.run_pipeline import run_pipeline
 from tracking_pipeline.config.loader import load_benchmark_config, load_config
@@ -52,6 +54,16 @@ def build_parser() -> argparse.ArgumentParser:
     replay_parser = subparsers.add_parser("replay", help="Replay a pipeline run in Open3D")
     replay_parser.add_argument("-c", "--config", required=True, help="Path to a YAML config")
 
+    live_view_parser = subparsers.add_parser("live-view", help="Attach an Open3D live viewer to snapshot stats")
+    live_view_parser.add_argument("-c", "--config", required=True, help="Path to a YAML config")
+    live_view_parser.add_argument("--run-id", default="", help="Optional explicit live run ID to attach to")
+
+    live_web_parser = subparsers.add_parser("live-web", help="Serve the live snapshot viewer over HTTP")
+    live_web_parser.add_argument("-c", "--config", required=True, help="Path to a YAML config")
+    live_web_parser.add_argument("--run-id", default="", help="Optional explicit live run ID to attach to")
+    live_web_parser.add_argument("--host", default="127.0.0.1", help="Bind host, e.g. 127.0.0.1 or 0.0.0.0")
+    live_web_parser.add_argument("--port", type=int, default=8765, help="Bind port for the HTTP viewer")
+
     benchmark_parser = subparsers.add_parser("benchmark", help="Benchmark multiple presets on one or more sequences")
     benchmark_parser.add_argument("-c", "--config", required=True, help="Path to a benchmark YAML config")
     return parser
@@ -90,6 +102,22 @@ def main() -> None:
     if args.command == "replay":
         config = load_config(args.config)
         replay_run(config, project_root)
+        return
+
+    if args.command == "live-view":
+        config = load_config(args.config)
+        live_view(config, project_root, run_id=str(args.run_id or "").strip() or None)
+        return
+
+    if args.command == "live-web":
+        config = load_config(args.config)
+        live_web(
+            config,
+            project_root,
+            run_id=str(args.run_id or "").strip() or None,
+            host=str(args.host or "").strip() or "127.0.0.1",
+            port=int(args.port),
+        )
         return
 
     if args.command == "benchmark":

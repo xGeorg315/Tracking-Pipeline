@@ -23,6 +23,13 @@ def resolve_output_root(config: PipelineConfig, project_root: Path) -> Path:
     return (project_root / root).resolve()
 
 
+def resolve_dataset_root(config: PipelineConfig, project_root: Path) -> Path:
+    root = Path(config.output.dataset_root_dir)
+    if root.is_absolute():
+        return root
+    return (project_root / root).resolve()
+
+
 def resolve_benchmark_root(config: BenchmarkConfig, project_root: Path) -> Path:
     root = Path(config.output_root)
     if root.is_absolute():

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Protocol
 
@@ -23,7 +24,7 @@ from tracking_pipeline.domain.value_objects import LaneBox
 
 
 class FrameReader(Protocol):
-    def iter_frames(self, input_paths: list[str]) -> list[FrameData]: ...
+    def iter_frames(self, input_paths: list[str]) -> Iterable[FrameData]: ...
 
 
 class Clusterer(Protocol):

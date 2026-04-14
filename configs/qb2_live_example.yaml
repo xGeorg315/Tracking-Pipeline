@@ -1,0 +1,77 @@
+input:
+  format: qb2_live
+  paths: []
+  qb2_live:
+    sensor_name: class_qb2
+    ip: 10.16.3.160
+    api_key: api_key_123
+    mqtt:
+      host: 10.16.3.111
+      port: 1883
+      topic: blickfeld/states_160
+      keepalive: 60
+    max_frames: 0
+    idle_timeout_sec: 30.0
+    mqtt_drain_tolerance_sec: 0.25
+    mqtt_max_pending_age_sec: 3.0
+# input:
+#   paths:
+#     - ../data/medium_2 # 115 Vehicles
+#     # - ../data/medium_energy # 159 Vehicles
+tracking:
+  algorithm: kalman_nn
+  max_dist: 7.5
+  max_missed: 2
+  min_track_hits: 6
+  sticky_extra_dist_per_missed: 1.0
+  sticky_max_dist: 12.0
+  kf_process_var: 0.8
+  kf_meas_var: 1.2
+  association_size_weight: 0.05
+aggregation:
+  algorithm: registration_voxel_fusion
+  registration_backend: icp_point_to_plane
+  frame_selection_method: keyframe_motion
+  keyframe_keep: 8
+  enable_registration_underfill_fallback: true
+  enable_tail_bridge: false
+  enable_post_filter_stat_outlier_removal: true
+  registration_min_kept_chunks: 2
+  registration_max_iter: 30
+  registration_max_translation: 3.5
+  registration_min_fitness: 0.3
+  registration_max_corr_dist: 0.5
+  shape_consistency_filter: false
+  truncate_after_lane_end_touch: true
+  enable_confidence_point_cap: false
+  confidence_point_cap_max_points: 2048
+  confidence_point_cap_bins: 16
+postprocessing:
+  enable_trajectory_smoothing: false 
+  enable_articulated_vehicle_merge: true
+  articulated_gap_eval_window_frames: 5
+  articulated_min_overlap_frames: 3
+  articulated_min_overlap_ratio: 0.6
+  articulated_max_lateral_offset: 0.6
+  articulated_max_vertical_offset: 5
+  articulated_max_hitch_gap: 1.75
+  articulated_max_hitch_gap_std: 0.6
+  articulated_max_speed_delta: 0.30
+  articulated_min_combined_length: 5.0
+output:
+  mode: dataset
+  dataset_root_dir: /mnt/data/Tracking-Pipeline/dataset
+warumup_runs: 1
+measure_runs: 1
+runtime:
+  cpu_cores: 4
+visualization:
+  show_tracker_debug: true
+  show_track_outcome_debug: true
+  live_web_enabled: true
+  live_web_host: 0.0.0.0
+  live_web_port: 8765
+  live_web_history_sec: 2.5
+  live_web_retain_all_frames: true
+  live_web_point_source: lane
+  max_points: 40000

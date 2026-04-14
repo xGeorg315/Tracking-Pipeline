@@ -64,6 +64,7 @@ src/tracking_pipeline/infrastructure/postprocessing/tracklet_stitching.py
 src/tracking_pipeline/infrastructure/postprocessing/trajectory_smoothing.py
 src/tracking_pipeline/infrastructure/readers/__init__.py
 src/tracking_pipeline/infrastructure/readers/a42_pb_reader.py
+src/tracking_pipeline/infrastructure/readers/qb2_live_reader.py
 src/tracking_pipeline/infrastructure/readers/a42_proto/__init__.py
 src/tracking_pipeline/infrastructure/readers/a42_proto/common.py
 src/tracking_pipeline/infrastructure/readers/a42_proto/data.py
