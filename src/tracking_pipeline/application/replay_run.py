@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -39,12 +40,14 @@ def replay_run(config: PipelineConfig, project_root: Path) -> None:
 
     states = []
     latest_object_labels: dict[int, ObjectLabelData] = {}
+    object_label_history_by_id: dict[int, list[ObjectLabelData]] = defaultdict(list)
     try:
         for frame in reader.iter_frames(config.input.paths):
             for object_label in frame.object_labels:
                 if len(object_label.points) == 0:
                     continue
                 normalized_object_label = class_normalizer.normalize_object_label(object_label)
+                object_label_history_by_id[int(object_label.object_id)].append(normalized_object_label)
                 current = latest_object_labels.get(int(object_label.object_id))
                 if _is_newer_object_label(normalized_object_label, current):
                     latest_object_labels[int(object_label.object_id)] = normalized_object_label
@@ -75,7 +78,7 @@ def replay_run(config: PipelineConfig, project_root: Path) -> None:
     matched_gt, unmatched_saved_tracks, _, _ = match_saved_aggregates_to_gt(
         tracks,
         aggregate_results,
-        latest_object_labels,
+        dict(object_label_history_by_id),
         class_normalizer,
     )
     apply_gt_matches_to_results(aggregate_results, matched_gt, unmatched_saved_tracks)

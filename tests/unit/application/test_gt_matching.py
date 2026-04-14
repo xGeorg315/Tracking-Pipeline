@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from tracking_pipeline.application.class_normalization import ClassNormalizer
-from tracking_pipeline.application.gt_matching import apply_gt_matches_to_results, match_saved_aggregates_to_gt
+from tracking_pipeline.application.gt_matching import GT_MATCH_MODE, apply_gt_matches_to_results, match_saved_aggregates_to_gt
 from tracking_pipeline.config.models import ClassNormalizationConfig
 from tracking_pipeline.domain.models import AggregateResult, ObjectLabelData, Track
 
@@ -30,11 +30,20 @@ def _saved_result(track_id: int) -> AggregateResult:
     )
 
 
-def _gt_label(object_id: int, *, frame_index: int, timestamp_ns: int) -> ObjectLabelData:
+def _gt_label(
+    object_id: int,
+    *,
+    frame_index: int,
+    timestamp_ns: int,
+    center_x: float | None = None,
+    center_y: float = 0.0,
+    center_z: float = 0.0,
+) -> ObjectLabelData:
+    point_x = float(object_id) if center_x is None else float(center_x)
     return ObjectLabelData(
         object_id=int(object_id),
         timestamp_ns=int(timestamp_ns),
-        points=np.array([[float(object_id), 0.0, 0.0]], dtype=np.float32),
+        points=np.array([[point_x, float(center_y), float(center_z)]], dtype=np.float32),
         obj_class=f"class_{int(object_id)}",
         obj_class_score=0.5 + 0.01 * float(object_id),
         frame_index=int(frame_index),
@@ -62,6 +71,7 @@ def test_gt_matching_assigns_saved_tracks_one_to_one_by_min_timestamp_delta() ->
     assert {(match.track_id, match.gt_obj_class) for match in matches} == {(1, "class_7"), (2, "class_8")}
     assert summary["gt_match_saved_track_count"] == 2
     assert summary["gt_match_matched_count"] == 2
+    assert summary["gt_match_mode"] == GT_MATCH_MODE
 
 
 def test_gt_matching_marks_extra_saved_tracks_as_unmatched() -> None:
@@ -144,10 +154,36 @@ def test_gt_matching_only_annotates_saved_results() -> None:
     apply_gt_matches_to_results([saved, skipped], matches, unmatched_saved)
 
     assert saved.metrics["gt_matched"] is True
+    assert saved.metrics["gt_match_mode"] == GT_MATCH_MODE
     assert saved.metrics["gt_object_id"] == 7
     assert saved.metrics["gt_obj_class"] == "class_7"
     assert abs(float(saved.metrics["gt_obj_class_score"]) - 0.57) < 1e-6
     assert "gt_matched" not in skipped.metrics
+
+
+def test_gt_matching_uses_object_history_instead_of_only_latest_snapshot() -> None:
+    tracks = {1: _saved_track(1, frame_id=10, timestamp_ns=1_000)}
+    saved = _saved_result(1)
+    tracks[1].centers[0] = np.array([0.05, 0.0, 0.0], dtype=np.float32)
+    labels = {
+        7: [
+            _gt_label(7, frame_index=9, timestamp_ns=995, center_x=0.10),
+            _gt_label(7, frame_index=40, timestamp_ns=4_000, center_x=100.0),
+        ],
+        8: [
+            _gt_label(8, frame_index=10, timestamp_ns=1_000, center_x=5.0),
+        ],
+    }
+
+    matches, unmatched_saved, unmatched_gt, summary = match_saved_aggregates_to_gt(tracks, [saved], labels)
+
+    assert unmatched_saved == []
+    assert len(unmatched_gt) == 1
+    assert len(matches) == 1
+    assert matches[0].gt_object_id == 7
+    assert matches[0].gt_timestamp_ns == 995
+    assert matches[0].timestamp_delta_ns == 5
+    assert summary["gt_match_mode"] == GT_MATCH_MODE
 
 
 def test_gt_matching_normalizes_gt_class_names_when_normalizer_is_provided() -> None:

@@ -310,7 +310,7 @@ def test_artifact_writer_writes_gt_matching_artifacts_and_track_fields(tmp_path:
         status="saved",
         metrics={
             "gt_matched": True,
-            "gt_match_mode": "timestamp_only",
+            "gt_match_mode": "track_center_trajectory",
             "gt_match_assignment": "one_to_one",
             "gt_object_id": 17,
             "gt_obj_class": "truck",
@@ -344,7 +344,7 @@ def test_artifact_writer_writes_gt_matching_artifacts_and_track_fields(tmp_path:
             "gt_match_matched_count": 1,
             "gt_match_unmatched_saved_count": 0,
             "gt_match_unmatched_gt_count": 0,
-            "gt_match_mode": "timestamp_only",
+            "gt_match_mode": "track_center_trajectory",
             "gt_match_assignment": "one_to_one",
             "gt_match_mean_timestamp_delta_ns": 5.0,
             "gt_match_max_timestamp_delta_ns": 5,
@@ -362,7 +362,7 @@ def test_artifact_writer_writes_gt_matching_artifacts_and_track_fields(tmp_path:
     assert track_rows[0]["gt_obj_class_score"] == 0.83
     assert track_rows[0]["gt_timestamp_ns"] == 1005
     assert track_rows[0]["gt_timestamp_delta_ns"] == 5
-    assert track_rows[0]["gt_match_mode"] == "timestamp_only"
+    assert track_rows[0]["gt_match_mode"] == "track_center_trajectory"
     assert track_rows[0]["gt_match_assignment"] == "one_to_one"
     assert match_rows[0]["track_id"] == 5
     assert match_rows[0]["gt_object_id"] == 17

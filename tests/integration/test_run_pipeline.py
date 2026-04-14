@@ -123,7 +123,7 @@ def test_run_pipeline_creates_run_artifacts(tmp_path: Path) -> None:
     assert "class_match_count" in payload
     assert "class_mismatch_count" in payload
     assert "class_count_rows" in payload
-    assert payload["gt_match_mode"] == "timestamp_only"
+    assert payload["gt_match_mode"] == "track_center_trajectory"
     assert payload["gt_match_assignment"] == "one_to_one"
     assert "performance" in payload
     assert "read_frames" in payload["performance"]["stages"]
@@ -262,7 +262,7 @@ def test_run_pipeline_exports_latest_object_list_artifacts(tmp_path: Path) -> No
     assert manifest_rows[0]["frame_index"] == 1
     assert manifest_rows[0]["point_count"] == 2
     assert payload["gt_match_saved_track_count"] >= 0
-    assert payload["gt_match_mode"] == "timestamp_only"
+    assert payload["gt_match_mode"] == "track_center_trajectory"
     assert payload["gt_match_assignment"] == "one_to_one"
     assert payload["gt_class_counts"] == {"TLS_VEHICLE_CAR": 1}
     assert class_stats_payload["gt_class_counts"] == {"TLS_VEHICLE_CAR": 1}

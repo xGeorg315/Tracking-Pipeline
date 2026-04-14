@@ -18,6 +18,7 @@ from tracking_pipeline.infrastructure.aggregation.registration_backends import (
 from tracking_pipeline.infrastructure.aggregation.registration_voxel_fusion import RegistrationVoxelFusionAccumulator
 from tracking_pipeline.infrastructure.aggregation.voxel_fusion import VoxelFusionAccumulator, _AggregationComponentProfiler
 from tracking_pipeline.infrastructure.aggregation.weighted_voxel_fusion import WeightedVoxelFusionAccumulator
+from tracking_pipeline.shared.geometry import transform_points
 
 
 def _track() -> Track:
@@ -197,6 +198,32 @@ def _constant_chunk(x_value: float) -> np.ndarray:
     ).astype(np.float32)
 
 
+def _rotation_x(angle_rad: float) -> np.ndarray:
+    cos_angle = float(np.cos(angle_rad))
+    sin_angle = float(np.sin(angle_rad))
+    return np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, cos_angle, -sin_angle],
+            [0.0, sin_angle, cos_angle],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _rotation_z(angle_rad: float) -> np.ndarray:
+    cos_angle = float(np.cos(angle_rad))
+    sin_angle = float(np.sin(angle_rad))
+    return np.array(
+        [
+            [cos_angle, -sin_angle, 0.0],
+            [sin_angle, cos_angle, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
 class _ScriptedRegistrationBackend(_BaseRegistrationBackend):
     name = "scripted"
 
@@ -211,6 +238,20 @@ class _ScriptedRegistrationBackend(_BaseRegistrationBackend):
         transform = np.eye(4, dtype=np.float64)
         transform[0, 3] = float(translation_x)
         return transform, float(fitness), 0.01
+
+
+class _ScriptedTransformRegistrationBackend(_BaseRegistrationBackend):
+    name = "scripted_transform"
+
+    def __init__(self, config: AggregationConfig, transform: np.ndarray, *, fitness: float = 1.0, rmse: float = 0.01):
+        super().__init__(config)
+        self.transform = np.asarray(transform, dtype=np.float64)
+        self.fitness = float(fitness)
+        self.rmse = float(rmse)
+
+    def _register_pair(self, source_xyz: np.ndarray, target_xyz: np.ndarray) -> tuple[np.ndarray, float, float]:
+        _ = source_xyz, target_xyz
+        return self.transform.copy(), self.fitness, self.rmse
 
 
 class _SubsetRegistrationAccumulator(VoxelFusionAccumulator):
@@ -1326,6 +1367,73 @@ def test_registration_backend_keeps_only_anchor_and_accepted_chunks() -> None:
     assert np.allclose(np.mean(backend.seen_targets[0], axis=0), np.mean(chunks[0], axis=0))
     assert np.allclose(np.mean(backend.seen_targets[1], axis=0), np.mean(chunks[0], axis=0))
     assert np.allclose(aligned[1], chunks[2])
+
+
+def test_registration_backend_projects_transform_to_allowed_dofs() -> None:
+    source = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.5, 0.1, 0.0],
+            [1.1, 0.0, 0.1],
+            [0.2, 0.8, 0.2],
+            [0.7, 0.9, 0.3],
+            [1.2, 0.4, 0.5],
+            [0.3, 1.2, 0.7],
+            [1.0, 1.1, 0.9],
+        ],
+        dtype=np.float32,
+    )
+    allowed_transform = np.eye(4, dtype=np.float64)
+    allowed_transform[:3, :3] = _rotation_z(np.deg2rad(30.0))
+    allowed_transform[0, 3] = 1.25
+    raw_transform = allowed_transform.copy()
+    raw_transform[:3, :3] = allowed_transform[:3, :3] @ _rotation_x(np.deg2rad(15.0))
+    raw_transform[1, 3] = -0.40
+    raw_transform[2, 3] = 0.60
+    target = transform_points(source, allowed_transform)
+    backend = _ScriptedTransformRegistrationBackend(
+        AggregationConfig(
+            registration_min_fitness=0.95,
+            registration_max_translation=3.2,
+            registration_max_corr_dist=0.2,
+            frame_downsample_voxel=0.0,
+            registration_allowed_dofs=["tx", "yaw"],
+        ),
+        raw_transform,
+    )
+
+    aligned, metrics = backend.align_chunks([target, source])
+
+    assert len(aligned) == 2
+    assert metrics["registration_allowed_dofs"] == ["tx", "yaw"]
+    assert metrics["registration_accepted"] == 1
+    assert np.allclose(aligned[1], target, atol=1e-5)
+
+
+def test_registration_backend_recomputes_metrics_after_dof_projection() -> None:
+    source = _constant_chunk(0.0)
+    raw_transform = np.eye(4, dtype=np.float64)
+    raw_transform[0, 3] = 1.0
+    raw_transform[1, 3] = 1.0
+    target = transform_points(source, raw_transform)
+    backend = _ScriptedTransformRegistrationBackend(
+        AggregationConfig(
+            registration_min_fitness=0.25,
+            registration_max_translation=3.2,
+            registration_max_corr_dist=0.1,
+            frame_downsample_voxel=0.0,
+            registration_allowed_dofs=["tx"],
+        ),
+        raw_transform,
+        fitness=1.0,
+    )
+
+    aligned, metrics = backend.align_chunks([target, source])
+
+    assert len(aligned) == 1
+    assert metrics["registration_accepted"] == 0
+    assert metrics["registration_rejected"] == 1
+    assert np.isclose(metrics["registration_mean_fitness"], 0.0)
 
 
 def test_kiss_matcher_icp_backend_returns_unavailable_without_optional_modules(monkeypatch) -> None:

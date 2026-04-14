@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 import json
 import os
@@ -204,6 +204,7 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
     live_artifact_state = _build_live_artifact_state(config.input.format)
     try:
         latest_object_labels: dict[int, ObjectLabelData] = {}
+        object_label_history_by_id: dict[int, list[ObjectLabelData]] = defaultdict(list)
         object_list_seen_ids: set[int] = set()
         object_list_skipped_empty = 0
         tracker_states = []
@@ -226,6 +227,7 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
                     skipped_empty, object_list_updated = _ingest_object_labels(
                         frame.object_labels,
                         latest_object_labels,
+                        object_label_history_by_id,
                         object_list_seen_ids,
                         class_normalizer,
                     )
@@ -275,6 +277,7 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
                         classifier=classifier,
                         class_normalizer=class_normalizer,
                         latest_object_labels=latest_object_labels,
+                        object_label_history_by_id=object_label_history_by_id,
                         object_list_seen_ids=object_list_seen_ids,
                         object_list_skipped_empty=object_list_skipped_empty,
                         tracker_states=tracker_states,
@@ -311,6 +314,7 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
                     max_timestamp_ns=last_processed_frame_timestamp_ns,
                 ),
                 latest_object_labels,
+                object_label_history_by_id,
                 object_list_seen_ids,
                 class_normalizer,
             )
@@ -358,6 +362,7 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
             classifier=classifier,
             class_normalizer=class_normalizer,
             latest_object_labels=latest_object_labels,
+            object_label_history_by_id=object_label_history_by_id,
             object_list_seen_ids=object_list_seen_ids,
             object_list_skipped_empty=object_list_skipped_empty,
             tracker_states=tracker_states,
@@ -408,7 +413,7 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
             matched_gt, unmatched_saved_tracks, unmatched_gt_objects, gt_match_summary = match_saved_aggregates_to_gt(
                 tracks,
                 aggregate_results,
-                latest_object_labels,
+                dict(object_label_history_by_id),
                 class_normalizer,
             )
             apply_gt_matches_to_results(aggregate_results, matched_gt, unmatched_saved_tracks)
@@ -847,6 +852,7 @@ def _maybe_write_live_artifact_snapshot(
     classifier,
     class_normalizer: ClassNormalizer,
     latest_object_labels: dict[int, ObjectLabelData],
+    object_label_history_by_id: dict[int, list[ObjectLabelData]],
     object_list_seen_ids: set[int],
     object_list_skipped_empty: int,
     tracker_states: list,
@@ -880,6 +886,7 @@ def _maybe_write_live_artifact_snapshot(
         classifier=classifier,
         class_normalizer=class_normalizer,
         latest_object_labels=latest_object_labels,
+        object_label_history_by_id=object_label_history_by_id,
         object_list_seen_ids=object_list_seen_ids,
         object_list_skipped_empty=object_list_skipped_empty,
         tracker_states=snapshot_tracker_states,
@@ -904,6 +911,7 @@ def _write_live_artifact_snapshot(
     classifier,
     class_normalizer: ClassNormalizer,
     latest_object_labels: dict[int, ObjectLabelData],
+    object_label_history_by_id: dict[int, list[ObjectLabelData]],
     object_list_seen_ids: set[int],
     object_list_skipped_empty: int,
     tracker_states: list,
@@ -950,7 +958,7 @@ def _write_live_artifact_snapshot(
         matched_gt, unmatched_saved_tracks, unmatched_gt_objects, gt_match_summary = match_saved_aggregates_to_gt(
             tracks,
             aggregate_results,
-            latest_object_labels,
+            dict(object_label_history_by_id),
             class_normalizer,
         )
         apply_gt_matches_to_results(aggregate_results, matched_gt, unmatched_saved_tracks)
@@ -1174,6 +1182,7 @@ def _drain_pending_object_labels(
 def _ingest_object_labels(
     object_labels: list[ObjectLabelData],
     latest_object_labels: dict[int, ObjectLabelData],
+    object_label_history_by_id: dict[int, list[ObjectLabelData]],
     object_list_seen_ids: set[int],
     class_normalizer: ClassNormalizer,
 ) -> tuple[int, bool]:
@@ -1185,6 +1194,7 @@ def _ingest_object_labels(
             skipped_empty += 1
             continue
         normalized_object_label = class_normalizer.normalize_object_label(object_label)
+        object_label_history_by_id[int(object_label.object_id)].append(normalized_object_label)
         current = latest_object_labels.get(int(object_label.object_id))
         if _is_newer_object_label(normalized_object_label, current):
             latest_object_labels[int(object_label.object_id)] = normalized_object_label

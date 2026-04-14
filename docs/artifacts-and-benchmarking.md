@@ -69,6 +69,8 @@ Wichtige Felder:
 
 `predicted_class_counts` zaehlt nur finale `saved`-Aggregate mit gesetzter `predicted_class_name`. `gt_class_counts` basiert auf den exportierten, nicht-leeren GT-Objektlabels des Runs. `matched_gt_class_counts` und die GT-Spalte in `class_count_rows` zaehlen dagegen nur gematchte Saved-Tracks. `class_comparison_count`, `class_match_count` und `class_mismatch_count` betrachten ebenfalls nur gematchte Saved-Tracks, bei denen sowohl Prediction als auch GT-Klasse vorhanden sind. Wenn `class_normalization.enabled=true`, werden Prediction und GT vorher auf dieselbe Zieltaxonomie normalisiert.
 
+`gt_match_mode` ist aktuell `track_center_trajectory`: Saved-Tracks werden per one-to-one Assignment gegen die komplette GT-Historie jedes Objekt-IDs gematcht. Die Kosten basieren primaer auf der mittleren Distanz zwischen Track-Zentren und den zeitlich naechsten GT-Snapshots; `gt_timestamp_ns` und `gt_timestamp_delta_ns` referenzieren danach den GT-Snapshot der zugeordneten Objekt-ID, der zeitlich dem Track-Ende am naechsten liegt.
+
 ### `summary.json.performance`
 
 Seit der Performance-Erweiterung schreibt `run` ein verschachteltes `performance`-Objekt:
@@ -285,7 +287,7 @@ Falls GT-Objektlabels vorhanden sind, wird zusaetzlich `gt_matching/` geschriebe
 - `unmatched_gt_objects.jsonl`
 - `summary.json`
 
-`matches.jsonl` und `unmatched_gt_objects.jsonl` enthalten neben IDs und Zeitstempeln auch `gt_obj_class` und `gt_obj_class_score`, falls das Objektlabel eine Klasse traegt.
+`matches.jsonl` und `unmatched_gt_objects.jsonl` enthalten neben IDs und Zeitstempeln auch `gt_obj_class` und `gt_obj_class_score`, falls das Objektlabel eine Klasse traegt. Im aktuellen Matcher ist `assignment_cost` die Trajektorienkosten des one-to-one Matchings, nicht nur ein reiner Timestamp-Abstand.
 
 ## Benchmark-Artefakte
 

@@ -20,6 +20,7 @@ Diese Seite beschreibt die YAML-Konfiguration der Pipeline auf Basis der aktuell
 - `aggregation.algorithm`: `voxel_fusion`, `registration_voxel_fusion`, `weighted_voxel_fusion`, `occupancy_consensus_fusion`
 - `aggregation.frame_selection_method`: `auto`, `all_track_frames`, `line_touch_last_k`, `keyframe_motion`, `length_coverage`, `quality_coverage`, `tail_coverage`, `center_diversity`, `max_extent`
 - `aggregation.registration_backend`: `small_gicp`, `icp_point_to_plane`, `generalized_icp`, `feature_global_then_local`, `kiss_matcher`, `kiss_matcher_then_icp`
+- `aggregation.registration_allowed_dofs`: `tx`, `ty`, `tz`, `roll`, `pitch`, `yaw`
 - `aggregation.fusion_weight_mode`: `uniform`, `point_count`, `quality`
 
 ## Beispiel: Pipeline-Config
@@ -211,6 +212,7 @@ Hinweise:
 | `registration_max_iter` | `80` | Iterationslimit fuer lokales Alignment |
 | `registration_min_fitness` | `0.25` | Mindestfitness fuer akzeptierte Registrierung |
 | `registration_max_translation` | `3.2` | Obergrenze fuer akzeptierte Translation |
+| `registration_allowed_dofs` | `[tx, ty, tz, roll, pitch, yaw]` | erlaubte Freiheitsgrade fuer die angewendete Registrierungs-Transformation |
 | `enable_registration_underfill_fallback` | `false` | faellt bei zu wenigen behaltenen Registration-Chunks auf die unregistrierten selektierten Chunks zurueck |
 | `registration_min_kept_chunks` | `4` | Mindestanzahl an Registration-Chunks vor dem optionalen Underfill-Fallback |
 | `global_registration_voxel` | `0.12` | Downsampling fuer globales Feature-Matching |

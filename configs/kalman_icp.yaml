@@ -29,6 +29,7 @@ tracking:
 aggregation:
   algorithm: registration_voxel_fusion
   registration_backend: icp_point_to_plane
+  registration_allowed_dofs: [tx, ty, tz]
   frame_selection_method: keyframe_motion
   keyframe_keep: 8
   enable_registration_underfill_fallback: true

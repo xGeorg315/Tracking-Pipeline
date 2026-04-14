@@ -851,6 +851,33 @@ def test_load_config_accepts_kiss_matcher_registration_backend(tmp_path: Path) -
     assert config.aggregation.registration_backend == "kiss_matcher"
 
 
+def test_load_config_accepts_registration_allowed_dofs(tmp_path: Path) -> None:
+    fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+
+    config_path = tmp_path / "config_registration_dofs.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "aggregation:",
+                "  registration_allowed_dofs: [tx, ty, yaw]",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.input.paths == [str(fixture_dst.resolve())]
+    assert config.aggregation.registration_allowed_dofs == ["tx", "ty", "yaw"]
+
+
 @pytest.mark.parametrize("method", ["quality_coverage", "tail_coverage", "center_diversity"])
 def test_load_config_accepts_new_frame_selection_methods(tmp_path: Path, method: str) -> None:
     fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
@@ -877,6 +904,31 @@ def test_load_config_accepts_new_frame_selection_methods(tmp_path: Path, method:
 
     assert config.input.paths == [str(fixture_dst.resolve())]
     assert config.aggregation.frame_selection_method == method
+
+
+def test_load_config_rejects_invalid_registration_allowed_dofs(tmp_path: Path) -> None:
+    _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+
+    config_path = tmp_path / "config_invalid_registration_dofs.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "aggregation:",
+                "  registration_allowed_dofs: [tx, turbo_spin]",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="aggregation.registration_allowed_dofs contains unsupported value: turbo_spin"):
+        load_config(config_path)
 
 
 def test_load_config_rejects_invalid_confidence_point_cap_settings(tmp_path: Path) -> None:

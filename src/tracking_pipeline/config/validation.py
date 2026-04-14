@@ -46,6 +46,7 @@ SUPPORTED_REGISTRATION_BACKENDS = {
     "kiss_matcher",
     "kiss_matcher_then_icp",
 }
+SUPPORTED_REGISTRATION_DOFS = {"tx", "ty", "tz", "roll", "pitch", "yaw"}
 SUPPORTED_FUSION_WEIGHT_MODES = {"uniform", "point_count", "quality"}
 SUPPORTED_CLASSIFICATION_BACKENDS = {"pointnext"}
 SUPPORTED_CLASSIFICATION_DEVICES = {"auto", "cpu", "cuda", "mps"}
@@ -144,6 +145,15 @@ def validate_config(config: PipelineConfig) -> None:
         raise ConfigError(f"Unsupported frame selection method: {config.aggregation.frame_selection_method}")
     if config.aggregation.registration_backend not in SUPPORTED_REGISTRATION_BACKENDS:
         raise ConfigError(f"Unsupported registration backend: {config.aggregation.registration_backend}")
+    if not isinstance(config.aggregation.registration_allowed_dofs, (list, tuple)):
+        raise ConfigError("aggregation.registration_allowed_dofs must be a list")
+    if not config.aggregation.registration_allowed_dofs:
+        raise ConfigError("aggregation.registration_allowed_dofs must contain at least one value")
+    for raw_dof in config.aggregation.registration_allowed_dofs:
+        if not isinstance(raw_dof, str):
+            raise ConfigError("aggregation.registration_allowed_dofs entries must be strings")
+        if raw_dof not in SUPPORTED_REGISTRATION_DOFS:
+            raise ConfigError(f"aggregation.registration_allowed_dofs contains unsupported value: {raw_dof}")
     if config.aggregation.fusion_weight_mode not in SUPPORTED_FUSION_WEIGHT_MODES:
         raise ConfigError(f"Unsupported fusion weight mode: {config.aggregation.fusion_weight_mode}")
     if config.classification.backend not in SUPPORTED_CLASSIFICATION_BACKENDS:
