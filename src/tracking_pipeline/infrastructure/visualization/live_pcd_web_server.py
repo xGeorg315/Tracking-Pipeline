@@ -256,7 +256,7 @@ _HTML = """<!doctype html>
       <section class="panel section">
         <p class="eyebrow">Tracking Pipeline</p>
         <h1 class="title">Live Raw PCD Viewer</h1>
-        <p class="subtitle">Headless browser viewer for the in-process `qb2_live` stream. The scene plays queued live frames with an adaptive speed so it stays smooth and close to realtime.</p>
+        <p class="subtitle">Headless browser viewer for the in-process `qb2_live` stream. The scene normally plays at 5 Hz and only speeds up on larger backlogs, capped at 10 Hz.</p>
         <div class="toolbar">
           <button id="pauseBtn">Pause</button>
           <button id="trackerBtn">Tracker</button>
@@ -301,7 +301,7 @@ Mouse wheel: zoom
       <div class="viewer-head">
         <div>
           <h2 class="viewer-title">Sequential Point Cloud</h2>
-          <p class="viewer-note">Continuous live playback. Frames are fetched sequentially in small batches, and the viewer snaps back to the live tail if it falls too far behind.</p>
+          <p class="viewer-note">Continuous live playback. Frames are fetched sequentially in small batches at 5 Hz, with bounded catch-up up to 10 Hz if the queue gets crowded.</p>
         </div>
         <div class="status-pill" id="phasePill">WAITING</div>
       </div>
@@ -332,10 +332,11 @@ Mouse wheel: zoom
     const FRAME_QUEUE_MAX = 6;
     const LAG_DROP_THRESHOLD = 12;
     const LAG_TAIL_KEEP = 3;
-    const PLAYBACK_IDLE_INTERVAL_MS = 64;
-    const PLAYBACK_NORMAL_INTERVAL_MS = 46;
-    const PLAYBACK_FAST_INTERVAL_MS = 30;
-    const PLAYBACK_CATCH_UP_INTERVAL_MS = 18;
+    const PLAYBACK_BASE_INTERVAL_MS = 200;
+    const PLAYBACK_BACKLOG_INTERVAL_MS = 125;
+    const PLAYBACK_MAX_INTERVAL_MS = 100;
+    const PLAYBACK_BACKLOG_QUEUE_THRESHOLD = 5;
+    const PLAYBACK_BACKLOG_LAG_THRESHOLD = 9;
     const OUTCOME_VISIBILITY_SEC = 3.0;
     const MAX_VISIBLE_OUTCOMES = 5;
 
@@ -434,7 +435,7 @@ Mouse wheel: zoom
       lines.push(`phase         ${status.pipeline_phase || "waiting_for_frames"}`);
       lines.push(`frames        ${status.processed_frames || 0}`);
       lines.push(`stored        ${seq.frame_count || 0} frames (${seq.oldest_sequence_id ?? -1}..${seq.latest_sequence_id ?? -1})`);
-      lines.push(`display       batched live queue`);
+      lines.push(`display       5Hz, catch-up <=10Hz`);
       lines.push(`active tracks ${status.active_track_count || 0}`);
       lines.push(`saved aggr    ${status.saved_aggregates || 0}`);
       lines.push(`reader        ${reader.reader_state || "n/a"}`);
@@ -478,7 +479,7 @@ Mouse wheel: zoom
       const lines = [];
       lines.push(`phase=${status.pipeline_phase || "waiting_for_frames"}  seq=${currentFrame ? currentFrame.sequence_id : -1}`);
       lines.push(`frame=${currentFrame ? currentFrame.frame_index : -1}  ts=${currentFrame ? currentFrame.timestamp_ns : -1}`);
-      lines.push(`stored_frames=${seq.frame_count || 0}  queued=${state.pendingFrames.length}  lag=${lag}  display=${state.displayHz > 0 ? state.displayHz.toFixed(1) : "--"}Hz`);
+      lines.push(`stored_frames=${seq.frame_count || 0}  queued=${state.pendingFrames.length}  lag=${lag}  display=${state.displayHz > 0 ? state.displayHz.toFixed(1) : "--"}Hz  target=${playbackTargetHz()}Hz`);
       lines.push(`active_tracks=${status.active_track_count || 0}  outcomes=${shownOutcomes.length}  shown_points=${currentFrame ? currentFrame.point_count || 0 : 0}`);
       lines.push(`displayed=${state.displayedSeq}  fetched=${state.fetchedSeq}  dropped=${state.droppedFrames}`);
       lines.push(`reader=${reader.reader_state || "n/a"}  raw=${reader.raw_frames_received || 0}  mqtt_pending=${reader.pending_label_count || 0}`);
@@ -726,15 +727,16 @@ Mouse wheel: zoom
       const lag = currentLag();
       const queued = state.pendingFrames.length;
       if (lag >= LAG_DROP_THRESHOLD || queued >= FRAME_QUEUE_MAX) {
-        return PLAYBACK_CATCH_UP_INTERVAL_MS;
+        return PLAYBACK_MAX_INTERVAL_MS;
       }
-      if (lag >= 6 || queued >= 6) {
-        return PLAYBACK_FAST_INTERVAL_MS;
+      if (lag >= PLAYBACK_BACKLOG_LAG_THRESHOLD || queued >= PLAYBACK_BACKLOG_QUEUE_THRESHOLD) {
+        return PLAYBACK_BACKLOG_INTERVAL_MS;
       }
-      if (lag >= 3 || queued >= 3) {
-        return PLAYBACK_NORMAL_INTERVAL_MS;
-      }
-      return PLAYBACK_IDLE_INTERVAL_MS;
+      return PLAYBACK_BASE_INTERVAL_MS;
+    }
+
+    function playbackTargetHz() {
+      return (1000.0 / playbackIntervalMs()).toFixed(1);
     }
 
     function scheduleFramePump() {

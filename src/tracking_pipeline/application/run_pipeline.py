@@ -37,7 +37,7 @@ from tracking_pipeline.application.performance import (
 )
 from tracking_pipeline.application.track_outcomes import build_track_outcomes
 from tracking_pipeline.config.models import PipelineConfig, RuntimeConfig
-from tracking_pipeline.domain.models import AggregateResult, ObjectLabelData, RunPerformance, RunSummary, Track
+from tracking_pipeline.domain.models import AggregateResult, ObjectLabelData, RunPerformance, RunSummary, Track, TrackOutcomeDebug
 from tracking_pipeline.infrastructure.logging.run_logger import get_run_logger
 from tracking_pipeline.infrastructure.visualization.live_frame_publisher import LiveFramePublisher
 from tracking_pipeline.infrastructure.visualization.live_pcd_web_server import LivePCDWebServer
@@ -207,6 +207,8 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
         object_label_history_by_id: dict[int, list[ObjectLabelData]] = defaultdict(list)
         object_list_seen_ids: set[int] = set()
         object_list_skipped_empty = 0
+        live_web_track_outcomes: dict[int, TrackOutcomeDebug] = {}
+        live_web_announced_finished_track_ids: set[int] = set()
         tracker_states = []
         frame_count = 0
         last_processed_frame_index = -1
@@ -265,6 +267,18 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
                         active_track_count=int(len(state.active_tracks)),
                     )
                     _publish_live_web_frame(live_web_runtime, frame, cluster_result, state)
+                    _maybe_update_live_web_finished_track_outcomes(
+                        runtime=live_web_runtime,
+                        tracker=tracker,
+                        lane_box=lane_box,
+                        accumulator=accumulator,
+                        classifier=classifier,
+                        class_normalizer=class_normalizer,
+                        tracker_states=tracker_states,
+                        live_track_outcomes=live_web_track_outcomes,
+                        announced_finished_track_ids=live_web_announced_finished_track_ids,
+                        logger=logger,
+                    )
                     _maybe_write_live_artifact_snapshot(
                         config=config,
                         profiler=profiler,
@@ -659,6 +673,60 @@ def _update_live_web_snapshot(runtime, track_outcomes, summary: RunSummary) -> N
         object_list_exported_count=int(summary.object_list_exported_count),
         object_list_seen_ids=int(summary.object_list_seen_ids),
     )
+
+
+def _maybe_update_live_web_finished_track_outcomes(
+    *,
+    runtime,
+    tracker,
+    lane_box,
+    accumulator,
+    classifier,
+    class_normalizer: ClassNormalizer,
+    tracker_states: list,
+    live_track_outcomes: dict[int, TrackOutcomeDebug],
+    announced_finished_track_ids: set[int],
+    logger,
+) -> None:
+    if runtime is None:
+        return
+    publisher = runtime.get("publisher")
+    if not isinstance(publisher, LiveFramePublisher):
+        return
+    finished_tracks = getattr(tracker, "finished_tracks", None)
+    if not isinstance(finished_tracks, dict) or not finished_tracks:
+        return
+    new_track_ids = [
+        int(track_id)
+        for track_id in sorted(int(track_id) for track_id in finished_tracks)
+        if int(track_id) not in announced_finished_track_ids
+    ]
+    if not new_track_ids:
+        return
+
+    new_tracks: dict[int, Track] = {}
+    for track_id in new_track_ids:
+        track = finished_tracks.get(int(track_id))
+        if isinstance(track, Track):
+            new_tracks[int(track_id)] = _clone_track(track)
+    if not new_tracks:
+        announced_finished_track_ids.update(new_track_ids)
+        return
+
+    try:
+        aggregate_results = [accumulator.accumulate(track, lane_box) for track in new_tracks.values()]
+        if hasattr(accumulator, "merge_long_vehicle_aggregates"):
+            aggregate_results = accumulator.merge_long_vehicle_aggregates(new_tracks, aggregate_results, lane_box)
+        aggregate_results = classify_aggregate_results(aggregate_results, classifier, class_normalizer)
+        live_track_outcomes.update(build_track_outcomes(new_tracks, aggregate_results, tracker_states))
+        announced_finished_track_ids.update(new_tracks)
+        publisher.update_track_outcomes(live_track_outcomes)
+        publisher.update_status(
+            finished_track_count=int(len(live_track_outcomes)),
+            saved_aggregates=int(sum(1 for outcome in live_track_outcomes.values() if str(outcome.status) == "saved")),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.info("Live web track outcome update failed: %s", exc)
 
 
 def _stop_live_web_viewer(runtime) -> None:

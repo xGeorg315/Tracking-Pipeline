@@ -1325,6 +1325,106 @@ def test_run_pipeline_starts_embedded_live_web_viewer_for_qb2_live(monkeypatch, 
     assert seen["stop_phases"] == ["stopped"]
 
 
+def test_run_pipeline_restores_live_saved_track_outcomes_without_live_snapshot_writes(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(
+            paths=["qb2_live://class_qb2@10.16.3.160"],
+            format="qb2_live",
+            qb2_live=QB2LiveInputConfig(
+                sensor_name="class_qb2",
+                ip="10.16.3.160",
+                api_key="secret",
+                mqtt=QB2LiveMQTTConfig(host="10.16.3.111", topic="blickfeld/states_160"),
+            ),
+        ),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, 0, 8, 0, 2]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(root_dir=str(tmp_path)),
+        visualization=VisualizationConfig(
+            live_web_enabled=True,
+            live_web_host="0.0.0.0",
+            live_web_port=8765,
+            live_web_history_sec=0.8,
+            live_web_retain_all_frames=True,
+        ),
+    )
+
+    class _FakeFinishingTracker(_FakeTracker):
+        def __init__(self):
+            super().__init__()
+            self.finished_tracks: dict[int, Track] = {}
+
+        def step(self, detections, frame_idx, frame_timestamp_ns):
+            state = super().step(detections, frame_idx, frame_timestamp_ns)
+            self.finished_tracks[int(self.track.track_id)] = self.track
+            return state
+
+    reader = _InterruptingLiveReader(
+        frames=[
+            FrameData(
+                frame_index=0,
+                timestamp_ns=100,
+                points=np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+                point_intensity=np.array([0.2], dtype=np.float32),
+                source_path="qb2_live://class_qb2@10.16.3.160",
+            )
+        ]
+    )
+    fake_writer = _FakeWriter(tmp_path)
+    fake_tracker = _FakeFinishingTracker()
+    seen: dict[str, object] = {}
+
+    class _FakeLiveFramePublisher:
+        def __init__(self, **kwargs):
+            seen["publisher_kwargs"] = dict(kwargs)
+            seen["track_outcomes"] = []
+            seen["status_updates"] = []
+
+        def update_status(self, **updates):
+            seen["status_updates"].append(dict(updates))
+
+        def publish_frame(self, frame, cluster_result, tracking_state):
+            _ = frame, cluster_result, tracking_state
+            return 1
+
+        def update_track_outcomes(self, track_outcomes):
+            seen["track_outcomes"].append(sorted(int(track_id) for track_id in dict(track_outcomes)))
+
+        def update_summary(self, summary):
+            _ = summary
+
+        def mark_stopped(self, *, pipeline_phase: str = "stopped"):
+            _ = pipeline_phase
+
+    class _FakeLivePCDWebServer:
+        def __init__(self, publisher, *, host: str, port: int):
+            _ = publisher, host, port
+            self.port = 9876
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_reader", lambda cfg: reader)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: fake_tracker)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda cfg, root: fake_writer)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.LiveFramePublisher", _FakeLiveFramePublisher)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.LivePCDWebServer", _FakeLivePCDWebServer)
+
+    run_pipeline(config, tmp_path)
+
+    assert len(seen["track_outcomes"]) >= 2
+    assert all(track_outcome_ids == [1] for track_outcome_ids in seen["track_outcomes"])
+    assert fake_writer.summary_write_count >= 2
+
+
 def test_run_pipeline_skips_embedded_live_web_viewer_when_disabled(monkeypatch, tmp_path: Path) -> None:
     config = PipelineConfig(
         input=InputConfig(paths=["ignored_a.pb"]),
