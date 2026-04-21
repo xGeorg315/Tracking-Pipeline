@@ -13,6 +13,7 @@ from tracking_pipeline.infrastructure.aggregation.occupancy_consensus_fusion imp
 from tracking_pipeline.infrastructure.aggregation import registration_backends
 from tracking_pipeline.infrastructure.aggregation.registration_backends import (
     _BaseRegistrationBackend,
+    _anchor_score,
     build_registration_backend,
 )
 from tracking_pipeline.infrastructure.aggregation.registration_voxel_fusion import RegistrationVoxelFusionAccumulator
@@ -284,10 +285,12 @@ class _ScriptedPrepareAccumulator(VoxelFusionAccumulator):
         *,
         keep_indices: list[int],
         chunk_weights: list[float] | None = None,
+        anchor_input_index: int | None = None,
     ):
         super().__init__(config, output_config, tracking_config)
         self.keep_indices = list(keep_indices)
         self.chunk_weights = None if chunk_weights is None else [float(weight) for weight in chunk_weights]
+        self.anchor_input_index = None if anchor_input_index is None else int(anchor_input_index)
 
     def _prepare_for_fusion(self, chunks: list[np.ndarray]) -> tuple[list[np.ndarray], dict[str, object]]:
         keep_indices = [int(index) for index in self.keep_indices if 0 <= int(index) < len(chunks)]
@@ -306,6 +309,7 @@ class _ScriptedPrepareAccumulator(VoxelFusionAccumulator):
             "registration_dropped_count": max(0, len(chunks) - len(keep_indices)),
             "registration_keep_indices": keep_indices,
             "registration_chunk_weights": chunk_weights,
+            "registration_anchor_input_index": self.anchor_input_index,
             "registration_skipped": False,
         }
 
@@ -1037,6 +1041,55 @@ def test_voxel_accumulate_requires_aligned_intensity_for_all_chunks_and_filters_
     assert np.allclose(confidence, np.array([1.4], dtype=np.float32), atol=1e-6)
 
 
+def test_voxel_accumulate_stops_after_threshold_is_exceeded() -> None:
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            fusion_skip_sum_if_vehicle_points_above=5,
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.10,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+    )
+    chunks = [
+        np.array([[0.00, 0.00, 0.0], [0.02, 0.00, 0.0]], dtype=np.float32),
+        np.array([[1.00, 0.00, 0.0], [1.02, 0.00, 0.0]], dtype=np.float32),
+        np.array([[2.00, 0.00, 0.0], [2.02, 0.00, 0.0]], dtype=np.float32),
+        np.array([[3.00, 0.00, 0.0], [3.02, 0.00, 0.0]], dtype=np.float32),
+    ]
+
+    xyz, intensity, confidence, raw_points, fusion_voxels_total, fusion_voxels_kept = accumulator._voxel_accumulate(
+        chunks,
+        [None, None, None, None],
+        [1.0, 1.0, 1.0, 1.0],
+        [0.1, 0.2, 0.3, 0.4],
+        0.10,
+        1,
+    )
+
+    assert raw_points == 6
+    assert fusion_voxels_total == 3
+    assert fusion_voxels_kept == 3
+    assert intensity is None
+    assert np.allclose(
+        xyz,
+        np.array(
+            [
+                [0.01, 0.00, 0.0],
+                [1.01, 0.00, 0.0],
+                [2.01, 0.00, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        atol=1e-6,
+    )
+    assert np.allclose(confidence, np.array([0.1, 0.2, 0.3], dtype=np.float32), atol=1e-6)
+
+
 def test_symmetry_slice_records_counts_one_sided_unique_slices() -> None:
     accumulator = _symmetry_accumulator(enabled=True, save_world=False, fusion_voxel_size=0.10)
     axis_idx, lateral_idx, vertical_idx = accumulator._symmetry_axes()
@@ -1369,6 +1422,129 @@ def test_registration_backend_keeps_only_anchor_and_accepted_chunks() -> None:
     assert np.allclose(aligned[1], chunks[2])
 
 
+def test_registration_backend_uses_most_complete_chunk_as_anchor() -> None:
+    backend = _ScriptedRegistrationBackend(
+        AggregationConfig(registration_min_fitness=0.25, registration_max_translation=3.2, frame_downsample_voxel=0.0),
+        scripted_results=[(0.80, 0.0), (0.80, 0.0)],
+    )
+    chunks = [
+        _points(8, 0.0, 0.8),
+        _points(14, 10.0, 2.4),
+        _points(9, 20.0, 1.0),
+    ]
+
+    aligned, metrics = backend.align_chunks(chunks)
+
+    assert len(aligned) == 3
+    assert metrics["registration_anchor_input_index"] == 1
+    assert metrics["registration_anchor_output_index"] == 0
+    assert metrics["registration_keep_indices"][0] == 1
+    assert np.allclose(np.mean(backend.seen_targets[0], axis=0), np.mean(chunks[1], axis=0))
+    assert float(np.mean(backend.seen_targets[1], axis=0)[1]) < float(np.mean(chunks[1], axis=0)[1])
+    assert np.allclose(aligned[0], chunks[1])
+
+
+def test_registration_anchor_score_prefers_2d_footprint_over_point_count() -> None:
+    chunk_many_points_small_footprint = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.4, 1.5, 0.0],
+            [0.1, 0.8, 0.0],
+            [0.3, 1.2, 0.0],
+            [0.2, 0.4, 0.0],
+            [0.4, 0.9, 0.0],
+            [0.1, 1.4, 0.0],
+            [0.2, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    chunk_fewer_points_large_footprint = np.array(
+        [
+            [0.0, 10.0, 0.0],
+            [1.2, 12.5, 0.0],
+            [0.0, 12.5, 0.0],
+            [1.2, 10.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    assert _anchor_score(chunk_fewer_points_large_footprint, 1, 1) > _anchor_score(chunk_many_points_small_footprint, 0, 1)
+
+
+def test_registration_anchor_score_uses_longitudinal_extent_as_first_tiebreaker() -> None:
+    chunk_shorter = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 2.0, 0.0],
+            [0.0, 2.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    chunk_longer = np.array(
+        [
+            [0.0, 10.0, 0.0],
+            [0.8, 12.5, 0.0],
+            [0.0, 12.5, 0.0],
+            [0.8, 10.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    assert np.isclose(_anchor_score(chunk_shorter, 0, 1)[0], _anchor_score(chunk_longer, 1, 1)[0])
+    assert _anchor_score(chunk_longer, 1, 1) > _anchor_score(chunk_shorter, 0, 1)
+
+
+def test_registration_anchor_score_prefers_longitudinal_extent_when_footprint_matches() -> None:
+    chunk_narrower = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 2.0, 0.0],
+            [0.0, 2.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    chunk_wider = np.array(
+        [
+            [0.0, 10.0, 0.0],
+            [2.0, 11.0, 0.0],
+            [0.0, 11.0, 0.0],
+            [2.0, 10.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    assert np.isclose(_anchor_score(chunk_narrower, 0, 1)[0], _anchor_score(chunk_wider, 1, 1)[0])
+    assert _anchor_score(chunk_narrower, 0, 1) > _anchor_score(chunk_wider, 1, 1)
+
+
+def test_registration_anchor_score_uses_point_count_as_third_tiebreaker() -> None:
+    chunk_fewer_points = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 2.0, 0.0],
+            [0.0, 2.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    chunk_more_points = np.array(
+        [
+            [0.0, 10.0, 0.0],
+            [1.0, 12.0, 0.0],
+            [0.0, 12.0, 0.0],
+            [1.0, 10.0, 0.0],
+            [0.5, 11.0, 0.0],
+            [0.2, 10.5, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    assert np.allclose(compute_extent(chunk_fewer_points), compute_extent(chunk_more_points), atol=1e-6)
+    assert _anchor_score(chunk_more_points, 1, 1) > _anchor_score(chunk_fewer_points, 0, 1)
+
+
 def test_registration_backend_projects_transform_to_allowed_dofs() -> None:
     source = np.array(
         [
@@ -1434,6 +1610,164 @@ def test_registration_backend_recomputes_metrics_after_dof_projection() -> None:
     assert metrics["registration_accepted"] == 0
     assert metrics["registration_rejected"] == 1
     assert np.isclose(metrics["registration_mean_fitness"], 0.0)
+
+
+def test_registration_backend_rejects_transform_above_max_tz() -> None:
+    source = _constant_chunk(0.0)
+    raw_transform = np.eye(4, dtype=np.float64)
+    raw_transform[0, 3] = 0.8
+    raw_transform[2, 3] = 0.7
+    target = transform_points(source, raw_transform)
+    backend = _ScriptedTransformRegistrationBackend(
+        AggregationConfig(
+            registration_min_fitness=0.25,
+            registration_max_translation=3.2,
+            registration_max_tz=0.5,
+            registration_max_corr_dist=0.2,
+            frame_downsample_voxel=0.0,
+            registration_allowed_dofs=["tx", "tz"],
+        ),
+        raw_transform,
+        fitness=1.0,
+    )
+
+    aligned, metrics = backend.align_chunks([target, source])
+
+    assert len(aligned) == 1
+    assert metrics["registration_accepted"] == 0
+    assert metrics["registration_rejected"] == 1
+
+
+def test_registration_backend_accepts_transform_when_max_tz_is_unset() -> None:
+    source = _constant_chunk(0.0)
+    raw_transform = np.eye(4, dtype=np.float64)
+    raw_transform[0, 3] = 0.8
+    raw_transform[2, 3] = 0.7
+    target = transform_points(source, raw_transform)
+    backend = _ScriptedTransformRegistrationBackend(
+        AggregationConfig(
+            registration_min_fitness=0.25,
+            registration_max_translation=3.2,
+            registration_max_corr_dist=0.2,
+            frame_downsample_voxel=0.0,
+            registration_allowed_dofs=["tx", "tz"],
+        ),
+        raw_transform,
+        fitness=1.0,
+    )
+
+    aligned, metrics = backend.align_chunks([target, source])
+
+    assert len(aligned) == 2
+    assert metrics["registration_accepted"] == 1
+
+
+def test_registration_backend_ignores_max_tz_when_tz_dof_is_disabled() -> None:
+    source = _constant_chunk(0.0)
+    raw_transform = np.eye(4, dtype=np.float64)
+    raw_transform[0, 3] = 0.8
+    raw_transform[2, 3] = 0.7
+    projected_transform = np.eye(4, dtype=np.float64)
+    projected_transform[0, 3] = 0.8
+    target = transform_points(source, projected_transform)
+    backend = _ScriptedTransformRegistrationBackend(
+        AggregationConfig(
+            registration_min_fitness=0.95,
+            registration_max_translation=3.2,
+            registration_max_tz=0.1,
+            registration_max_corr_dist=0.2,
+            frame_downsample_voxel=0.0,
+            registration_allowed_dofs=["tx"],
+        ),
+        raw_transform,
+    )
+
+    aligned, metrics = backend.align_chunks([target, source])
+
+    assert len(aligned) == 2
+    assert metrics["registration_accepted"] == 1
+
+
+def test_registration_preserve_anchor_points_keeps_anchor_chunk_points_in_final_aggregate() -> None:
+    chunks = [
+        np.array([[0.00, 0.0, 0.0], [0.09, 0.0, 0.0]], dtype=np.float32),
+        np.array([[0.05, 0.0, 0.0], [0.14, 0.0, 0.0]], dtype=np.float32),
+    ]
+    track = _track_from_chunks(chunks)
+    lane_box = LaneBox.from_values([-1.0, 1.0, -1.0, 1.0, -1.0, 1.0])
+
+    without_preserve = _ScriptedPrepareAccumulator(
+        AggregationConfig(
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.2,
+            aggregate_voxel=0.0,
+            min_saved_aggregate_points=0,
+            enable_post_filter_stat_outlier_removal=False,
+            registration_preserve_anchor_points=False,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+        keep_indices=[0, 1],
+    ).accumulate(track, lane_box)
+
+    with_preserve = _ScriptedPrepareAccumulator(
+        AggregationConfig(
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.2,
+            aggregate_voxel=0.0,
+            min_saved_aggregate_points=0,
+            enable_post_filter_stat_outlier_removal=False,
+            registration_preserve_anchor_points=True,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+        keep_indices=[0, 1],
+    ).accumulate(track, lane_box)
+
+    assert without_preserve.status == "saved"
+    assert with_preserve.status == "saved"
+    assert not any(np.allclose(point, chunks[0][0]) for point in without_preserve.points)
+    assert not any(np.allclose(point, chunks[0][1]) for point in without_preserve.points)
+    assert any(np.allclose(point, chunks[0][0]) for point in with_preserve.points)
+    assert any(np.allclose(point, chunks[0][1]) for point in with_preserve.points)
+    assert with_preserve.metrics["registration_anchor_points_preserved"] is True
+    assert with_preserve.metrics["registration_anchor_point_count"] == 2
+    assert with_preserve.metrics["registration_anchor_points_appended"] == 2
+
+
+def test_registration_preserve_anchor_points_uses_selected_anchor_index() -> None:
+    chunks = [
+        np.array([[0.00, 0.0, 0.0], [0.02, 0.0, 0.0], [0.04, 0.0, 0.0]], dtype=np.float32),
+        np.array([[0.10, 0.0, 0.0], [0.18, 0.0, 0.0], [0.26, 0.0, 0.0]], dtype=np.float32),
+    ]
+    track = _track_from_chunks(chunks)
+    lane_box = LaneBox.from_values([-1.0, 1.0, -1.0, 1.0, -1.0, 1.0])
+
+    result = _ScriptedPrepareAccumulator(
+        AggregationConfig(
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.5,
+            aggregate_voxel=0.0,
+            min_saved_aggregate_points=0,
+            enable_post_filter_stat_outlier_removal=False,
+            registration_preserve_anchor_points=True,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+        keep_indices=[0, 1],
+        anchor_input_index=1,
+    ).accumulate(track, lane_box)
+
+    assert result.status == "saved"
+    assert result.metrics["registration_anchor_input_index"] == 1
+    assert result.metrics["registration_anchor_output_index"] == 1
+    assert result.metrics["registration_anchor_points_preserved"] is True
+    assert any(np.allclose(point, chunks[1][0]) for point in result.points)
+    assert any(np.allclose(point, chunks[1][1]) for point in result.points)
+    assert any(np.allclose(point, chunks[1][2]) for point in result.points)
 
 
 def test_kiss_matcher_icp_backend_returns_unavailable_without_optional_modules(monkeypatch) -> None:

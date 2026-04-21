@@ -212,10 +212,14 @@ Hinweise:
 | `registration_max_iter` | `80` | Iterationslimit fuer lokales Alignment |
 | `registration_min_fitness` | `0.25` | Mindestfitness fuer akzeptierte Registrierung |
 | `registration_max_translation` | `3.2` | Obergrenze fuer akzeptierte Translation |
+| `registration_max_tz` | `null` | optionale Obergrenze fuer die absolute `z`-Verschiebung der akzeptierten Registrierung |
 | `registration_allowed_dofs` | `[tx, ty, tz, roll, pitch, yaw]` | erlaubte Freiheitsgrade fuer die angewendete Registrierungs-Transformation |
+| `registration_preserve_anchor_points` | `false` | behaelt beim `registration_voxel_fusion` die Punkte des intern gewaehlten Registration-Ankers garantiert im finalen Aggregate |
 | `enable_registration_underfill_fallback` | `false` | faellt bei zu wenigen behaltenen Registration-Chunks auf die unregistrierten selektierten Chunks zurueck |
 | `registration_min_kept_chunks` | `4` | Mindestanzahl an Registration-Chunks vor dem optionalen Underfill-Fallback |
 | `global_registration_voxel` | `0.12` | Downsampling fuer globales Feature-Matching |
+
+Der Registration-Anchor wird backend-intern bestimmt. Aktuell priorisiert die Heuristik die groesste longitudinale Ausdehnung entlang `frame_selection_line_axis`, danach groessere Gesamt-Extent-Norm und erst danach die Punktzahl.
 
 ### Fusion und Save-Gating
 

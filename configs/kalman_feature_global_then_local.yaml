@@ -11,5 +11,6 @@ aggregation:
   frame_selection_method: keyframe_motion
   keyframe_keep: 8
   shape_consistency_filter: true
+  fusion_skip_sum_if_vehicle_points_above: 2048
 postprocessing:
   enable_trajectory_smoothing: true

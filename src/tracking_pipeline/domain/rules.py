@@ -504,7 +504,11 @@ def track_exited_lane_box(
     return float(last[axis_idx]) <= float(line_value) and bool(track.ended_by_missed or track.missed > 0)
 
 
-def is_valid_transform(transform: np.ndarray, max_translation: float | None) -> bool:
+def is_valid_transform(
+    transform: np.ndarray,
+    max_translation: float | None,
+    max_tz: float | None = None,
+) -> bool:
     transform = np.asarray(transform, dtype=np.float64)
     if transform.shape != (4, 4) or not np.isfinite(transform).all():
         return False
@@ -514,5 +518,7 @@ def is_valid_transform(transform: np.ndarray, max_translation: float | None) -> 
     if abs(det) < 1e-3 or abs(det) > 5.0:
         return False
     if max_translation is not None and np.linalg.norm(transform[:3, 3]) > float(max_translation):
+        return False
+    if max_tz is not None and abs(float(transform[2, 3])) > float(max_tz):
         return False
     return True

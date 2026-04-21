@@ -176,6 +176,8 @@ def validate_config(config: PipelineConfig) -> None:
         raise ConfigError("aggregation.truncate_after_lane_end_touch must be a boolean")
     if not isinstance(config.aggregation.enable_registration_underfill_fallback, bool):
         raise ConfigError("aggregation.enable_registration_underfill_fallback must be a boolean")
+    if not isinstance(config.aggregation.registration_preserve_anchor_points, bool):
+        raise ConfigError("aggregation.registration_preserve_anchor_points must be a boolean")
     if not isinstance(config.aggregation.enable_confidence_point_cap, bool):
         raise ConfigError("aggregation.enable_confidence_point_cap must be a boolean")
     if not isinstance(config.aggregation.enable_tail_bridge, bool):
@@ -224,6 +226,8 @@ def validate_config(config: PipelineConfig) -> None:
         raise ConfigError("aggregation.confidence_point_cap_max_points must be >= 1")
     if config.aggregation.confidence_point_cap_bins < 1:
         raise ConfigError("aggregation.confidence_point_cap_bins must be >= 1")
+    if config.aggregation.registration_max_tz is not None and float(config.aggregation.registration_max_tz) < 0:
+        raise ConfigError("aggregation.registration_max_tz must be >= 0")
     if config.tracking.min_track_hits < 1:
         raise ConfigError("tracking.min_track_hits must be >= 1")
     if config.postprocessing.stitching_max_gap < 0:

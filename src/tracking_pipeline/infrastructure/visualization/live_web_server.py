@@ -314,6 +314,7 @@ H toggle help</div>
       showHelp: false,
       snapshot: null,
       fetchInFlight: false,
+      pendingForceRefresh: false,
       pollTimer: null,
     };
 
@@ -555,10 +556,14 @@ H toggle help</div>
     }
 
     async function refresh(force = false) {
-      if (state.fetchInFlight) return;
+      if (state.fetchInFlight) {
+        state.pendingForceRefresh = state.pendingForceRefresh || force;
+        return;
+      }
       state.fetchInFlight = true;
       try {
-        const resp = await fetch(`/api/snapshot${force ? "?force=1" : ""}`, { cache: "no-store" });
+        const query = force ? `?force=1&_ts=${Date.now()}` : `?_ts=${Date.now()}`;
+        const resp = await fetch(`/api/snapshot${query}`, { cache: "no-store" });
         const payload = await resp.json();
         state.snapshot = payload;
         setText("statusText", payload.status_text);
@@ -571,6 +576,10 @@ H toggle help</div>
         setText("warningText", `snapshot fetch failed\\n${String(err)}`);
       } finally {
         state.fetchInFlight = false;
+        if (state.pendingForceRefresh) {
+          state.pendingForceRefresh = false;
+          void refresh(true);
+        }
       }
     }
 
@@ -824,5 +833,7 @@ class LiveWebViewerServer:
 
     def snapshot_payload(self, *, run_id: str | None = None, force: bool = False) -> dict[str, Any]:
         with self._lock:
+            if force:
+                self.loader.invalidate_cache()
             snapshot = self.loader.load(run_id=run_id, force=force)
         return build_live_web_payload(snapshot)

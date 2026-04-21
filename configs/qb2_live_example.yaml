@@ -4,7 +4,7 @@ input:
   qb2_live:
     sensor_name: class_qb2
     ip: 10.16.3.160
-    api_key: api_key_123
+    api_key: 001bf3f34b7912994pysYScYzbIquTIp
     mqtt:
       host: 10.16.3.111
       port: 1883
@@ -31,6 +31,8 @@ tracking:
 aggregation:
   algorithm: registration_voxel_fusion
   registration_backend: icp_point_to_plane
+  registration_allowed_dofs: [tx, ty, tz]
+  registration_preserve_anchor_points: true
   frame_selection_method: keyframe_motion
   keyframe_keep: 8
   enable_registration_underfill_fallback: true
@@ -39,6 +41,7 @@ aggregation:
   registration_min_kept_chunks: 2
   registration_max_iter: 30
   registration_max_translation: 3.5
+  registration_max_tz: 200.0
   registration_min_fitness: 0.3
   registration_max_corr_dist: 0.5
   shape_consistency_filter: false
@@ -46,6 +49,7 @@ aggregation:
   enable_confidence_point_cap: false
   confidence_point_cap_max_points: 2048
   confidence_point_cap_bins: 16
+  fusion_skip_sum_if_vehicle_points_above: 2048
 postprocessing:
   enable_trajectory_smoothing: false 
   enable_articulated_vehicle_merge: true
@@ -68,7 +72,7 @@ runtime:
 visualization:
   show_tracker_debug: true
   show_track_outcome_debug: true
-  live_web_enabled: true
+  live_web_enabled: false
   live_web_host: 0.0.0.0
   live_web_port: 8765
   live_web_history_sec: 2.5

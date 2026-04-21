@@ -274,6 +274,11 @@ class VoxelFusionAccumulator:
             selection_info,
             long_vehicle_mode_applied=long_vehicle_mode_applied,
         )
+        anchor_points_to_preserve, anchor_intensity_to_preserve = self._registration_anchor_points_to_preserve(
+            accumulation_input,
+            prepared_intensity,
+            registration_metrics,
+        )
         chunk_weights = self._chunk_weights(track, accumulation_input, registration_metrics, long_vehicle_mode_applied)
         confidence_chunk_weights = self._confidence_chunk_weights(accumulation_input, chunk_weights, registration_metrics)
         with component_profiler.stage("fusion_core"):
@@ -284,12 +289,16 @@ class VoxelFusionAccumulator:
                 confidence_chunk_weights,
                 min_observations=self._required_observations(len(accumulation_input)),
             )
+        fusion_skip_sum_threshold = max(0, int(self.config.fusion_skip_sum_if_vehicle_points_above))
+        fusion_sum_skipped = fusion_skip_sum_threshold > 0 and raw_points_total > fusion_skip_sum_threshold
         if len(fused_xyz) == 0:
             metrics = {
                 **self._base_metrics(track),
                 **selection_info,
                 **motion_deskew_metrics,
                 **registration_metrics,
+                "fusion_sum_skipped": bool(fusion_sum_skipped),
+                "fusion_skip_sum_threshold": int(fusion_skip_sum_threshold),
                 **self._aggregation_timing_metrics(component_profiler.snapshot()),
             }
             return self._result(
@@ -343,6 +352,8 @@ class VoxelFusionAccumulator:
                 "raw_point_count": raw_points_total,
                 "fusion_voxels_total": fusion_voxels_total,
                 "fusion_voxels_kept": fusion_voxels_kept,
+                "fusion_sum_skipped": bool(fusion_sum_skipped),
+                "fusion_skip_sum_threshold": int(fusion_skip_sum_threshold),
                 "point_count_after_fusion": prefilter_points,
                 "point_count_after_stat_filter": stat_filtered_points,
                 "point_count_after_downsample": final_points,
@@ -366,6 +377,7 @@ class VoxelFusionAccumulator:
             candidate_points_world = None
             candidate_intensity_world = None
             candidate_status = "missing"
+            preserved_anchor_points_appended = 0
 
             if final_points != 0:
                 point_count_before_confidence_cap = int(len(filtered_xyz))
@@ -390,18 +402,34 @@ class VoxelFusionAccumulator:
                     completed_intensity,
                     candidate_anchor_center_world,
                 )
-                metrics["point_count_after_downsample"] = int(len(completed_xyz))
                 point_count_after_confidence_cap = int(len(capped_xyz))
                 candidate_status = "available"
-                if final_points < int(self.config.min_saved_aggregate_points):
+            completed_xyz, completed_intensity, preserved_anchor_points_appended = self._append_registration_anchor_points(
+                completed_xyz if final_points != 0 else np.zeros((0, 3), dtype=np.float32),
+                completed_intensity if final_points != 0 else None,
+                anchor_points_to_preserve,
+                anchor_intensity_to_preserve,
+            )
+            metrics["registration_anchor_points_preserved"] = bool(self.config.registration_preserve_anchor_points)
+            metrics["registration_anchor_point_count"] = int(len(anchor_points_to_preserve))
+            metrics["registration_anchor_points_appended"] = int(preserved_anchor_points_appended)
+            metrics["point_count_after_downsample"] = int(len(completed_xyz))
+            if len(completed_xyz) > 0:
+                candidate_points_world, candidate_intensity_world = self._candidate_world_outputs(
+                    completed_xyz,
+                    completed_intensity,
+                    candidate_anchor_center_world,
+                )
+                candidate_status = "available"
+                if len(completed_xyz) < int(self.config.min_saved_aggregate_points):
                     result_status = "skipped_min_saved_points"
-                    result_point_count_after_downsample = final_points
+                    result_point_count_after_downsample = int(len(completed_xyz))
                 else:
                     quality_threshold = self._quality_threshold(long_vehicle_mode_applied)
                     if float(track.quality_score or 0.0) < quality_threshold:
                         metrics["quality_threshold"] = quality_threshold
                         result_status = "skipped_quality_threshold"
-                        result_point_count_after_downsample = final_points
+                        result_point_count_after_downsample = int(len(completed_xyz))
                         result_quality_threshold = quality_threshold
                     else:
                         result_status = "saved"
@@ -1008,6 +1036,7 @@ class VoxelFusionAccumulator:
         attempt_dropped_count = max(0, int(input_count - attempt_output_count))
         synced_metrics = dict(registration_metrics)
         synced_metrics["registration_input_chunk_count"] = int(input_count)
+        anchor_input_index = int(synced_metrics.get("registration_anchor_input_index", 0) or 0)
         chunk_weights = synced_metrics.get("registration_chunk_weights")
         if not isinstance(chunk_weights, list) or len(chunk_weights) != len(keep_indices):
             attempt_chunk_weights = [1.0 for _ in keep_indices]
@@ -1028,6 +1057,9 @@ class VoxelFusionAccumulator:
             effective_frame_ids = [int(frame_id) for frame_id in selected_frame_ids]
             effective_keep_indices = list(range(input_count))
             effective_chunk_weights = [1.0 for _ in effective_keep_indices]
+            effective_anchor_output_index = (
+                effective_keep_indices.index(anchor_input_index) if anchor_input_index in effective_keep_indices else 0
+            )
         else:
             effective_chunks = list(accumulation_input)
             effective_intensity = [prepared_intensity[index] for index in keep_indices]
@@ -1035,6 +1067,9 @@ class VoxelFusionAccumulator:
             effective_frame_ids = [int(selected_frame_ids[index]) for index in keep_indices]
             effective_keep_indices = list(keep_indices)
             effective_chunk_weights = attempt_chunk_weights
+            effective_anchor_output_index = (
+                keep_indices.index(anchor_input_index) if anchor_input_index in keep_indices else 0
+            )
         synced_metrics["registration_fallback_applied"] = bool(fallback_applied)
         synced_metrics["registration_fallback_min_kept_chunks"] = int(fallback_min_kept_chunks)
         synced_metrics["registration_attempt_output_chunk_count"] = attempt_output_count
@@ -1045,6 +1080,7 @@ class VoxelFusionAccumulator:
         synced_metrics["registration_dropped_count"] = max(0, int(input_count - len(effective_keep_indices)))
         synced_metrics["registration_keep_indices"] = list(effective_keep_indices)
         synced_metrics["registration_chunk_weights"] = list(effective_chunk_weights)
+        synced_metrics["registration_anchor_output_index"] = int(effective_anchor_output_index)
         return (
             effective_chunks,
             effective_intensity,
@@ -1565,6 +1601,75 @@ class VoxelFusionAccumulator:
             return np.asarray(np.median(np.asarray(track.centers, dtype=np.float32), axis=0), dtype=np.float32)
         return np.zeros((3,), dtype=np.float32)
 
+    def _registration_anchor_points_to_preserve(
+        self,
+        accumulation_input: list[np.ndarray],
+        prepared_intensity: list[np.ndarray | None],
+        registration_metrics: dict[str, Any],
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        if self.fusion_method != "registration_voxel_fusion" or not bool(self.config.registration_preserve_anchor_points):
+            return np.zeros((0, 3), dtype=np.float32), None
+        if not accumulation_input:
+            return np.zeros((0, 3), dtype=np.float32), None
+        anchor_output_index = int(registration_metrics.get("registration_anchor_output_index", 0) or 0)
+        if anchor_output_index < 0 or anchor_output_index >= len(accumulation_input):
+            anchor_output_index = 0
+        anchor_points = np.asarray(accumulation_input[anchor_output_index], dtype=np.float32)
+        anchor_intensity = None
+        if prepared_intensity:
+            anchor_values = prepared_intensity[anchor_output_index]
+            if anchor_values is not None and len(np.asarray(anchor_values, dtype=np.float32)) == len(anchor_points):
+                anchor_intensity = np.asarray(anchor_values, dtype=np.float32).copy()
+        return anchor_points.copy(), anchor_intensity
+
+    def _append_registration_anchor_points(
+        self,
+        points: np.ndarray,
+        intensity: np.ndarray | None,
+        anchor_points: np.ndarray,
+        anchor_intensity: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray | None, int]:
+        current_points = np.asarray(points, dtype=np.float32)
+        fixed_points = np.asarray(anchor_points, dtype=np.float32)
+        if len(fixed_points) == 0:
+            current_intensity = None if intensity is None else np.asarray(intensity, dtype=np.float32)
+            return current_points, current_intensity, 0
+
+        existing_rows = {tuple(float(value) for value in row.tolist()) for row in current_points}
+        append_indices = [
+            index
+            for index, row in enumerate(fixed_points)
+            if tuple(float(value) for value in row.tolist()) not in existing_rows
+        ]
+        if not append_indices:
+            current_intensity = None if intensity is None else np.asarray(intensity, dtype=np.float32)
+            return current_points, current_intensity, 0
+
+        appended_points = fixed_points[np.asarray(append_indices, dtype=np.int32)]
+        combined_points = (
+            appended_points.astype(np.float32, copy=False)
+            if len(current_points) == 0
+            else np.vstack([current_points, appended_points]).astype(np.float32, copy=False)
+        )
+
+        current_intensity = None if intensity is None else np.asarray(intensity, dtype=np.float32)
+        if anchor_intensity is None or len(np.asarray(anchor_intensity, dtype=np.float32)) != len(fixed_points):
+            if current_intensity is not None and len(current_intensity) == len(current_points):
+                return combined_points, None, len(append_indices)
+            return combined_points, current_intensity, len(append_indices)
+
+        appended_intensity = np.asarray(anchor_intensity, dtype=np.float32)[np.asarray(append_indices, dtype=np.int32)]
+        if current_intensity is None:
+            return combined_points, appended_intensity.astype(np.float32, copy=False), len(append_indices)
+        if len(current_intensity) != len(current_points):
+            return combined_points, None, len(append_indices)
+        combined_intensity = (
+            appended_intensity.astype(np.float32, copy=False)
+            if len(current_intensity) == 0
+            else np.concatenate([current_intensity, appended_intensity], axis=0).astype(np.float32, copy=False)
+        )
+        return combined_points, combined_intensity, len(append_indices)
+
     def _candidate_world_outputs(
         self,
         points: np.ndarray,
@@ -1732,6 +1837,7 @@ class VoxelFusionAccumulator:
             for points, intensity in zip(chunks, intensities)
         )
         raw_points = 0
+        skip_sum_threshold = max(0, int(getattr(self.config, "fusion_skip_sum_if_vehicle_points_above", 0) or 0))
         chunk_voxels: list[np.ndarray] = []
         chunk_point_means: list[np.ndarray] = []
         chunk_weights_per_voxel: list[np.ndarray] = []
@@ -1753,6 +1859,8 @@ class VoxelFusionAccumulator:
             confidence_weights_per_voxel.append(np.full((group_count,), confidence_weight, dtype=np.float64))
             if has_intensity and intensity_means is not None:
                 chunk_intensity_means.append(intensity_means)
+            if skip_sum_threshold > 0 and raw_points > skip_sum_threshold:
+                break
         if not chunk_voxels:
             return np.zeros((0, 3), dtype=np.float32), None, np.zeros((0,), dtype=np.float32), raw_points, 0, 0
 

@@ -8,7 +8,7 @@ import numpy as np
 import open3d as o3d
 
 from tracking_pipeline.config.models import AggregationConfig
-from tracking_pipeline.domain.rules import is_valid_transform
+from tracking_pipeline.domain.rules import axis_to_index, is_valid_transform, orthogonal_axes
 from tracking_pipeline.shared.geometry import estimate_normals, np_to_o3d, transform_points, voxel_downsample_numpy
 
 
@@ -63,6 +63,24 @@ def _roll_pitch_yaw_to_matrix(roll: float, pitch: float, yaw: float) -> np.ndarr
     return rot_z @ rot_y @ rot_x
 
 
+def _anchor_score(chunk: np.ndarray, index: int, axis_idx: int) -> tuple[float, float, float, int]:
+    points = np.asarray(chunk, dtype=np.float32)
+    if len(points) == 0:
+        return (0.0, 0.0, 0.0, -int(index))
+    extent = np.max(points, axis=0) - np.min(points, axis=0)
+    axis_idx = int(np.clip(int(axis_idx), 0, 2))
+    lateral_idx, _ = orthogonal_axes(axis_idx)
+    longitudinal_extent = float(extent[axis_idx])
+    lateral_extent = float(extent[lateral_idx])
+    return (
+        longitudinal_extent * lateral_extent,
+        longitudinal_extent,
+        lateral_extent,
+        float(len(points)),
+        -int(index),
+    )
+
+
 class _BaseRegistrationBackend:
     name = "base"
 
@@ -74,17 +92,25 @@ class _BaseRegistrationBackend:
     def align_chunks(self, chunks: list[np.ndarray]) -> tuple[list[np.ndarray], dict[str, Any]]:
         if len(chunks) <= 1:
             return list(chunks), self._empty_info(len(chunks))
-        aligned = [chunks[0].copy()]
-        model = chunks[0].copy()
+        axis_idx = axis_to_index(self.config.frame_selection_line_axis)
+        anchor_index = max(range(len(chunks)), key=lambda index: _anchor_score(chunks[index], index, axis_idx))
+        anchor_chunk = chunks[anchor_index].copy()
+        aligned = [anchor_chunk]
+        model = anchor_chunk.copy()
         chunk_weights = [1.0]
-        keep_indices = [0]
+        keep_indices = [anchor_index]
         pairs = 0
         accepted = 0
         fitness_values: list[float] = []
         rmse_values: list[float] = []
         backend_counts: Counter[str] = Counter()
 
-        for source_index, source in enumerate(chunks[1:], start=1):
+        ordered_pairs = [
+            (index, chunks[index])
+            for index in range(len(chunks))
+            if index != anchor_index
+        ]
+        for source_index, source in ordered_pairs:
             if len(source) < 8 or len(model) < 8:
                 backend_counts["skipped_insufficient_points"] += 1
                 continue
@@ -107,6 +133,7 @@ class _BaseRegistrationBackend:
                 if float(fitness) >= float(self.config.registration_min_fitness) and is_valid_transform(
                     transform,
                     max_translation=self.config.registration_max_translation,
+                    max_tz=self.config.registration_max_tz,
                 ):
                     aligned_source = transform_points(source, transform)
                     accepted += 1
@@ -133,6 +160,8 @@ class _BaseRegistrationBackend:
             "registration_backend_counts": dict(backend_counts),
             "registration_pair_fitness": fitness_values,
             "registration_chunk_weights": chunk_weights,
+            "registration_anchor_input_index": int(anchor_index),
+            "registration_anchor_output_index": 0,
             "registration_allowed_dofs": list(self._allowed_dofs),
             "registration_input_chunk_count": int(len(chunks)),
             "registration_output_chunk_count": int(len(aligned)),
@@ -154,6 +183,8 @@ class _BaseRegistrationBackend:
             "registration_backend_counts": {},
             "registration_pair_fitness": [],
             "registration_chunk_weights": [1.0 for _ in keep_indices],
+            "registration_anchor_input_index": 0 if keep_indices else -1,
+            "registration_anchor_output_index": 0 if keep_indices else -1,
             "registration_allowed_dofs": list(self._allowed_dofs),
             "registration_input_chunk_count": int(chunk_count),
             "registration_output_chunk_count": int(chunk_count),

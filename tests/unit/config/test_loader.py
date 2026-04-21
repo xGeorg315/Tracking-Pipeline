@@ -878,6 +878,60 @@ def test_load_config_accepts_registration_allowed_dofs(tmp_path: Path) -> None:
     assert config.aggregation.registration_allowed_dofs == ["tx", "ty", "yaw"]
 
 
+def test_load_config_accepts_registration_max_tz(tmp_path: Path) -> None:
+    fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+
+    config_path = tmp_path / "config_registration_max_tz.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "aggregation:",
+                "  registration_max_tz: 0.45",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.input.paths == [str(fixture_dst.resolve())]
+    assert config.aggregation.registration_max_tz == 0.45
+
+
+def test_load_config_accepts_registration_preserve_anchor_points(tmp_path: Path) -> None:
+    fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+
+    config_path = tmp_path / "config_registration_preserve_anchor.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "aggregation:",
+                "  registration_preserve_anchor_points: true",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.input.paths == [str(fixture_dst.resolve())]
+    assert config.aggregation.registration_preserve_anchor_points is True
+
+
 @pytest.mark.parametrize("method", ["quality_coverage", "tail_coverage", "center_diversity"])
 def test_load_config_accepts_new_frame_selection_methods(tmp_path: Path, method: str) -> None:
     fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
@@ -928,6 +982,31 @@ def test_load_config_rejects_invalid_registration_allowed_dofs(tmp_path: Path) -
     )
 
     with pytest.raises(ConfigError, match="aggregation.registration_allowed_dofs contains unsupported value: turbo_spin"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_negative_registration_max_tz(tmp_path: Path) -> None:
+    _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+
+    config_path = tmp_path / "config_invalid_registration_max_tz.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "aggregation:",
+                "  registration_max_tz: -0.1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="aggregation.registration_max_tz must be >= 0"):
         load_config(config_path)
 
 

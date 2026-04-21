@@ -268,3 +268,15 @@ def test_is_valid_transform_rejects_large_translation() -> None:
     transform = np.eye(4, dtype=np.float64)
     transform[:3, 3] = np.array([10.0, 0.0, 0.0])
     assert is_valid_transform(transform, max_translation=3.0) is False
+
+
+def test_is_valid_transform_accepts_translation_within_tz_limit() -> None:
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, 3] = np.array([0.5, 0.0, 0.4])
+    assert is_valid_transform(transform, max_translation=3.0, max_tz=0.5) is True
+
+
+def test_is_valid_transform_rejects_translation_above_tz_limit() -> None:
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, 3] = np.array([0.5, 0.0, 0.6])
+    assert is_valid_transform(transform, max_translation=3.0, max_tz=0.5) is False

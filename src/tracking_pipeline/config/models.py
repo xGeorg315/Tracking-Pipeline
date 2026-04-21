@@ -112,13 +112,16 @@ class AggregationConfig:
     registration_max_iter: int = 80
     registration_min_fitness: float = 0.25
     registration_max_translation: float = 3.2
+    registration_max_tz: float | None = None
     registration_allowed_dofs: list[str] = field(default_factory=_default_registration_allowed_dofs)
+    registration_preserve_anchor_points: bool = False
     enable_registration_underfill_fallback: bool = False
     registration_min_kept_chunks: int = 4
     global_registration_voxel: float = 0.12
     fusion_voxel_size: float = 0.05
     fusion_min_observations: int = 1
     fusion_weight_mode: str = "point_count"
+    fusion_skip_sum_if_vehicle_points_above: int = 0
     consensus_ratio: float = 0.35
     min_track_quality_for_save: float = 0.0
     min_saved_aggregate_points: int = 180
