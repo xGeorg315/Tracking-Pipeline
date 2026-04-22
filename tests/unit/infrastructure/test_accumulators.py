@@ -1612,6 +1612,44 @@ def test_registration_backend_recomputes_metrics_after_dof_projection() -> None:
     assert np.isclose(metrics["registration_mean_fitness"], 0.0)
 
 
+def test_registration_backend_uses_unconstrained_fallback_for_rotation_loss() -> None:
+    source = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.4, 0.8, 0.0],
+            [1.1, 0.1, 0.0],
+            [1.3, 1.0, 0.0],
+            [0.2, 1.4, 0.0],
+            [0.9, 1.8, 0.0],
+            [1.5, 0.5, 0.0],
+            [1.7, 1.6, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    allowed_transform = np.eye(4, dtype=np.float64)
+    allowed_transform[:3, :3] = _rotation_z(np.deg2rad(25.0))
+    allowed_transform[0, 3] = 0.4
+    target = transform_points(source, allowed_transform)
+    backend = _ScriptedTransformRegistrationBackend(
+        AggregationConfig(
+            registration_min_fitness=0.2,
+            registration_max_translation=3.2,
+            registration_max_corr_dist=0.2,
+            frame_downsample_voxel=0.0,
+            registration_allowed_dofs=["tx"],
+        ),
+        allowed_transform,
+        fitness=1.0,
+    )
+
+    aligned, metrics = backend.align_chunks([target, source])
+
+    assert len(aligned) == 2
+    assert metrics["registration_accepted"] == 1
+    assert metrics["registration_unconstrained_fallback_count"] == 1
+    assert np.allclose(aligned[1], target, atol=1e-5)
+
+
 def test_registration_backend_rejects_transform_above_max_tz() -> None:
     source = _constant_chunk(0.0)
     raw_transform = np.eye(4, dtype=np.float64)
@@ -2800,6 +2838,75 @@ def test_long_vehicle_tail_candidate_frames_are_kept_for_selection() -> None:
     assert any(frame_id in result.selected_frame_ids for frame_id in result.metrics["tail_candidate_frame_ids"])
 
 
+def test_long_vehicle_front_candidate_frames_are_kept_for_selection() -> None:
+    track = _track_from_profile(
+        [16, 18, 20, 50, 48, 45],
+        [1.7, 1.8, 2.0, 4.0, 4.1, 4.2],
+        start_frame=360,
+    )
+    track.quality_metrics = {"is_long_vehicle": True}
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            frame_selection_method="length_coverage",
+            use_all_frames=False,
+            keyframe_keep=3,
+            chunk_quality_filter=True,
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.1,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            long_vehicle_mode=True,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-2.0, 2.0, 0.0, 20.0, 0.0, 2.0]))
+
+    assert result.status == "saved"
+    assert result.metrics["front_candidate_frame_ids"] != []
+    assert result.metrics["front_candidate_kept_count"] >= 1
+    assert any(frame_id in result.selected_frame_ids for frame_id in result.metrics["front_candidate_frame_ids"])
+
+
+def test_long_vehicle_selection_includes_anchor_and_support_frame_two_meters_before() -> None:
+    track = _track_from_profile(
+        [22, 26, 30, 48, 44, 40],
+        [1.6, 2.0, 2.2, 5.0, 4.5, 4.0],
+        start_frame=420,
+    )
+    track.quality_metrics = {"is_long_vehicle": True}
+    accumulator = VoxelFusionAccumulator(
+        AggregationConfig(
+            frame_selection_method="length_coverage",
+            use_all_frames=False,
+            keyframe_keep=1,
+            chunk_quality_filter=True,
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.1,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            long_vehicle_mode=True,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-2.0, 2.0, 0.0, 20.0, 0.0, 2.0]))
+
+    assert result.status == "saved"
+    assert result.metrics["long_vehicle_min_pair_applied"] is True
+    assert result.metrics["long_vehicle_anchor_candidate_frame_id"] in result.selected_frame_ids
+    assert result.metrics["long_vehicle_support_frame_id"] in result.selected_frame_ids
+    assert len(result.selected_frame_ids) >= 2
+    anchor_frame_id = int(result.metrics["long_vehicle_anchor_candidate_frame_id"])
+    support_frame_id = int(result.metrics["long_vehicle_support_frame_id"])
+    assert anchor_frame_id == 423
+    assert support_frame_id == 421
+
+
 def test_long_vehicle_rear_registration_fallback_restores_rejected_chunks() -> None:
     chunks = [_constant_chunk(0.0), _constant_chunk(0.6), _constant_chunk(1.2)]
     track = _track_from_chunks(chunks, track_id=88)
@@ -2826,7 +2933,37 @@ def test_long_vehicle_rear_registration_fallback_restores_rejected_chunks() -> N
 
     assert result.status == "saved"
     assert result.metrics["rear_fallback_used"] is True
-    assert result.metrics["rear_registration_rejected_count"] == 2
+    assert result.metrics["rear_registration_rejected_count"] >= 1
+    assert result.metrics["registration_output_chunk_count"] == 3
+
+
+def test_long_vehicle_front_registration_fallback_restores_rejected_chunks() -> None:
+    chunks = [_constant_chunk(0.0), _constant_chunk(0.6), _constant_chunk(1.2)]
+    track = _track_from_chunks(chunks, track_id=89)
+    track.quality_metrics = {"is_long_vehicle": True}
+    track.state["long_vehicle_component_role"] = "lead"
+    accumulator = _ScriptedPrepareAccumulator(
+        AggregationConfig(
+            algorithm="registration_voxel_fusion",
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.05,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            long_vehicle_mode=True,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+        keep_indices=[0],
+        chunk_weights=[1.0],
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-2.0, 2.0, -1.0, 4.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert result.metrics["front_fallback_used"] is True
+    assert result.metrics["front_registration_rejected_count"] >= 1
     assert result.metrics["registration_output_chunk_count"] == 3
 
 

@@ -22,6 +22,7 @@ class QB2LiveInputConfig:
     sensor_name: str = ""
     ip: str = ""
     api_key: str = ""
+    api_key_file: str = ""
     mqtt: QB2LiveMQTTConfig = field(default_factory=QB2LiveMQTTConfig)
     max_frames: int = 0
     idle_timeout_sec: float = 5.0

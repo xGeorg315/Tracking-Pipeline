@@ -56,6 +56,7 @@ output:
 | `sensor_name` | `""` | logischer Sensorname fuer Kalibrierung, Scans und GT-Labels |
 | `ip` | `""` | QB2-IP/FQDN fuer `blickfeld_qb2.Channel` |
 | `api_key` | `""` | Application-Key-Secret fuer den QB2-Zugriff |
+| `api_key_file` | `""` | Pfad zu einer Datei mit dem QB2-API-Key; wird relativ zur Config aufgeloest |
 | `mqtt.host` | `""` | MQTT-Broker fuer QB2-Objekt-/GT-Nachrichten |
 | `mqtt.port` | `1883` | MQTT-Port |
 | `mqtt.topic` | `""` | MQTT-Topic mit `states -> states -> trafficLane -> vehicles`-Payloads |
@@ -74,7 +75,7 @@ input:
   qb2_live:
     sensor_name: class_qb2
     ip: 10.16.3.160
-    api_key: YOUR_API_KEY
+    api_key_file: apikey.txt
     mqtt:
       host: 10.16.3.111
       port: 1883

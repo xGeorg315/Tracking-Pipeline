@@ -91,6 +91,16 @@ def _qb2_live_source_path(sensor_name: str, ip: str) -> str:
     return f"qb2_live://{sensor_name}@{ip}"
 
 
+def _load_secret_from_file(value: str | Path, config_path: Path, *, field_name: str) -> str:
+    secret_path = _resolve_path(value, config_path.parent)
+    if not secret_path.is_file():
+        raise ConfigError(f"{field_name} file does not exist: {secret_path}")
+    secret = secret_path.read_text(encoding="utf-8").strip()
+    if not secret:
+        raise ConfigError(f"{field_name} file is empty: {secret_path}")
+    return secret
+
+
 def _load_input_config(raw_input: dict[str, Any], config_path: Path) -> InputConfig:
     input_cfg = dict(raw_input)
     format_name = str(input_cfg.get("format", "a42_pb"))
@@ -98,10 +108,19 @@ def _load_input_config(raw_input: dict[str, Any], config_path: Path) -> InputCon
     qb2_live = None
     if qb2_live_raw:
         mqtt_raw = dict(qb2_live_raw.get("mqtt", {}) or {})
+        api_key = str(qb2_live_raw.get("api_key", ""))
+        api_key_file = str(qb2_live_raw.get("api_key_file", ""))
+        if api_key_file.strip():
+            api_key = _load_secret_from_file(
+                api_key_file,
+                config_path,
+                field_name="input.qb2_live.api_key_file",
+            )
         qb2_live = QB2LiveInputConfig(
             sensor_name=str(qb2_live_raw.get("sensor_name", "")),
             ip=str(qb2_live_raw.get("ip", "")),
-            api_key=str(qb2_live_raw.get("api_key", "")),
+            api_key=api_key,
+            api_key_file=api_key_file,
             mqtt=QB2LiveMQTTConfig(
                 host=str(mqtt_raw.get("host", "")),
                 port=int(mqtt_raw.get("port", 1883) or 1883),

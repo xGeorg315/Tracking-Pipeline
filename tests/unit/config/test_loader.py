@@ -95,6 +95,66 @@ def test_load_config_accepts_qb2_live_with_synthesized_source_path(tmp_path: Pat
     assert config.input.qb2_live.mqtt_max_pending_age_sec == 3.5
 
 
+def test_load_config_reads_qb2_live_api_key_from_file(tmp_path: Path) -> None:
+    secret_path = tmp_path / "apikey.txt"
+    secret_path.write_text("secret-from-file\n", encoding="utf-8")
+
+    config_path = tmp_path / "config_qb2_live.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  format: qb2_live",
+                "  paths: []",
+                "  qb2_live:",
+                "    sensor_name: class_qb2",
+                "    ip: 10.16.3.160",
+                "    api_key_file: apikey.txt",
+                "    mqtt:",
+                "      host: 10.16.3.111",
+                "      topic: blickfeld/states_160",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.input.qb2_live is not None
+    assert config.input.qb2_live.api_key == "secret-from-file"
+    assert config.input.qb2_live.api_key_file == "apikey.txt"
+
+
+def test_load_config_rejects_missing_qb2_live_api_key_file(tmp_path: Path) -> None:
+    config_path = tmp_path / "config_qb2_live_missing_key_file.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  format: qb2_live",
+                "  paths: []",
+                "  qb2_live:",
+                "    sensor_name: class_qb2",
+                "    ip: 10.16.3.160",
+                "    api_key_file: apikey.txt",
+                "    mqtt:",
+                "      host: 10.16.3.111",
+                "      topic: blickfeld/states_160",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="input.qb2_live.api_key_file file does not exist"):
+        load_config(config_path)
+
+
 def test_load_config_rejects_qb2_live_without_required_mqtt_fields(tmp_path: Path) -> None:
     config_path = tmp_path / "config_qb2_live_invalid.yaml"
     config_path.write_text(

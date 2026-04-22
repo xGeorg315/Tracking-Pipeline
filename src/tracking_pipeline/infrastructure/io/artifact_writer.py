@@ -182,10 +182,20 @@ class JsonArtifactWriter:
                 row["tail_candidate_frame_ids"] = [int(frame_id) for frame_id in result_metrics.get("tail_candidate_frame_ids", [])]
             if result_metrics.get("tail_candidate_kept_count") is not None:
                 row["tail_candidate_kept_count"] = int(result_metrics.get("tail_candidate_kept_count"))
+            if result_metrics.get("front_candidate_frame_ids") is not None:
+                row["front_candidate_frame_ids"] = [int(frame_id) for frame_id in result_metrics.get("front_candidate_frame_ids", [])]
+            if result_metrics.get("front_candidate_kept_count") is not None:
+                row["front_candidate_kept_count"] = int(result_metrics.get("front_candidate_kept_count"))
+            if result_metrics.get("front_registration_rejected_count") is not None:
+                row["front_registration_rejected_count"] = int(result_metrics.get("front_registration_rejected_count"))
+            if result_metrics.get("front_fallback_used") is not None:
+                row["front_fallback_used"] = bool(result_metrics.get("front_fallback_used"))
             if result_metrics.get("rear_registration_rejected_count") is not None:
                 row["rear_registration_rejected_count"] = int(result_metrics.get("rear_registration_rejected_count"))
             if result_metrics.get("rear_fallback_used") is not None:
                 row["rear_fallback_used"] = bool(result_metrics.get("rear_fallback_used"))
+            if result_metrics.get("registration_unconstrained_fallback_count") is not None:
+                row["registration_unconstrained_fallback_count"] = int(result_metrics.get("registration_unconstrained_fallback_count"))
             if result_metrics.get("post_merge_component_ids") is not None:
                 row["post_merge_component_ids"] = [int(track_id) for track_id in result_metrics.get("post_merge_component_ids", [])]
             if result_metrics.get("long_vehicle_local_anchor_mode") is not None:

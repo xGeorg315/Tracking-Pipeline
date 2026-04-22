@@ -82,6 +82,7 @@ class VoxelFusionAccumulator:
     _LONG_VEHICLE_TAIL_EXTENT_RATIO = 0.20
     _LONG_VEHICLE_TAIL_CANDIDATE_COUNT = 2
     _LONG_VEHICLE_REJECTED_CHUNK_WEIGHT = 0.35
+    _LONG_VEHICLE_MIN_PAIR_DISTANCE_M = 2.0
 
     def __init__(self, config: AggregationConfig, output_config: OutputConfig, tracking_config: TrackingConfig):
         self.config = config
@@ -1356,6 +1357,8 @@ class VoxelFusionAccumulator:
             "chunk_quality_segment_end_frame": -1 if not frame_ids else int(frame_ids[-1]),
             "peak_chunk_point_count": 0,
             "peak_chunk_extent_norm": 0.0,
+            "front_candidate_frame_ids": [],
+            "front_candidate_kept_count": 0,
             "tail_candidate_frame_ids": [],
             "tail_candidate_kept_count": 0,
         }
@@ -1364,8 +1367,13 @@ class VoxelFusionAccumulator:
         if not self.config.chunk_quality_filter:
             return list(chunks), list(centers), list(frame_ids), empty_metrics
 
+        front_candidate_indices = (
+            self._long_vehicle_end_candidate_indices(chunks, centers, frame_ids, prefer_front=True)
+            if long_vehicle_mode_applied
+            else []
+        )
         tail_candidate_indices = (
-            self._long_vehicle_tail_candidate_indices(chunks, centers, frame_ids)
+            self._long_vehicle_end_candidate_indices(chunks, centers, frame_ids, prefer_front=False)
             if long_vehicle_mode_applied
             else []
         )
@@ -1411,17 +1419,19 @@ class VoxelFusionAccumulator:
                 start_idx, end_idx = self._expand_segment_around_peak(peak_index, total)
 
         kept_indices = list(range(start_idx, end_idx + 1))
-        if long_vehicle_mode_applied and tail_candidate_indices:
+        if long_vehicle_mode_applied and (tail_candidate_indices or front_candidate_indices):
             tail_point_ratio = min(float(self.config.chunk_min_points_ratio_to_peak), self._LONG_VEHICLE_TAIL_POINT_RATIO)
             tail_extent_ratio = min(float(self.config.chunk_min_extent_ratio_to_peak), self._LONG_VEHICLE_TAIL_EXTENT_RATIO)
             tail_point_threshold = tail_point_ratio * float(max(peak_point_count, 1))
             tail_extent_threshold = tail_extent_ratio * float(max(peak_extent_norm, 1e-6))
+            edge_candidate_indices = sorted(set(front_candidate_indices).union(tail_candidate_indices))
             tail_keep_indices = [
                 int(index)
-                for index in tail_candidate_indices
+                for index in edge_candidate_indices
                 if float(point_counts[index]) >= tail_point_threshold and float(extent_norms[index]) >= tail_extent_threshold
             ]
             kept_indices = sorted(set(kept_indices).union(tail_keep_indices))
+        kept_index_set = set(kept_indices)
         metrics = {
             "chunk_quality_filter_enabled": True,
             "chunk_quality_total": total,
@@ -1430,8 +1440,10 @@ class VoxelFusionAccumulator:
             "chunk_quality_segment_end_frame": int(frame_ids[max(kept_indices)]),
             "peak_chunk_point_count": peak_point_count,
             "peak_chunk_extent_norm": peak_extent_norm,
+            "front_candidate_frame_ids": [int(frame_ids[index]) for index in front_candidate_indices],
+            "front_candidate_kept_count": int(sum(1 for index in front_candidate_indices if index in kept_index_set)),
             "tail_candidate_frame_ids": [int(frame_ids[index]) for index in tail_candidate_indices],
-            "tail_candidate_kept_count": int(sum(1 for index in tail_candidate_indices if index in set(kept_indices))),
+            "tail_candidate_kept_count": int(sum(1 for index in tail_candidate_indices if index in kept_index_set)),
         }
         return (
             [chunks[index] for index in kept_indices],
@@ -1440,11 +1452,13 @@ class VoxelFusionAccumulator:
             metrics,
         )
 
-    def _long_vehicle_tail_candidate_indices(
+    def _long_vehicle_end_candidate_indices(
         self,
         chunks: list[np.ndarray],
         centers: list[np.ndarray],
         frame_ids: list[int],
+        *,
+        prefer_front: bool,
     ) -> list[int]:
         _ = frame_ids
         if not chunks:
@@ -1462,8 +1476,9 @@ class VoxelFusionAccumulator:
             rear_span = abs(float(np.min(signed))) if len(signed) else 0.0
             front_span = max(0.0, float(np.max(signed))) if len(signed) else 0.0
             total_span = rear_span + front_span
-            rear_ratio = 0.0 if total_span <= 1e-6 else rear_span / total_span
-            scored.append((rear_ratio, rear_span, int(index)))
+            preferred_span = front_span if prefer_front else rear_span
+            preferred_ratio = 0.0 if total_span <= 1e-6 else preferred_span / total_span
+            scored.append((preferred_ratio, preferred_span, int(index)))
         if not scored:
             return []
         scored.sort(key=lambda item: (item[0], item[1], -item[2]), reverse=True)
@@ -1505,15 +1520,36 @@ class VoxelFusionAccumulator:
                     continue
                 best_index = int(max(candidate_indices.tolist(), key=lambda idx: (int(point_counts[idx]), -idx)))
                 selected_indices.add(best_index)
+        front_candidate_frame_ids = [int(frame_id) for frame_id in selection_info.get("front_candidate_frame_ids", [])]
         tail_candidate_frame_ids = [int(frame_id) for frame_id in selection_info.get("tail_candidate_frame_ids", [])]
-        for frame_id in tail_candidate_frame_ids:
+        for frame_id in front_candidate_frame_ids + tail_candidate_frame_ids:
             index = frame_to_index.get(int(frame_id))
             if index is not None:
                 selected_indices.add(int(index))
+        anchor_candidate_index = self._long_vehicle_anchor_candidate_index(filtered_chunks)
+        if anchor_candidate_index is not None:
+            selected_indices.add(int(anchor_candidate_index))
+            support_candidate_index = self._long_vehicle_support_candidate_index(filtered_centers, anchor_candidate_index)
+            if support_candidate_index is not None:
+                selected_indices.add(int(support_candidate_index))
         ordered_indices = sorted(selected_indices)
+        ordered_frame_ids = {int(filtered_frame_ids[index]) for index in ordered_indices}
         augmented_info = dict(selection_info)
+        augmented_info["front_candidate_kept_count"] = int(
+            sum(1 for frame_id in front_candidate_frame_ids if int(frame_id) in ordered_frame_ids)
+        )
         augmented_info["tail_candidate_kept_count"] = int(
-            sum(1 for frame_id in tail_candidate_frame_ids if int(frame_id) in {int(filtered_frame_ids[index]) for index in ordered_indices})
+            sum(1 for frame_id in tail_candidate_frame_ids if int(frame_id) in ordered_frame_ids)
+        )
+        augmented_info["long_vehicle_min_pair_distance_m"] = float(self._LONG_VEHICLE_MIN_PAIR_DISTANCE_M)
+        augmented_info["long_vehicle_anchor_candidate_frame_id"] = (
+            int(filtered_frame_ids[anchor_candidate_index]) if anchor_candidate_index is not None else -1
+        )
+        augmented_info["long_vehicle_support_frame_id"] = (
+            int(filtered_frame_ids[support_candidate_index]) if support_candidate_index is not None else -1
+        )
+        augmented_info["long_vehicle_min_pair_applied"] = bool(
+            anchor_candidate_index is not None and support_candidate_index is not None
         )
         augmented_info["long_vehicle_coverage_bins_selected"] = 3
         return (
@@ -1522,6 +1558,49 @@ class VoxelFusionAccumulator:
             [int(filtered_frame_ids[index]) for index in ordered_indices],
             augmented_info,
         )
+
+    def _long_vehicle_anchor_candidate_index(self, chunks: list[np.ndarray]) -> int | None:
+        if not chunks:
+            return None
+        axis_idx = axis_to_index(self.config.frame_selection_line_axis)
+        lateral_idx, _ = orthogonal_axes(axis_idx)
+
+        def _score(index: int) -> tuple[float, float, float, float, int]:
+            points = np.asarray(chunks[index], dtype=np.float32)
+            if len(points) == 0:
+                return (0.0, 0.0, 0.0, 0.0, -int(index))
+            extent = compute_extent(points).astype(np.float64, copy=False)
+            longitudinal_extent = float(extent[axis_idx])
+            lateral_extent = float(extent[lateral_idx])
+            return (
+                longitudinal_extent * lateral_extent,
+                longitudinal_extent,
+                lateral_extent,
+                float(len(points)),
+                -int(index),
+            )
+
+        return int(max(range(len(chunks)), key=_score))
+
+    def _long_vehicle_support_candidate_index(self, centers: list[np.ndarray], anchor_index: int) -> int | None:
+        if not centers or anchor_index < 0 or anchor_index >= len(centers):
+            return None
+        axis_idx = axis_to_index(self.config.frame_selection_line_axis)
+        direction = self._track_motion_direction(centers)
+        anchor_center = np.asarray(centers[anchor_index], dtype=np.float64)
+        anchor_position = float(anchor_center[axis_idx]) * float(direction)
+        support_candidates: list[tuple[float, int]] = []
+        for index, center in enumerate(centers):
+            if index == anchor_index:
+                continue
+            center_position = float(np.asarray(center, dtype=np.float64)[axis_idx]) * float(direction)
+            signed_gap = anchor_position - center_position
+            if signed_gap >= float(self._LONG_VEHICLE_MIN_PAIR_DISTANCE_M):
+                support_candidates.append((signed_gap, int(index)))
+        if not support_candidates:
+            return None
+        support_candidates.sort(key=lambda item: (item[0], item[1]))
+        return int(support_candidates[0][1])
 
     def _restore_long_vehicle_rejected_chunks(
         self,
@@ -1540,6 +1619,8 @@ class VoxelFusionAccumulator:
         long_vehicle_mode_applied: bool,
     ) -> tuple[list[np.ndarray], list[np.ndarray | None], list[np.ndarray], list[int], dict[str, Any]]:
         metrics = dict(registration_metrics)
+        metrics.setdefault("front_registration_rejected_count", 0)
+        metrics.setdefault("front_fallback_used", False)
         metrics.setdefault("rear_registration_rejected_count", 0)
         metrics.setdefault("rear_fallback_used", False)
         if not long_vehicle_mode_applied or len(prepared_chunks) <= len(accumulation_input):
@@ -1552,13 +1633,25 @@ class VoxelFusionAccumulator:
         if not dropped_indices:
             return accumulation_input, prepared_intensity, selected_centers, selected_frame_ids, metrics
 
+        front_candidate_frame_ids = {int(frame_id) for frame_id in selection_info.get("front_candidate_frame_ids", [])}
         tail_candidate_frame_ids = {int(frame_id) for frame_id in selection_info.get("tail_candidate_frame_ids", [])}
         role = str(track.state.get("long_vehicle_component_role") or track.state.get("articulated_role") or "")
-        should_fallback = bool(role in {"rear", "fragment"}) or any(
-            int(selected_frame_ids[index]) in tail_candidate_frame_ids for index in dropped_indices if index < len(selected_frame_ids)
+        dropped_frame_ids = {
+            int(selected_frame_ids[index])
+            for index in dropped_indices
+            if index < len(selected_frame_ids)
+        }
+        dropped_front_frame_ids = dropped_frame_ids.intersection(front_candidate_frame_ids)
+        dropped_rear_frame_ids = dropped_frame_ids.intersection(tail_candidate_frame_ids)
+        should_fallback = (
+            bool(role in {"rear", "fragment"} and dropped_rear_frame_ids)
+            or bool(role in {"lead", "front", "fragment"} and dropped_front_frame_ids)
+            or bool(dropped_front_frame_ids)
+            or bool(dropped_rear_frame_ids)
         )
         if not should_fallback:
-            metrics["rear_registration_rejected_count"] = int(len(dropped_indices))
+            metrics["front_registration_rejected_count"] = int(len(dropped_front_frame_ids))
+            metrics["rear_registration_rejected_count"] = int(len(dropped_rear_frame_ids))
             return accumulation_input, prepared_intensity, selected_centers, selected_frame_ids, metrics
 
         kept_set = set(keep_indices)
@@ -1581,8 +1674,10 @@ class VoxelFusionAccumulator:
         metrics["registration_keep_indices"] = list(range(len(restored_chunks)))
         metrics["registration_output_chunk_count"] = int(len(restored_chunks))
         metrics["registration_dropped_count"] = max(0, int(len(prepared_chunks) - len(restored_chunks)))
-        metrics["rear_registration_rejected_count"] = int(len(dropped_indices))
-        metrics["rear_fallback_used"] = True
+        metrics["front_registration_rejected_count"] = int(len(dropped_front_frame_ids))
+        metrics["rear_registration_rejected_count"] = int(len(dropped_rear_frame_ids))
+        metrics["front_fallback_used"] = bool(dropped_front_frame_ids)
+        metrics["rear_fallback_used"] = bool(dropped_rear_frame_ids)
         return restored_chunks, restored_intensity, restored_centers, restored_frame_ids, metrics
 
     def _track_motion_direction(self, centers: list[np.ndarray]) -> float:
