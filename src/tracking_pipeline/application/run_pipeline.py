@@ -461,6 +461,7 @@ def run_pipeline(config: PipelineConfig, project_root: Path, live_observer=None)
             if not isinstance(finished_tracks, dict) and isinstance(finalized_tracks, dict):
                 finished_tracks = finalized_tracks
             if isinstance(finished_tracks, dict):
+                _discard_processed_finished_tracks(finished_tracks, live_snapshot_announced_finished_track_ids)
                 new_tracks, new_results = _process_incremental_finished_tracks(
                     finished_tracks=finished_tracks,
                     lane_box=lane_box,
@@ -477,6 +478,16 @@ def run_pipeline(config: PipelineConfig, project_root: Path, live_observer=None)
                     live_snapshot_track_outcomes=live_snapshot_track_outcomes,
                     pending_snapshot_results=live_artifact_state["pending_saved_results"] if live_artifact_state is not None else None,
                     collect_track_outcomes=statistics_enabled,
+                )
+                _discard_processed_finished_tracks(finished_tracks, live_snapshot_announced_finished_track_ids)
+                _update_live_incremental_track_metrics(
+                    live_status_reporter,
+                    live_web_runtime,
+                    queued_finished_track_count=len(finished_tracks),
+                    processed_finished_track_count=len(live_snapshot_announced_finished_track_ids),
+                    snapshot_track_count=len(live_snapshot_tracks),
+                    snapshot_aggregate_count=len(live_snapshot_aggregate_results),
+                    saved_aggregate_count=_saved_aggregate_count(live_snapshot_aggregate_results),
                 )
                 if new_tracks:
                     _notify_live_observer(
@@ -821,6 +832,10 @@ def _start_live_status_reporter(
             "live_tracker_debug_flush_interval_sec": float(live_tracker_debug_flush_interval_sec),
             "live_artifact_write_count": 0,
             "last_live_artifact_write_unix_sec": None,
+            "live_finished_track_processed_count": 0,
+            "live_finished_track_queue_count": 0,
+            "live_snapshot_track_count": 0,
+            "live_snapshot_aggregate_count": 0,
             "object_list_exported_count": 0,
             "object_list_seen_ids": 0,
             "object_list_manifest_path": str(object_list_manifest_path),
@@ -880,7 +895,6 @@ def _start_live_web_viewer(*, config: PipelineConfig, writer, run_dir: Path, lan
         track_exit_edge_margin=config.output.track_exit_edge_margin,
         max_points=config.visualization.max_points,
         history_sec=config.visualization.live_web_history_sec,
-        retain_all_frames=config.visualization.live_web_retain_all_frames,
         point_source=config.visualization.live_web_point_source,
         color_by_intensity=config.visualization.color_by_intensity,
         show_tracker_debug=config.visualization.show_tracker_debug,
@@ -905,7 +919,13 @@ def _start_live_web_viewer(*, config: PipelineConfig, writer, run_dir: Path, lan
         config.visualization.live_web_host,
         server.port,
     )
-    return {"publisher": publisher, "server": server}
+    return {
+        "publisher": publisher,
+        "server": server,
+        "_started_monotonic": float(time.monotonic()),
+        "_last_processed_monotonic": None,
+        "_last_processed_frame_count": 0,
+    }
 
 
 def _update_live_web_status(runtime, **updates: object) -> None:
@@ -913,7 +933,31 @@ def _update_live_web_status(runtime, **updates: object) -> None:
         return
     publisher = runtime.get("publisher")
     if isinstance(publisher, LiveFramePublisher):
-        publisher.update_status(**updates)
+        publisher.update_status(**_with_live_web_processing_metrics(runtime, updates))
+
+
+def _with_live_web_processing_metrics(runtime, updates: dict[str, object]) -> dict[str, object]:
+    enriched = dict(updates)
+    if "processed_frames" not in enriched:
+        return enriched
+    processed_frames = int(enriched.get("processed_frames", 0) or 0)
+    now = time.monotonic()
+    started_monotonic = float(runtime.get("_started_monotonic", now) or now)
+    elapsed = max(0.0, now - started_monotonic)
+    enriched["processing_total_hz"] = (
+        0.0 if processed_frames <= 0 or elapsed <= 0.0 else float(processed_frames) / elapsed
+    )
+    previous_monotonic = runtime.get("_last_processed_monotonic")
+    previous_frame_count = int(runtime.get("_last_processed_frame_count", 0) or 0)
+    if previous_monotonic is not None and processed_frames > previous_frame_count:
+        delta = max(0.0, now - float(previous_monotonic))
+        frame_delta = processed_frames - previous_frame_count
+        enriched["processing_recent_hz"] = 0.0 if delta <= 0.0 else float(frame_delta) / delta
+    elif processed_frames <= 1:
+        enriched["processing_recent_hz"] = 0.0
+    runtime["_last_processed_monotonic"] = float(now)
+    runtime["_last_processed_frame_count"] = int(processed_frames)
+    return enriched
 
 
 def _publish_live_web_frame(runtime, frame, cluster_result, tracking_state) -> None:
@@ -1173,6 +1217,7 @@ def _format_live_status_line(payload: dict[str, object]) -> str:
     reader = dict(payload.get("reader") or {})
     return (
         "live phase={phase} f={processed} hz={recent_hz:.2f}/{total_hz:.2f} tr={active_tracks} "
+        "finq={finished_queue} snaptr={snapshot_tracks} "
         "aw={artifact_writes} ow={object_writes} raw={raw} mqtt={mqtt_msgs} snap={mqtt_snapshots} "
         "q={pending_labels}/{pending_snapshots} drop={dropped_overflow_labels}/{dropped_stale_labels} "
         "conn={mqtt_connected} wait={waiting_first_raw} reconn={raw_reconnects} "
@@ -1184,6 +1229,8 @@ def _format_live_status_line(payload: dict[str, object]) -> str:
         recent_hz=float(payload.get("processing_recent_hz", 0.0) or 0.0),
         total_hz=float(payload.get("processing_total_hz", 0.0) or 0.0),
         active_tracks=int(payload.get("active_track_count", 0) or 0),
+        finished_queue=int(payload.get("live_finished_track_queue_count", 0) or 0),
+        snapshot_tracks=int(payload.get("live_snapshot_track_count", 0) or 0),
         artifact_writes=int(payload.get("live_artifact_write_count", 0) or 0),
         object_writes=int(payload.get("live_object_list_write_count", 0) or 0),
         raw=int(reader.get("raw_frames_received", 0) or 0),
@@ -1291,6 +1338,41 @@ def _build_live_artifact_state(input_format: str) -> dict[str, object] | None:
     }
 
 
+def _discard_processed_finished_tracks(finished_tracks: dict[int, Track], processed_track_ids: set[int]) -> int:
+    removed_count = 0
+    processed_ids = {int(track_id) for track_id in processed_track_ids}
+    for track_id in list(finished_tracks):
+        if int(track_id) in processed_ids:
+            finished_tracks.pop(track_id, None)
+            removed_count += 1
+    return int(removed_count)
+
+
+def _update_live_incremental_track_metrics(
+    live_status_reporter,
+    live_web_runtime,
+    *,
+    queued_finished_track_count: int,
+    processed_finished_track_count: int,
+    snapshot_track_count: int,
+    snapshot_aggregate_count: int,
+    saved_aggregate_count: int,
+) -> None:
+    updates = {
+        "live_finished_track_queue_count": int(queued_finished_track_count),
+        "live_finished_track_processed_count": int(processed_finished_track_count),
+        "live_snapshot_track_count": int(snapshot_track_count),
+        "live_snapshot_aggregate_count": int(snapshot_aggregate_count),
+        "saved_aggregates": int(saved_aggregate_count),
+    }
+    _update_live_status_reporter(live_status_reporter, **updates)
+    _update_live_web_status(live_web_runtime, **updates)
+
+
+def _saved_aggregate_count(aggregate_results_by_track: dict[int, AggregateResult]) -> int:
+    return int(sum(1 for result in aggregate_results_by_track.values() if str(result.status) == "saved"))
+
+
 def _maybe_write_incremental_live_artifact_snapshot(
     *,
     config: PipelineConfig,
@@ -1327,6 +1409,18 @@ def _maybe_write_incremental_live_artifact_snapshot(
         return
     statistics_enabled = bool(config.output.statistics_enabled)
     finished_tracks = getattr(tracker, "finished_tracks", None)
+    if isinstance(finished_tracks, dict):
+        _discard_processed_finished_tracks(finished_tracks, live_snapshot_announced_finished_track_ids)
+        _update_live_incremental_track_metrics(
+            live_status_reporter,
+            live_web_runtime,
+            queued_finished_track_count=len(finished_tracks),
+            processed_finished_track_count=len(live_snapshot_announced_finished_track_ids),
+            snapshot_track_count=len(live_snapshot_tracks),
+            snapshot_aggregate_count=len(live_snapshot_aggregate_results),
+            saved_aggregate_count=_saved_aggregate_count(live_snapshot_aggregate_results),
+        )
+
     if isinstance(finished_tracks, dict) and finished_tracks:
         _set_live_pipeline_step(live_status_reporter, "accumulate_finished_tracks", frame_count)
         new_tracks, aggregate_results = _process_incremental_finished_tracks(
@@ -1345,6 +1439,16 @@ def _maybe_write_incremental_live_artifact_snapshot(
             live_snapshot_track_outcomes=live_snapshot_track_outcomes,
             pending_snapshot_results=live_artifact_state["pending_saved_results"],
             collect_track_outcomes=statistics_enabled,
+        )
+        _discard_processed_finished_tracks(finished_tracks, live_snapshot_announced_finished_track_ids)
+        _update_live_incremental_track_metrics(
+            live_status_reporter,
+            live_web_runtime,
+            queued_finished_track_count=len(finished_tracks),
+            processed_finished_track_count=len(live_snapshot_announced_finished_track_ids),
+            snapshot_track_count=len(live_snapshot_tracks),
+            snapshot_aggregate_count=len(live_snapshot_aggregate_results),
+            saved_aggregate_count=_saved_aggregate_count(live_snapshot_aggregate_results),
         )
         if new_tracks:
             live_artifact_state["pending_flush"] = True
@@ -1637,8 +1741,11 @@ def _process_incremental_finished_tracks(
         announced_finished_track_ids.update(new_track_ids)
         return {}, []
 
-    candidate_tracks = {int(track_id): _clone_track(track) for track_id, track in live_snapshot_tracks.items()}
-    candidate_tracks.update({int(track_id): _clone_track(track) for track_id, track in new_tracks.items()})
+    candidate_tracks = _select_incremental_postprocess_candidates(
+        live_snapshot_tracks=live_snapshot_tracks,
+        new_tracks=new_tracks,
+        postprocessors=postprocessors,
+    )
     before_signatures = {
         int(track_id): _incremental_postprocess_signature(track)
         for track_id, track in candidate_tracks.items()
@@ -1680,6 +1787,13 @@ def _process_incremental_finished_tracks(
         aggregate_results = classify_aggregate_results(aggregate_results, classifier, class_normalizer)
 
     announced_finished_track_ids.update(new_tracks)
+    missing_candidate_ids = set(candidate_tracks) - set(processed_tracks)
+    for track_id in missing_candidate_ids:
+        live_snapshot_tracks.pop(int(track_id), None)
+        live_snapshot_aggregate_results.pop(int(track_id), None)
+        live_snapshot_track_outcomes.pop(int(track_id), None)
+        if pending_snapshot_results is not None:
+            pending_snapshot_results.pop(int(track_id), None)
     live_snapshot_tracks.update({int(track_id): _clone_track(track) for track_id, track in processed_tracks.items()})
     for result in aggregate_results:
         live_snapshot_aggregate_results[int(result.track_id)] = result
@@ -1695,6 +1809,85 @@ def _process_incremental_finished_tracks(
             )
         )
     return affected_tracks, aggregate_results
+
+
+def _select_incremental_postprocess_candidates(
+    *,
+    live_snapshot_tracks: dict[int, Track],
+    new_tracks: dict[int, Track],
+    postprocessors,
+) -> dict[int, Track]:
+    candidate_tracks = {int(track_id): _clone_track(track) for track_id, track in new_tracks.items()}
+    if not live_snapshot_tracks or not _postprocessors_need_cross_track_context(postprocessors):
+        return candidate_tracks
+
+    max_frame_gap = _incremental_candidate_frame_gap(postprocessors)
+    new_ranges = [
+        frame_range
+        for track in new_tracks.values()
+        if (frame_range := _track_frame_range(track)) is not None
+    ]
+    if not new_ranges:
+        return candidate_tracks
+
+    for track_id, track in live_snapshot_tracks.items():
+        frame_range = _track_frame_range(track)
+        if frame_range is None:
+            continue
+        if any(_frame_ranges_are_close(frame_range, new_range, max_frame_gap=max_frame_gap) for new_range in new_ranges):
+            candidate_tracks[int(track_id)] = _clone_track(track)
+    return candidate_tracks
+
+
+def _postprocessors_need_cross_track_context(postprocessors) -> bool:
+    cross_track_processors = {
+        "articulated_vehicle_merge",
+        "co_moving_track_merge",
+        "tracklet_stitching",
+    }
+    return any(str(getattr(processor, "name", "")) in cross_track_processors for processor in postprocessors)
+
+
+def _incremental_candidate_frame_gap(postprocessors) -> int:
+    max_gap = 0
+    for processor in postprocessors:
+        config = getattr(processor, "config", None)
+        for attr_name in (
+            "stitching_max_gap",
+            "articulated_gap_eval_window_frames",
+            "parallel_merge_min_overlap_frames",
+        ):
+            if config is None or not hasattr(config, attr_name):
+                continue
+            try:
+                max_gap = max(max_gap, int(getattr(config, attr_name)))
+            except (TypeError, ValueError):
+                continue
+    return int(max(0, max_gap))
+
+
+def _track_frame_range(track: Track) -> tuple[int, int] | None:
+    if track.frame_ids:
+        return int(min(track.frame_ids)), int(max(track.frame_ids))
+    first_frame = int(getattr(track, "first_frame", -1))
+    last_frame = int(getattr(track, "last_frame", -1))
+    if first_frame < 0 or last_frame < 0:
+        return None
+    return min(first_frame, last_frame), max(first_frame, last_frame)
+
+
+def _frame_ranges_are_close(
+    left: tuple[int, int],
+    right: tuple[int, int],
+    *,
+    max_frame_gap: int,
+) -> bool:
+    left_min, left_max = left
+    right_min, right_max = right
+    if left_min <= right_max and right_min <= left_max:
+        return True
+    gap = max(left_min - right_max, right_min - left_max)
+    return int(gap) <= int(max_frame_gap)
 
 
 def _incremental_postprocess_signature(track: Track) -> tuple[object, ...]:

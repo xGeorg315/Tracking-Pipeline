@@ -16,6 +16,7 @@ from tracking_pipeline.application.run_pipeline import (
     _maybe_write_incremental_live_artifact_snapshot,
     _maybe_write_live_object_list_snapshot,
     _snapshot_tracker_tracks,
+    _update_live_web_status,
     run_pipeline,
 )
 from tracking_pipeline.config.models import (
@@ -794,6 +795,7 @@ def test_incremental_live_pipeline_merges_articulated_vehicle_tracks(monkeypatch
     assert summary.saved_aggregates == 1
     assert summary.articulated_vehicle_pair_count == 1
     assert summary.articulated_vehicle_merged_component_count == 1
+    assert fake_tracker.finished_tracks == {}
     assert set(fake_writer.written_tracks.keys()) == {11, 12}
     assert fake_writer.written_tracks[11].state["articulated_role"] == "lead"
     assert fake_writer.written_tracks[12].state["articulated_role"] == "rear"
@@ -2008,7 +2010,6 @@ def test_run_pipeline_starts_embedded_live_web_viewer_for_qb2_live(monkeypatch, 
             live_web_host="0.0.0.0",
             live_web_port=8765,
             live_web_history_sec=0.8,
-            live_web_retain_all_frames=True,
         ),
     )
     reader = _InterruptingLiveReader(
@@ -2087,7 +2088,7 @@ def test_run_pipeline_starts_embedded_live_web_viewer_for_qb2_live(monkeypatch, 
     assert summary.frame_count == 1
     assert seen["server_host"] == "0.0.0.0"
     assert seen["server_port"] == 8765
-    assert seen["publisher_kwargs"]["retain_all_frames"] is True
+    assert "retain_all_frames" not in seen["publisher_kwargs"]
     assert seen["server_started"] is True
     assert seen["server_stopped"] is True
     assert seen["published_frames"] == [
@@ -2103,6 +2104,34 @@ def test_run_pipeline_starts_embedded_live_web_viewer_for_qb2_live(monkeypatch, 
     assert seen["track_outcomes"][-1] == [1]
     assert seen["summaries"][-1] == 1
     assert seen["stop_phases"] == ["stopped"]
+
+
+def test_live_web_status_updates_include_processing_hz(monkeypatch) -> None:
+    seen: list[dict[str, object]] = []
+
+    class _FakeLiveFramePublisher:
+        def update_status(self, **updates):
+            seen.append(dict(updates))
+
+    monotonic_values = iter([101.0, 103.0])
+
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.LiveFramePublisher", _FakeLiveFramePublisher)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.time.monotonic", lambda: next(monotonic_values))
+
+    runtime = {
+        "publisher": _FakeLiveFramePublisher(),
+        "_started_monotonic": 100.0,
+        "_last_processed_monotonic": None,
+        "_last_processed_frame_count": 0,
+    }
+
+    _update_live_web_status(runtime, processed_frames=1)
+    _update_live_web_status(runtime, processed_frames=5)
+
+    assert seen[0]["processing_total_hz"] == pytest.approx(1.0)
+    assert seen[0]["processing_recent_hz"] == pytest.approx(0.0)
+    assert seen[1]["processing_total_hz"] == pytest.approx(5.0 / 3.0)
+    assert seen[1]["processing_recent_hz"] == pytest.approx(2.0)
 
 
 def test_run_pipeline_restores_live_saved_track_outcomes_without_live_snapshot_writes(monkeypatch, tmp_path: Path) -> None:
@@ -2127,7 +2156,6 @@ def test_run_pipeline_restores_live_saved_track_outcomes_without_live_snapshot_w
             live_web_host="0.0.0.0",
             live_web_port=8765,
             live_web_history_sec=0.8,
-            live_web_retain_all_frames=True,
         ),
     )
 

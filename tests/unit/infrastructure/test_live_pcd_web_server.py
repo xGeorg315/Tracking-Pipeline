@@ -89,7 +89,8 @@ def test_live_pcd_web_server_handler_serves_meta_frame_and_html() -> None:
     assert meta["payload"]["run_label"] == "embedded_live_run"
     assert meta["payload"]["status"]["pipeline_phase"] == "processing_frames"
     assert meta["payload"]["point_source"] == "lane"
-    assert meta["payload"]["retain_all_frames"] is True
+    assert "retain_all_frames" not in meta["payload"]
+    assert meta["payload"]["monitoring"]["status_line"].startswith("live phase=processing_frames f=1")
     assert meta["payload"]["sequence_window"]["latest_sequence_id"] == 1
     assert frame["status"] == 200
     assert frame["payload"]["frame_index"] == 4
@@ -99,6 +100,10 @@ def test_live_pcd_web_server_handler_serves_meta_frame_and_html() -> None:
     assert [int(row["sequence_id"]) for row in batch["payload"]["frames"]] == [1]
     assert html["kind"] == "html"
     assert "Live Raw PCD Viewer" in html["payload"]
+    assert "Monitoring" in html["payload"]
+    assert "Saved vehicles" in html["payload"]
+    assert "JOURNAL_LOG_MAX_ENTRIES = 240" in html["payload"]
+    assert "journal-style status" in html["payload"]
     assert "Frames are fetched sequentially in small batches" in html["payload"]
     assert "<canvas id=\"scene\"></canvas>" in html["payload"]
 

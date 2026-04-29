@@ -324,7 +324,6 @@ def test_load_config_reads_live_web_visualization_settings(tmp_path: Path) -> No
                 "  live_web_host: 0.0.0.0",
                 "  live_web_port: 9001",
                 "  live_web_history_sec: 1.25",
-                "  live_web_retain_all_frames: false",
                 "  show_tracker_debug: true",
                 "  show_track_outcome_debug: true",
             ]
@@ -339,7 +338,6 @@ def test_load_config_reads_live_web_visualization_settings(tmp_path: Path) -> No
     assert config.visualization.live_web_host == "0.0.0.0"
     assert config.visualization.live_web_port == 9001
     assert config.visualization.live_web_history_sec == pytest.approx(1.25)
-    assert config.visualization.live_web_retain_all_frames is False
     assert config.visualization.show_tracker_debug is True
     assert config.visualization.show_track_outcome_debug is True
 
@@ -366,7 +364,6 @@ def test_load_config_rejects_invalid_live_web_settings(tmp_path: Path) -> None:
                 "  live_web_host: ''",
                 "  live_web_port: 0",
                 "  live_web_history_sec: 0.0",
-                "  live_web_retain_all_frames: nope",
             ]
         )
         + "\n",

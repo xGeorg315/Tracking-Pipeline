@@ -126,6 +126,61 @@ _HTML = """<!doctype html>
       gap: 10px;
     }
 
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .metric {
+      min-width: 0;
+      padding: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.035);
+    }
+
+    .metric-value {
+      overflow-wrap: anywhere;
+      font-family: var(--font-mono);
+      font-size: 18px;
+      font-weight: 700;
+      line-height: 1.15;
+    }
+
+    .metric-label {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 10px;
+      letter-spacing: 0.11em;
+      text-transform: uppercase;
+    }
+
+    .monitor-line {
+      margin-top: 12px;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid rgba(115, 217, 255, 0.14);
+      background: rgba(115, 217, 255, 0.055);
+    }
+
+    .mini-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .log-panel {
+      margin-top: 10px;
+      max-height: 210px;
+      overflow: auto;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      background: rgba(0, 0, 0, 0.22);
+    }
+
     .meta-row {
       display: grid;
       gap: 3px;
@@ -282,6 +337,25 @@ Mouse wheel: zoom
       </section>
 
       <section class="panel section">
+        <p class="eyebrow">Monitoring</p>
+        <div class="metric-grid" id="monitorGrid">
+          <div class="metric"><div class="metric-value" id="metricHz">--</div><div class="metric-label">Hz recent / total</div></div>
+          <div class="metric"><div class="metric-value" id="metricFrames">--</div><div class="metric-label">Frames</div></div>
+          <div class="metric"><div class="metric-value" id="metricSaved">--</div><div class="metric-label">Saved vehicles</div></div>
+          <div class="metric"><div class="metric-value" id="metricQueues">--</div><div class="metric-label">Queues label / snap</div></div>
+          <div class="metric"><div class="metric-value" id="metricDrops">--</div><div class="metric-label">Drops overflow / stale</div></div>
+          <div class="metric"><div class="metric-value" id="metricReader">--</div><div class="metric-label">Reader</div></div>
+          <div class="metric"><div class="metric-value" id="metricStep">--</div><div class="metric-label">Pipeline step</div></div>
+        </div>
+        <div class="monitor-line mono" id="journalLine">Waiting for journal-style status...</div>
+        <div class="mini-toolbar">
+          <button id="clearLogBtn">Clear log</button>
+          <button id="copyLogBtn">Copy log</button>
+        </div>
+        <div class="log-panel mono" id="journalLog">No log entries yet</div>
+      </section>
+
+      <section class="panel section">
         <p class="eyebrow">Summary</p>
         <div class="grid mono" id="summaryBlock">No summary yet</div>
       </section>
@@ -325,8 +399,19 @@ Mouse wheel: zoom
     const refreshBtn = document.getElementById("refreshBtn");
     const helpBtn = document.getElementById("helpBtn");
     const helpBox = document.getElementById("helpBox");
+    const journalLine = document.getElementById("journalLine");
+    const journalLog = document.getElementById("journalLog");
+    const clearLogBtn = document.getElementById("clearLogBtn");
+    const copyLogBtn = document.getElementById("copyLogBtn");
+    const metricHz = document.getElementById("metricHz");
+    const metricFrames = document.getElementById("metricFrames");
+    const metricSaved = document.getElementById("metricSaved");
+    const metricQueues = document.getElementById("metricQueues");
+    const metricDrops = document.getElementById("metricDrops");
+    const metricReader = document.getElementById("metricReader");
+    const metricStep = document.getElementById("metricStep");
 
-    const META_POLL_INTERVAL_MS = 40;
+    const META_POLL_INTERVAL_MS = 200;
     const FRAME_BATCH_LIMIT = 4;
     const FRAME_QUEUE_TARGET = 3;
     const FRAME_QUEUE_MAX = 6;
@@ -339,6 +424,7 @@ Mouse wheel: zoom
     const PLAYBACK_BACKLOG_LAG_THRESHOLD = 9;
     const OUTCOME_VISIBILITY_SEC = 3.0;
     const MAX_VISIBLE_OUTCOMES = 5;
+    const JOURNAL_LOG_MAX_ENTRIES = 240;
 
     const state = {
       meta: null,
@@ -359,6 +445,9 @@ Mouse wheel: zoom
       framePumpQueued: false,
       playbackTimerId: 0,
       renderQueued: false,
+      journalEntries: [],
+      lastJournalLine: "",
+      lastJournalEntryAtMs: 0,
       camera: {
         yaw: -0.75,
         pitch: 0.42,
@@ -422,6 +511,89 @@ Mouse wheel: zoom
       phasePill.textContent = phase.toUpperCase();
     }
 
+    function formatAge(value) {
+      if (value === null || value === undefined) {
+        return "n/a";
+      }
+      const number = Number(value);
+      return Number.isFinite(number) ? `${number.toFixed(1)}s` : "n/a";
+    }
+
+    function fallbackJournalLine(meta) {
+      const status = (meta || {}).status || {};
+      const reader = (meta || {}).reader || {};
+      const mqttConnected = reader.mqtt_connected ? "yes" : "no";
+      const waitingRaw = reader.waiting_for_first_raw_frame ? "yes" : "no";
+      return [
+        `live phase=${status.pipeline_phase || "unknown"}`,
+        `f=${status.processed_frames || 0}`,
+        `hz=${Number(status.processing_recent_hz || 0).toFixed(2)}/${Number(status.processing_total_hz || 0).toFixed(2)}`,
+        `tr=${status.active_track_count || 0}`,
+        `finq=${status.live_finished_track_queue_count || 0}`,
+        `snaptr=${status.live_snapshot_track_count || 0}`,
+        `saved=${savedVehicleCount(meta)}`,
+        `aw=${status.live_artifact_write_count || 0}`,
+        `ow=${status.live_object_list_write_count || 0}`,
+        `raw=${reader.raw_frames_received || 0}`,
+        `mqtt=${reader.mqtt_messages_received || 0}`,
+        `snap=${reader.mqtt_snapshots_received || 0}`,
+        `q=${reader.pending_label_count || 0}/${reader.pending_snapshot_count || 0}`,
+        `drop=${reader.dropped_overflow_label_count || 0}/${reader.dropped_stale_label_count || 0}`,
+        `conn=${mqttConnected}`,
+        `wait=${waitingRaw}`,
+        `reconn=${reader.raw_stream_reconnect_count || 0}`,
+        `raw_age=${formatAge(reader.last_raw_age_sec)}`,
+        `mqtt_age=${formatAge(reader.last_mqtt_age_sec)}`,
+        `state=${reader.reader_state || "unknown"}`,
+        `step=${status.current_pipeline_step || "unknown"}`,
+        `step_age=${formatAge(status.current_pipeline_step_age_sec)}`,
+      ].join(" ");
+    }
+
+    function journalStatusLine(meta) {
+      return (((meta || {}).monitoring || {}).status_line) || fallbackJournalLine(meta);
+    }
+
+    function savedVehicleCount(meta) {
+      const status = (meta || {}).status || {};
+      const summary = (meta || {}).summary || {};
+      return Math.max(Number(status.saved_aggregates || 0), Number(summary.saved_aggregates || 0));
+    }
+
+    function updateMonitoringDashboard(meta) {
+      const status = (meta || {}).status || {};
+      const reader = (meta || {}).reader || {};
+      metricHz.textContent = `${Number(status.processing_recent_hz || 0).toFixed(2)} / ${Number(status.processing_total_hz || 0).toFixed(2)}`;
+      metricFrames.textContent = `${status.processed_frames || 0}`;
+      metricSaved.textContent = `${savedVehicleCount(meta)}`;
+      metricQueues.textContent = `${reader.pending_label_count || 0} / ${reader.pending_snapshot_count || 0}`;
+      metricDrops.textContent = `${reader.dropped_overflow_label_count || 0} / ${reader.dropped_stale_label_count || 0}`;
+      metricReader.textContent = `${reader.reader_state || "n/a"}`;
+      metricStep.textContent = `${status.current_pipeline_step || "n/a"} ${formatAge(status.current_pipeline_step_age_sec)}`;
+      const line = journalStatusLine(meta);
+      journalLine.textContent = line;
+      appendJournalLine(line);
+    }
+
+    function appendJournalLine(line) {
+      const nowMs = Date.now();
+      if (!line || line === state.lastJournalLine || nowMs - state.lastJournalEntryAtMs < 1000) {
+        return;
+      }
+      state.lastJournalLine = line;
+      state.lastJournalEntryAtMs = nowMs;
+      const stamp = new Date(nowMs).toISOString();
+      state.journalEntries.push(`${stamp} ${line}`);
+      if (state.journalEntries.length > JOURNAL_LOG_MAX_ENTRIES) {
+        state.journalEntries.splice(0, state.journalEntries.length - JOURNAL_LOG_MAX_ENTRIES);
+      }
+      journalLog.textContent = state.journalEntries.join("\\n");
+      journalLog.scrollTop = journalLog.scrollHeight;
+      if (window.console && typeof window.console.debug === "function") {
+        window.console.debug(`[tracking-live] ${line}`);
+      }
+    }
+
     function formatMeta(meta) {
       if (!meta) {
         return "Waiting for meta...";
@@ -429,14 +601,17 @@ Mouse wheel: zoom
       const status = meta.status || {};
       const reader = meta.reader || {};
       const seq = meta.sequence_window || {};
-      const retention = meta.retain_all_frames ? "full-run" : `${Number(meta.history_sec || 0).toFixed(2)}s`;
+      const retention = `rolling ${Number(meta.history_sec || 0).toFixed(2)}s`;
       const lines = [];
       lines.push(`run           ${meta.run_label || "live"}`);
       lines.push(`phase         ${status.pipeline_phase || "waiting_for_frames"}`);
       lines.push(`frames        ${status.processed_frames || 0}`);
       lines.push(`stored        ${seq.frame_count || 0} frames (${seq.oldest_sequence_id ?? -1}..${seq.latest_sequence_id ?? -1})`);
+      lines.push(`web pruned    ${seq.pruned_frame_count || status.live_web_pruned_frame_count || 0}`);
       lines.push(`display       5Hz, catch-up <=10Hz`);
       lines.push(`active tracks ${status.active_track_count || 0}`);
+      lines.push(`finished q    ${status.live_finished_track_queue_count || 0}`);
+      lines.push(`snapshot tr   ${status.live_snapshot_track_count || 0}`);
       lines.push(`saved aggr    ${status.saved_aggregates || 0}`);
       lines.push(`reader        ${reader.reader_state || "n/a"}`);
       lines.push(`raw frames    ${reader.raw_frames_received || 0}`);
@@ -479,8 +654,8 @@ Mouse wheel: zoom
       const lines = [];
       lines.push(`phase=${status.pipeline_phase || "waiting_for_frames"}  seq=${currentFrame ? currentFrame.sequence_id : -1}`);
       lines.push(`frame=${currentFrame ? currentFrame.frame_index : -1}  ts=${currentFrame ? currentFrame.timestamp_ns : -1}`);
-      lines.push(`stored_frames=${seq.frame_count || 0}  queued=${state.pendingFrames.length}  lag=${lag}  display=${state.displayHz > 0 ? state.displayHz.toFixed(1) : "--"}Hz  target=${playbackTargetHz()}Hz`);
-      lines.push(`active_tracks=${status.active_track_count || 0}  outcomes=${shownOutcomes.length}  shown_points=${currentFrame ? currentFrame.point_count || 0 : 0}`);
+      lines.push(`stored_frames=${seq.frame_count || 0}  web_pruned=${seq.pruned_frame_count || status.live_web_pruned_frame_count || 0}  queued=${state.pendingFrames.length}  lag=${lag}  display=${state.displayHz > 0 ? state.displayHz.toFixed(1) : "--"}Hz  target=${playbackTargetHz()}Hz`);
+      lines.push(`active_tracks=${status.active_track_count || 0}  finished_q=${status.live_finished_track_queue_count || 0}  snapshot_tracks=${status.live_snapshot_track_count || 0}  outcomes=${shownOutcomes.length}  shown_points=${currentFrame ? currentFrame.point_count || 0 : 0}`);
       lines.push(`displayed=${state.displayedSeq}  fetched=${state.fetchedSeq}  dropped=${state.droppedFrames}`);
       lines.push(`reader=${reader.reader_state || "n/a"}  raw=${reader.raw_frames_received || 0}  mqtt_pending=${reader.pending_label_count || 0}`);
       lines.push(`drag to orbit, wheel to zoom`);
@@ -606,6 +781,7 @@ Mouse wheel: zoom
       }
       statusBlock.textContent = formatMeta(meta);
       summaryBlock.textContent = formatSummary(meta);
+      updateMonitoringDashboard(meta);
       setPhase(meta);
       setButtonState(pauseBtn, state.paused);
       setButtonState(trackerBtn, state.showTracker);
@@ -1198,6 +1374,25 @@ Mouse wheel: zoom
       state.helpVisible = !state.helpVisible;
       helpBox.classList.toggle("visible", state.helpVisible);
       setButtonState(helpBtn, state.helpVisible);
+    });
+
+    clearLogBtn.addEventListener("click", () => {
+      state.journalEntries = [];
+      state.lastJournalLine = "";
+      state.lastJournalEntryAtMs = 0;
+      journalLog.textContent = "No log entries yet";
+    });
+
+    copyLogBtn.addEventListener("click", async () => {
+      const text = state.journalEntries.join("\\n");
+      if (!text || !navigator.clipboard) {
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (_error) {
+        // Clipboard access is browser-dependent; the dashboard log remains visible.
+      }
     });
 
     window.addEventListener("keydown", async (event) => {

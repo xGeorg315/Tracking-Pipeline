@@ -35,7 +35,6 @@ class LiveFramePublisher:
         track_exit_edge_margin: float,
         max_points: int,
         history_sec: float,
-        retain_all_frames: bool = True,
         point_source: str,
         color_by_intensity: bool,
         show_tracker_debug: bool,
@@ -51,7 +50,6 @@ class LiveFramePublisher:
         self._track_exit_edge_margin = float(track_exit_edge_margin)
         self._max_points = max(1, int(max_points))
         self._history_sec = max(0.05, float(history_sec))
-        self._retain_all_frames = bool(retain_all_frames)
         normalized_point_source = str(point_source).strip().lower()
         self._point_source = "lane" if normalized_point_source == "lane" else "all"
         self._history_ns = int(round(self._history_sec * _NSEC_PER_SEC))
@@ -69,6 +67,8 @@ class LiveFramePublisher:
         self._lock = threading.Lock()
         self._publish_condition = threading.Condition(self._lock)
         self._frames: deque[dict[str, Any]] = deque()
+        self._frames_by_sequence: dict[int, dict[str, Any]] = {}
+        self._pruned_frame_count = 0
         self._sequence_id = 0
         self._track_outcome_version = 0
         self._track_outcomes: list[dict[str, Any]] = []
@@ -83,11 +83,18 @@ class LiveFramePublisher:
             "last_frame_timestamp_ns": None,
             "active_track_count": 0,
             "finished_track_count": 0,
+            "live_finished_track_processed_count": 0,
+            "live_finished_track_queue_count": 0,
+            "live_snapshot_track_count": 0,
+            "live_snapshot_aggregate_count": 0,
             "saved_aggregates": 0,
             "interrupted": False,
             "live_web_pending_frame": False,
             "live_web_worker_busy": False,
             "live_web_dropped_frame_count": 0,
+            "live_web_pruned_frame_count": 0,
+            "live_web_retained_frame_count": 0,
+            "live_web_oldest_sequence_id": -1,
             "live_web_latest_sequence_id": -1,
             "updated_at_unix_sec": float(time.time()),
         }
@@ -175,10 +182,7 @@ class LiveFramePublisher:
     def get_frame(self, sequence_id: int) -> dict[str, Any] | None:
         requested = int(sequence_id)
         with self._lock:
-            for payload in self._frames:
-                if int(payload.get("sequence_id", -1)) == requested:
-                    return payload
-        return None
+            return self._frames_by_sequence.get(requested)
 
     def get_frames(self, start_sequence_id: int, *, limit: int) -> list[dict[str, Any]]:
         requested_start = int(start_sequence_id)
@@ -219,7 +223,6 @@ class LiveFramePublisher:
                 ),
             },
             "history_sec": float(self._history_sec),
-            "retain_all_frames": bool(self._retain_all_frames),
             "max_points": int(self._max_points),
             "point_source": str(self._point_source),
             "color_by_intensity": bool(self._color_by_intensity),
@@ -231,12 +234,17 @@ class LiveFramePublisher:
                 "oldest_sequence_id": int(oldest_sequence_id),
                 "latest_sequence_id": int(latest_sequence_id),
                 "frame_count": int(frame_count),
+                "pruned_frame_count": int(status.get("live_web_pruned_frame_count", 0)),
             },
             "status": status,
             "summary": summary,
             "track_outcomes": track_outcomes,
             "track_outcome_version": int(track_outcome_version),
             "reader": reader_status,
+            "monitoring": {
+                "status_line": _format_monitoring_status_line(status, reader_status),
+                "updated_at_unix_sec": float(status.get("updated_at_unix_sec", time.time()) or time.time()),
+            },
         }
 
     def mark_stopped(self, *, pipeline_phase: str = "stopped") -> None:
@@ -269,13 +277,25 @@ class LiveFramePublisher:
         self._publish_thread = None
 
     def _prune_frames_locked(self, newest_timestamp_ns: int) -> None:
-        if self._retain_all_frames:
-            return
         cutoff_timestamp_ns = int(newest_timestamp_ns) - int(self._history_ns)
         while len(self._frames) > self._max_frames:
-            self._frames.popleft()
+            self._drop_oldest_frame_locked()
         while len(self._frames) > 1 and int(self._frames[0].get("timestamp_ns", 0)) < cutoff_timestamp_ns:
-            self._frames.popleft()
+            self._drop_oldest_frame_locked()
+        oldest_sequence_id = -1 if not self._frames else int(self._frames[0].get("sequence_id", -1))
+        latest_sequence_id = -1 if not self._frames else int(self._frames[-1].get("sequence_id", -1))
+        self._status["live_web_pruned_frame_count"] = int(self._pruned_frame_count)
+        self._status["live_web_retained_frame_count"] = int(len(self._frames))
+        self._status["live_web_oldest_sequence_id"] = int(oldest_sequence_id)
+        self._status["live_web_latest_sequence_id"] = int(latest_sequence_id)
+
+    def _drop_oldest_frame_locked(self) -> None:
+        if not self._frames:
+            return
+        payload = self._frames.popleft()
+        sequence_id = int(payload.get("sequence_id", -1))
+        self._frames_by_sequence.pop(sequence_id, None)
+        self._pruned_frame_count += 1
 
     def _read_reader_status(self) -> dict[str, Any]:
         provider = self._reader_status_provider
@@ -337,8 +357,8 @@ class LiveFramePublisher:
     def _store_frame_payload(self, payload: dict[str, Any], timestamp_ns: int) -> None:
         with self._lock:
             self._frames.append(payload)
+            self._frames_by_sequence[int(payload.get("sequence_id", -1))] = payload
             self._prune_frames_locked(int(timestamp_ns))
-            self._status["live_web_latest_sequence_id"] = int(payload.get("sequence_id", -1))
             self._status["updated_at_unix_sec"] = float(time.time())
 
     def _publish_worker_main(self) -> None:
@@ -546,6 +566,50 @@ def _serialize_summary(summary: RunSummary | Mapping[str, Any]) -> dict[str, Any
         str(key): _json_compatible_value(value)
         for key, value in dict(summary).items()
     }
+
+
+def _format_monitoring_status_line(status: Mapping[str, Any], reader: Mapping[str, Any]) -> str:
+    return (
+        "live phase={phase} f={processed} hz={recent_hz:.2f}/{total_hz:.2f} tr={active_tracks} "
+        "finq={finished_queue} snaptr={snapshot_tracks} saved={saved_vehicles} "
+        "aw={artifact_writes} ow={object_writes} raw={raw} mqtt={mqtt_msgs} snap={mqtt_snapshots} "
+        "q={pending_labels}/{pending_snapshots} drop={dropped_overflow_labels}/{dropped_stale_labels} "
+        "conn={mqtt_connected} wait={waiting_first_raw} reconn={raw_reconnects} "
+        "raw_age={last_raw_age} mqtt_age={last_mqtt_age} state={reader_state} "
+        "step={pipeline_step} step_age={pipeline_step_age}"
+    ).format(
+        phase=str(status.get("pipeline_phase", "unknown")),
+        processed=int(status.get("processed_frames", 0) or 0),
+        recent_hz=float(status.get("processing_recent_hz", 0.0) or 0.0),
+        total_hz=float(status.get("processing_total_hz", 0.0) or 0.0),
+        active_tracks=int(status.get("active_track_count", 0) or 0),
+        finished_queue=int(status.get("live_finished_track_queue_count", 0) or 0),
+        snapshot_tracks=int(status.get("live_snapshot_track_count", 0) or 0),
+        saved_vehicles=int(status.get("saved_aggregates", 0) or 0),
+        artifact_writes=int(status.get("live_artifact_write_count", 0) or 0),
+        object_writes=int(status.get("live_object_list_write_count", 0) or 0),
+        raw=int(reader.get("raw_frames_received", 0) or 0),
+        mqtt_msgs=int(reader.get("mqtt_messages_received", 0) or 0),
+        mqtt_snapshots=int(reader.get("mqtt_snapshots_received", 0) or 0),
+        pending_labels=int(reader.get("pending_label_count", 0) or 0),
+        pending_snapshots=int(reader.get("pending_snapshot_count", 0) or 0),
+        dropped_overflow_labels=int(reader.get("dropped_overflow_label_count", 0) or 0),
+        dropped_stale_labels=int(reader.get("dropped_stale_label_count", 0) or 0),
+        mqtt_connected="yes" if bool(reader.get("mqtt_connected", False)) else "no",
+        waiting_first_raw="yes" if bool(reader.get("waiting_for_first_raw_frame", False)) else "no",
+        raw_reconnects=int(reader.get("raw_stream_reconnect_count", 0) or 0),
+        last_raw_age=_format_monitoring_age(reader.get("last_raw_age_sec")),
+        last_mqtt_age=_format_monitoring_age(reader.get("last_mqtt_age_sec")),
+        reader_state=str(reader.get("reader_state", "unknown")),
+        pipeline_step=str(status.get("current_pipeline_step", "unknown")),
+        pipeline_step_age=_format_monitoring_age(status.get("current_pipeline_step_age_sec")),
+    )
+
+
+def _format_monitoring_age(value: object) -> str:
+    if value is None:
+        return "n/a"
+    return f"{float(value):.1f}s"
 
 
 def _json_compatible_value(value: object) -> Any:

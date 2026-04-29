@@ -26,7 +26,6 @@ def _publisher(
     max_points: int = 3,
     history_sec: float = 1.0,
     max_frames: int | None = None,
-    retain_all_frames: bool = True,
     async_publish: bool = False,
 ) -> LiveFramePublisher:
     return LiveFramePublisher(
@@ -35,7 +34,6 @@ def _publisher(
         track_exit_edge_margin=0.9,
         max_points=max_points,
         history_sec=history_sec,
-        retain_all_frames=retain_all_frames,
         point_source="lane",
         color_by_intensity=True,
         show_tracker_debug=True,
@@ -134,8 +132,8 @@ def _tracking_state(frame_index: int) -> FrameTrackingState:
     )
 
 
-def test_live_frame_publisher_caps_points_and_prunes_frames_when_retention_disabled() -> None:
-    publisher = _publisher(max_points=3, history_sec=1.0, max_frames=2, retain_all_frames=False)
+def test_live_frame_publisher_caps_points_and_prunes_frames_in_rolling_window() -> None:
+    publisher = _publisher(max_points=3, history_sec=1.0, max_frames=2)
 
     seq_1 = publisher.publish_frame(_frame(0, 0, point_count=6), _cluster_result(), _tracking_state(0))
     seq_2 = publisher.publish_frame(_frame(1, 400_000_000, point_count=6), _cluster_result(), _tracking_state(1))
@@ -162,40 +160,41 @@ def test_live_frame_publisher_caps_points_and_prunes_frames_when_retention_disab
     assert publisher.get_frame(4) is not None
     assert meta["sequence_window"]["oldest_sequence_id"] == 4
     assert meta["sequence_window"]["latest_sequence_id"] == 4
+    assert meta["sequence_window"]["frame_count"] == 1
+    assert meta["sequence_window"]["pruned_frame_count"] == 3
+    assert "retain_all_frames" not in meta
 
 
-def test_live_frame_publisher_retains_all_frames_by_default() -> None:
-    publisher = _publisher(max_points=3, history_sec=1.0, max_frames=2)
+def test_live_frame_publisher_prunes_by_hard_frame_limit() -> None:
+    publisher = _publisher(max_points=3, history_sec=10.0, max_frames=2)
 
     publisher.publish_frame(_frame(0, 0, point_count=6), _cluster_result(), _tracking_state(0))
     publisher.publish_frame(_frame(1, 400_000_000, point_count=6), _cluster_result(), _tracking_state(1))
     publisher.publish_frame(_frame(2, 800_000_000, point_count=6), _cluster_result(), _tracking_state(2))
-    publisher.publish_frame(_frame(3, 2_200_000_000, point_count=4), _cluster_result(), _tracking_state(3))
 
     meta = publisher.current_meta()
 
-    assert publisher.get_frame(1) is not None
+    assert publisher.get_frame(1) is None
     assert publisher.get_frame(2) is not None
     assert publisher.get_frame(3) is not None
-    assert publisher.get_frame(4) is not None
-    assert meta["retain_all_frames"] is True
-    assert meta["sequence_window"]["oldest_sequence_id"] == 1
-    assert meta["sequence_window"]["latest_sequence_id"] == 4
-    assert meta["sequence_window"]["frame_count"] == 4
+    assert meta["sequence_window"]["oldest_sequence_id"] == 2
+    assert meta["sequence_window"]["latest_sequence_id"] == 3
+    assert meta["sequence_window"]["frame_count"] == 2
+    assert meta["sequence_window"]["pruned_frame_count"] == 1
 
 
 def test_live_frame_publisher_returns_frame_batches_in_sequence_order() -> None:
-    publisher = _publisher(max_points=3, history_sec=1.0, max_frames=2)
+    publisher = _publisher(max_points=3, history_sec=10.0, max_frames=2)
 
     publisher.publish_frame(_frame(0, 0, point_count=6), _cluster_result(), _tracking_state(0))
     publisher.publish_frame(_frame(1, 400_000_000, point_count=6), _cluster_result(), _tracking_state(1))
     publisher.publish_frame(_frame(2, 800_000_000, point_count=6), _cluster_result(), _tracking_state(2))
     publisher.publish_frame(_frame(3, 1_200_000_000, point_count=6), _cluster_result(), _tracking_state(3))
 
-    batch = publisher.get_frames(2, limit=2)
+    batch = publisher.get_frames(1, limit=4)
 
-    assert [int(row["sequence_id"]) for row in batch] == [2, 3]
-    assert [int(row["frame_index"]) for row in batch] == [1, 2]
+    assert [int(row["sequence_id"]) for row in batch] == [3, 4]
+    assert [int(row["frame_index"]) for row in batch] == [2, 3]
 
 
 def test_live_frame_publisher_serializes_tracker_status_summary_and_outcomes() -> None:
@@ -244,7 +243,10 @@ def test_live_frame_publisher_serializes_tracker_status_summary_and_outcomes() -
     assert meta["status"]["processed_frames"] == 3
     assert meta["summary"]["saved_aggregates"] == 1
     assert meta["point_source"] == "lane"
-    assert meta["retain_all_frames"] is True
+    assert meta["monitoring"]["status_line"].startswith("live phase=processing_frames f=3")
+    assert "hz=0.00/0.00" in meta["monitoring"]["status_line"]
+    assert "saved=0" in meta["monitoring"]["status_line"]
+    assert "raw=0 mqtt=0" in meta["monitoring"]["status_line"]
     assert meta["track_outcome_version"] == 1
     assert meta["track_outcomes"][0]["track_id"] == 9
     assert meta["track_outcomes"][0]["status"] == "saved"
@@ -268,7 +270,6 @@ def test_live_frame_publisher_uses_full_frame_points_when_configured() -> None:
         track_exit_edge_margin=0.9,
         max_points=4,
         history_sec=1.0,
-        retain_all_frames=True,
         point_source="all",
         color_by_intensity=True,
         show_tracker_debug=True,

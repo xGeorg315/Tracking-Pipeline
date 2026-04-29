@@ -34,6 +34,7 @@ aggregation:
   registration_backend: icp_point_to_plane
   frame_selection_method: keyframe_motion
   keyframe_keep: 8
+  symmetry_completion: true
   enable_registration_underfill_fallback: true
   enable_tail_bridge: false
   enable_post_filter_stat_outlier_removal: true
@@ -72,14 +73,13 @@ output:
 warumup_runs: 1
 measure_runs: 1
 runtime:
-  cpu_cores: 4
+  cpu_cores: 2
 visualization:
   show_tracker_debug: true
   show_track_outcome_debug: true
-  live_web_enabled: false
+  live_web_enabled: true
   live_web_host: 0.0.0.0
   live_web_port: 8765
-  live_web_history_sec: 2.5
-  live_web_retain_all_frames: true
+  live_web_history_sec: 1.5
   live_web_point_source: lane
-  max_points: 40000
+  max_points: 12000

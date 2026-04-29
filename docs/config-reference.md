@@ -359,8 +359,7 @@ Hinweise:
 | `live_web_enabled` | `false` | startet fuer `input.format: qb2_live` einen eingebetteten headless Browser-Viewer direkt im laufenden `run`-Prozess |
 | `live_web_host` | `0.0.0.0` | Bind-Host fuer den eingebetteten Browser-Viewer |
 | `live_web_port` | `8765` | TCP-Port fuer den eingebetteten Browser-Viewer |
-| `live_web_history_sec` | `0.8` | History-Fenster fuer den Browser-Viewer, falls `live_web_retain_all_frames: false` gesetzt ist |
-| `live_web_retain_all_frames` | `true` | behaelt alle Live-Frames waehrend des Runs im eingebetteten Browser-Viewer, statt sie auf ein Rolling Window zu beschraenken |
+| `live_web_history_sec` | `0.8` | Rolling-History-Fenster fuer den Browser-Viewer |
 | `live_web_point_source` | `lane` | Punktquelle fuer den eingebetteten Browser-Viewer; `lane` streamt nur Lane-Punkte, `all` die komplette Frame-Punktwolke |
 | `max_points` | `120000` | Punktlimit fuer den Viewer |
 | `max_cluster_points` | `15000` | Punktlimit pro Cluster im Viewer |
@@ -372,8 +371,8 @@ Hinweise:
 - V1 von `live-view` zeigt bewusst keine volle Rohpunktwolke, keine Aggregate-PCDs und keine Playback-Timeline, sondern Lane-Box, Exit-Linie, letzten Tracker-Snapshot, Outcome-Beacons und HUD.
 - Wenn `visualization.live_web_enabled: true` aktiv ist und `input.format: qb2_live` laeuft, startet `tracking-pipeline run` einen eingebetteten Browser-Viewer fuer die rohe Live-Punktwolke direkt im Pipeline-Prozess.
 - Dieser Live-Webviewer streamt pro Frame je nach `live_web_point_source` entweder nur `lane_points` oder die komplette Frame-Punktwolke als `points_xyz`, dazu Tracker-Overlay und die zuletzt bekannten `track_outcomes` in den Browser.
-- Standardmaessig werden Live-Frames fuer die gesamte Run-Dauer gehalten (`live_web_retain_all_frames: true`), damit der Browser Frames sequentiell weiterladen kann und nicht nur innerhalb eines kurzen Buffers arbeitet.
-- Wenn stattdessen ein Rolling Window gewuenscht ist, kann `live_web_retain_all_frames: false` gesetzt werden; dann greift wieder `live_web_history_sec`.
+- Live-Frames werden im eingebetteten Browser-Viewer immer als Rolling Window gehalten; Full-Run-Replay erfolgt ueber gespeicherte Artefakte, nicht ueber den Browser-Buffer.
+- `live_web_history_sec` bestimmt, wie lange Frames im direkten Rohframe-Stream gehalten werden.
 - `max_points` dient in diesem Pfad als serverseitiges Punktbudget pro Live-Frame.
 - Der CLI-Befehl `tracking-pipeline live-web ...` bleibt als read-only Snapshot-Fallback erhalten und nutzt weiterhin die bereits geschriebenen Dataset-Stats statt den direkten Rohframe-Stream.
 

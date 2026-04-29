@@ -219,8 +219,6 @@ def validate_config(config: PipelineConfig) -> None:
         raise ConfigError("visualization.live_web_port must be > 0")
     if float(config.visualization.live_web_history_sec) <= 0:
         raise ConfigError("visualization.live_web_history_sec must be > 0")
-    if not isinstance(config.visualization.live_web_retain_all_frames, bool):
-        raise ConfigError("visualization.live_web_retain_all_frames must be a boolean")
     if str(config.visualization.live_web_point_source) not in {"lane", "all"}:
         raise ConfigError("visualization.live_web_point_source must be one of: lane, all")
     if len(config.preprocessing.lane_box) != 6:

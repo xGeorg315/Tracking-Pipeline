@@ -216,7 +216,6 @@ class VisualizationConfig:
     live_web_host: str = "0.0.0.0"
     live_web_port: int = 8765
     live_web_history_sec: float = 0.8
-    live_web_retain_all_frames: bool = True
     live_web_point_source: str = "lane"
     max_points: int = 120000
     max_cluster_points: int = 15000
