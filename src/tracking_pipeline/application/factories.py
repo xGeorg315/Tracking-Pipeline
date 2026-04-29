@@ -19,6 +19,7 @@ from tracking_pipeline.infrastructure.clustering.beam_neighbor_region_growing im
 from tracking_pipeline.infrastructure.clustering.voxel_grid_connected_components import VoxelGridConnectedComponentsClusterer
 from tracking_pipeline.infrastructure.io.artifact_writer import JsonArtifactWriter
 from tracking_pipeline.infrastructure.io.dataset_artifact_writer import DatasetArtifactWriter
+from tracking_pipeline.infrastructure.io.frame_segment import FrameSegmentReader
 from tracking_pipeline.infrastructure.postprocessing.articulated_vehicle_merge import ArticulatedVehicleMergePostprocessor
 from tracking_pipeline.infrastructure.postprocessing.co_moving_track_merge import CoMovingTrackMergePostprocessor
 from tracking_pipeline.infrastructure.postprocessing.track_quality_scoring import TrackQualityScoringPostprocessor
@@ -46,6 +47,8 @@ def build_reader(config: PipelineConfig) -> FrameReader:
             config.input.qb2_live,
             read_intensity=config.visualization.color_by_intensity or config.output.save_aggregate_intensity,
         )
+    if config.input.format == "frame_segment":
+        return FrameSegmentReader()
     raise ValueError(f"Unsupported input format: {config.input.format}")
 
 

@@ -6,7 +6,7 @@ import numpy as np
 
 from tracking_pipeline.domain.models import FrameTrackerDebug, TrackOutcomeDebug, DetectionDebugState, TrackDebugState
 from tracking_pipeline.infrastructure.visualization.live_snapshot_loader import LiveSnapshot, LiveTrackerFrameSnapshot
-from tracking_pipeline.infrastructure.visualization.live_web_server import LiveWebViewerServer, build_live_web_payload
+from tracking_pipeline.infrastructure.visualization.live_web_server import build_live_web_payload
 
 
 def _snapshot(
@@ -101,25 +101,3 @@ def test_build_live_web_payload_serializes_tracker_and_outcomes() -> None:
     assert payload["tracks"][0]["output_label"] == "track #7"
     assert payload["outcomes"][0]["label"] == "saved #7 car 0.91 | gt:PKW"
     assert payload["outcomes"][0]["color"] == [0.2, 1.0, 0.35]
-
-
-def test_live_web_server_force_refresh_invalidates_loader_cache() -> None:
-    class _FakeLoader:
-        def __init__(self) -> None:
-            self.invalidated = 0
-            self.calls: list[tuple[str | None, bool]] = []
-
-        def invalidate_cache(self) -> None:
-            self.invalidated += 1
-
-        def load(self, run_id: str | None = None, force: bool = False) -> LiveSnapshot:
-            self.calls.append((run_id, force))
-            return _snapshot()
-
-    loader = _FakeLoader()
-    server = LiveWebViewerServer(loader)
-
-    server.snapshot_payload(run_id="run_web", force=True)
-
-    assert loader.invalidated == 1
-    assert loader.calls == [("run_web", True)]

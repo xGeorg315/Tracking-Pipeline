@@ -74,7 +74,7 @@ Fuer Live-QB2-Frames mit MQTT-GT:
 tracking-pipeline run -c configs/qb2_live_example.yaml
 ```
 
-Der Live-Run bleibt offen, bis du ihn mit `Ctrl+C` oder `SIGTERM` beendest. Dann finalisiert die Pipeline den aktuellen Stand und schreibt die normalen Run-Artefakte einmal am Ende weg. Wenn `visualization.live_web_enabled: true` gesetzt ist, startet derselbe Prozess zusaetzlich einen headless Browser-Viewer fuer die rohe Live-Punktwolke.
+Der Live-Run bleibt offen, bis du ihn mit `Ctrl+C` oder `SIGTERM` beendest. Dann finalisiert die Pipeline den aktuellen Stand und schreibt die normalen Run-Artefakte einmal am Ende weg. Wenn `visualization.live_web_enabled: true` gesetzt ist, startet derselbe Prozess zusaetzlich einen headless Browser-Viewer fuer die rohe Live-Punktwolke. Bei `output.statistics_enabled: true` zeigt die CLI-Statuszeile ausserdem direkt die aktuelle Bearbeitungsfrequenz `hz=recent/total`, den MQTT-Pending-Stand `q=labels/snapshots` und die Reader-Drops `drop=overflow/stale`.
 
 ### Replay starten
 
@@ -277,8 +277,8 @@ Wichtig fuer den Alltag:
 - `live-view` haengt sich separat an bestehende Snapshot-Stats eines laufenden oder kuerzlich geschriebenen `dataset`-Runs; der Service selbst bleibt headless.
 - `runtime.cpu_cores` begrenzt auf Linux die Pipeline per CPU-Affinity plus numerische Thread-Limits auf die angegebene Kernzahl; `0` bedeutet keine explizite Begrenzung.
 - `output.mode` waehlt exklusiv zwischen klassischem Run-Ordner (`run`) und globalem Dataset-Baum (`dataset`); es wird nie beides gleichzeitig geschrieben.
-- Im `dataset`-Modus liegen die Tagesstatistiken unter `dataset/_stats/YYYY-MM-DD/<run_id>/`.
-- Bei `qb2_live` werden `live_status.json`, `object_list/`, `tracks.jsonl`, `summary.json`, `gt_matching/` und `aggregates/` bereits waehrend des laufenden Runs als Zwischenstand aktualisiert.
+- Im `dataset`-Modus liegen die Tagesstatistiken unter `dataset/_stats/YYYY-MM-DD/<run_id>/`, sofern `output.statistics_enabled: true` gesetzt ist.
+- Bei `qb2_live` werden `live_status.json`, `object_list/`, `tracks.jsonl`, `summary.json`, `gt_matching/` und `aggregates/` bereits waehrend des laufenden Runs als Zwischenstand aktualisiert. Mit `output.statistics_enabled: false` entfallen `_stats`, Summary, Tracks und Debug-Stats; Aggregate und GT-Matching bleiben aktiv.
 
 Die vollstaendige Referenz steht in [docs/config-reference.md](docs/config-reference.md).
 

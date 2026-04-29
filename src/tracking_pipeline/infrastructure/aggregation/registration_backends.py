@@ -8,7 +8,7 @@ import numpy as np
 import open3d as o3d
 
 from tracking_pipeline.config.models import AggregationConfig
-from tracking_pipeline.domain.rules import axis_to_index, is_valid_transform, orthogonal_axes
+from tracking_pipeline.domain.rules import is_valid_transform
 from tracking_pipeline.shared.geometry import estimate_normals, np_to_o3d, transform_points, voxel_downsample_numpy
 
 
@@ -63,24 +63,6 @@ def _roll_pitch_yaw_to_matrix(roll: float, pitch: float, yaw: float) -> np.ndarr
     return rot_z @ rot_y @ rot_x
 
 
-def _anchor_score(chunk: np.ndarray, index: int, axis_idx: int) -> tuple[float, float, float, float, int]:
-    points = np.asarray(chunk, dtype=np.float32)
-    if len(points) == 0:
-        return (0.0, 0.0, 0.0, -int(index))
-    extent = np.max(points, axis=0) - np.min(points, axis=0)
-    axis_idx = int(np.clip(int(axis_idx), 0, 2))
-    lateral_idx, _ = orthogonal_axes(axis_idx)
-    longitudinal_extent = float(extent[axis_idx])
-    lateral_extent = float(extent[lateral_idx])
-    return (
-        longitudinal_extent * lateral_extent,
-        longitudinal_extent,
-        lateral_extent,
-        float(len(points)),
-        -int(index),
-    )
-
-
 class _BaseRegistrationBackend:
     name = "base"
 
@@ -92,26 +74,17 @@ class _BaseRegistrationBackend:
     def align_chunks(self, chunks: list[np.ndarray]) -> tuple[list[np.ndarray], dict[str, Any]]:
         if len(chunks) <= 1:
             return list(chunks), self._empty_info(len(chunks))
-        axis_idx = axis_to_index(self.config.frame_selection_line_axis)
-        anchor_index = max(range(len(chunks)), key=lambda index: _anchor_score(chunks[index], index, axis_idx))
-        anchor_chunk = chunks[anchor_index].copy()
-        aligned = [anchor_chunk]
-        model = anchor_chunk.copy()
+        aligned = [chunks[0].copy()]
+        model = chunks[0].copy()
         chunk_weights = [1.0]
-        keep_indices = [anchor_index]
+        keep_indices = [0]
         pairs = 0
         accepted = 0
         fitness_values: list[float] = []
         rmse_values: list[float] = []
         backend_counts: Counter[str] = Counter()
-        unconstrained_fallbacks = 0
 
-        ordered_pairs = [
-            (index, chunks[index])
-            for index in range(len(chunks))
-            if index != anchor_index
-        ]
-        for source_index, source in ordered_pairs:
+        for source_index, source in enumerate(chunks[1:], start=1):
             if len(source) < 8 or len(model) < 8:
                 backend_counts["skipped_insufficient_points"] += 1
                 continue
@@ -119,8 +92,6 @@ class _BaseRegistrationBackend:
             try:
                 transform, fitness, rmse = self._register_pair(source, model)
                 raw_transform = np.asarray(transform, dtype=np.float64)
-                raw_fitness = float(fitness)
-                raw_rmse = float(rmse)
                 transform = self._constrain_transform(raw_transform)
                 fitness, rmse = self._evaluate_transform_if_needed(
                     source,
@@ -131,26 +102,16 @@ class _BaseRegistrationBackend:
                     rmse,
                 )
                 backend_counts[self.name] += 1
-                selected_transform = transform
-                selected_fitness = float(fitness)
-                selected_rmse = float(rmse)
-                if self._should_use_unconstrained_fallback(raw_transform, transform, raw_fitness, selected_fitness):
-                    selected_transform = raw_transform
-                    selected_fitness = raw_fitness
-                    selected_rmse = raw_rmse
-                    unconstrained_fallbacks += 1
-                    backend_counts["unconstrained_fallback"] += 1
-                fitness_values.append(float(selected_fitness))
-                rmse_values.append(float(selected_rmse))
-                if float(selected_fitness) >= float(self.config.registration_min_fitness) and is_valid_transform(
-                    selected_transform,
+                fitness_values.append(float(fitness))
+                rmse_values.append(float(rmse))
+                if float(fitness) >= float(self.config.registration_min_fitness) and is_valid_transform(
+                    transform,
                     max_translation=self.config.registration_max_translation,
-                    max_tz=self.config.registration_max_tz,
                 ):
-                    aligned_source = transform_points(source, selected_transform)
+                    aligned_source = transform_points(source, transform)
                     accepted += 1
                     keep_indices.append(source_index)
-                    chunk_weights.append(max(0.1, float(selected_fitness)))
+                    chunk_weights.append(max(0.1, float(fitness)))
                     aligned.append(aligned_source)
                     model = voxel_downsample_numpy(
                         np.vstack([model, aligned_source]),
@@ -172,15 +133,12 @@ class _BaseRegistrationBackend:
             "registration_backend_counts": dict(backend_counts),
             "registration_pair_fitness": fitness_values,
             "registration_chunk_weights": chunk_weights,
-            "registration_anchor_input_index": int(anchor_index),
-            "registration_anchor_output_index": 0,
             "registration_allowed_dofs": list(self._allowed_dofs),
             "registration_input_chunk_count": int(len(chunks)),
             "registration_output_chunk_count": int(len(aligned)),
             "registration_dropped_count": int(len(chunks) - len(aligned)),
             "registration_keep_indices": keep_indices,
             "registration_skipped": False,
-            "registration_unconstrained_fallback_count": int(unconstrained_fallbacks),
         }
 
     def _empty_info(self, chunk_count: int = 0) -> dict[str, Any]:
@@ -196,130 +154,13 @@ class _BaseRegistrationBackend:
             "registration_backend_counts": {},
             "registration_pair_fitness": [],
             "registration_chunk_weights": [1.0 for _ in keep_indices],
-            "registration_anchor_input_index": 0 if keep_indices else -1,
-            "registration_anchor_output_index": 0 if keep_indices else -1,
             "registration_allowed_dofs": list(self._allowed_dofs),
             "registration_input_chunk_count": int(chunk_count),
             "registration_output_chunk_count": int(chunk_count),
             "registration_dropped_count": 0,
             "registration_keep_indices": keep_indices,
             "registration_skipped": False,
-            "registration_unconstrained_fallback_count": 0,
         }
-
-    def _should_use_unconstrained_fallback(
-        self,
-        raw_transform: np.ndarray,
-        constrained_transform: np.ndarray,
-        raw_fitness: float,
-        constrained_fitness: float,
-    ) -> bool:
-        if not is_valid_transform(
-            raw_transform,
-            max_translation=self.config.registration_max_translation,
-            max_tz=self.config.registration_max_tz,
-        ):
-            return False
-        if float(raw_fitness) < float(self.config.registration_min_fitness):
-            return False
-        if np.allclose(raw_transform[:3, :3], constrained_transform[:3, :3], rtol=1e-6, atol=1e-8):
-            return False
-        return float(raw_fitness) > float(constrained_fitness)
-
-    def _coarse_initial_transform(self, source_xyz: np.ndarray, target_xyz: np.ndarray) -> np.ndarray:
-        source = np.asarray(source_xyz, dtype=np.float64)
-        target = np.asarray(target_xyz, dtype=np.float64)
-        if len(source) == 0 or len(target) == 0:
-            return np.eye(4, dtype=np.float64)
-        axis_idx = axis_to_index(self.config.frame_selection_line_axis)
-        lateral_idx, vertical_idx = orthogonal_axes(axis_idx)
-        plane_axes = [lateral_idx, axis_idx]
-        source_center = np.mean(source, axis=0)
-        target_center = np.mean(target, axis=0)
-
-        def _principal_angle(points: np.ndarray) -> float:
-            planar = np.asarray(points[:, plane_axes], dtype=np.float64)
-            planar = planar - np.mean(planar, axis=0, keepdims=True)
-            if len(planar) < 2:
-                return 0.0
-            cov = np.cov(planar, rowvar=False)
-            if np.asarray(cov).shape != (2, 2):
-                return 0.0
-            eigvals, eigvecs = np.linalg.eigh(cov)
-            principal = np.asarray(eigvecs[:, int(np.argmax(eigvals))], dtype=np.float64)
-            return float(np.arctan2(principal[1], principal[0]))
-
-        angle_delta = _principal_angle(target) - _principal_angle(source)
-        rotation = np.eye(4, dtype=np.float64)
-        cos_angle = float(np.cos(angle_delta))
-        sin_angle = float(np.sin(angle_delta))
-        rotation[np.ix_(plane_axes, plane_axes)] = np.array(
-            [[cos_angle, -sin_angle], [sin_angle, cos_angle]],
-            dtype=np.float64,
-        )
-        rotated_center = (rotation[:3, :3] @ source_center.reshape(3, 1)).reshape(3)
-        translation = target_center - rotated_center
-        rotation[:3, 3] = translation
-        rotation[vertical_idx, 3] = float(target_center[vertical_idx] - rotated_center[vertical_idx])
-        return rotation
-
-    def _robust_refine_with_icp(
-        self,
-        source_xyz: np.ndarray,
-        target_xyz: np.ndarray,
-        estimation_method: Any,
-        *,
-        generalized: bool = False,
-    ) -> tuple[np.ndarray, float, float]:
-        source = np.asarray(source_xyz, dtype=np.float64)
-        target = np.asarray(target_xyz, dtype=np.float64)
-        source_full = estimate_normals(source, radius=max(0.2, self.config.frame_downsample_voxel * 4.0))
-        target_full = estimate_normals(target, radius=max(0.2, self.config.frame_downsample_voxel * 4.0))
-        coarse_distance = max(float(self.config.registration_max_corr_dist) * 1.8, float(self.config.registration_max_corr_dist) + 0.2)
-        init_candidates = [np.eye(4, dtype=np.float64), self._coarse_initial_transform(source, target)]
-        best_result = None
-        best_key = None
-        for init in init_candidates:
-            try:
-                coarse = o3d.pipelines.registration.registration_icp(
-                    source_full,
-                    target_full,
-                    max_correspondence_distance=coarse_distance,
-                    init=np.asarray(init, dtype=np.float64),
-                    estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
-                    criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max(10, int(self.config.registration_max_iter // 2))),
-                )
-                coarse_transform = np.asarray(coarse.transformation, dtype=np.float64)
-            except Exception:
-                coarse_transform = np.asarray(init, dtype=np.float64)
-            if generalized:
-                refined = o3d.pipelines.registration.registration_generalized_icp(
-                    source_full,
-                    target_full,
-                    max_correspondence_distance=float(self.config.registration_max_corr_dist),
-                    init=coarse_transform,
-                    criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=int(self.config.registration_max_iter)),
-                )
-            else:
-                refined = o3d.pipelines.registration.registration_icp(
-                    source_full,
-                    target_full,
-                    max_correspondence_distance=float(self.config.registration_max_corr_dist),
-                    init=coarse_transform,
-                    estimation_method=estimation_method,
-                    criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=int(self.config.registration_max_iter)),
-                )
-            key = (float(refined.fitness), -float(refined.inlier_rmse))
-            if best_key is None or key > best_key:
-                best_key = key
-                best_result = refined
-        if best_result is None:
-            raise RuntimeError("ICP refinement failed for all initialization candidates")
-        return (
-            np.asarray(best_result.transformation, dtype=np.float64),
-            float(best_result.fitness),
-            float(best_result.inlier_rmse),
-        )
 
     def _constrain_transform(self, transform: np.ndarray) -> np.ndarray:
         matrix = np.asarray(transform, dtype=np.float64)
@@ -479,23 +320,33 @@ class ICPPointToPlaneRegistrationBackend(_BaseRegistrationBackend):
     name = "icp_point_to_plane"
 
     def _register_pair(self, source_xyz: np.ndarray, target_xyz: np.ndarray) -> tuple[np.ndarray, float, float]:
-        return self._robust_refine_with_icp(
-            source_xyz,
-            target_xyz,
-            o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+        source = estimate_normals(source_xyz, radius=max(0.2, self.config.frame_downsample_voxel * 4.0))
+        target = estimate_normals(target_xyz, radius=max(0.2, self.config.frame_downsample_voxel * 4.0))
+        result = o3d.pipelines.registration.registration_icp(
+            source,
+            target,
+            max_correspondence_distance=float(self.config.registration_max_corr_dist),
+            init=np.eye(4),
+            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=int(self.config.registration_max_iter)),
         )
+        return np.asarray(result.transformation), float(result.fitness), float(result.inlier_rmse)
 
 
 class GeneralizedICPRegistrationBackend(_BaseRegistrationBackend):
     name = "generalized_icp"
 
     def _register_pair(self, source_xyz: np.ndarray, target_xyz: np.ndarray) -> tuple[np.ndarray, float, float]:
-        return self._robust_refine_with_icp(
-            source_xyz,
-            target_xyz,
-            None,
-            generalized=True,
+        source = estimate_normals(source_xyz, radius=max(0.2, self.config.frame_downsample_voxel * 4.0))
+        target = estimate_normals(target_xyz, radius=max(0.2, self.config.frame_downsample_voxel * 4.0))
+        result = o3d.pipelines.registration.registration_generalized_icp(
+            source,
+            target,
+            max_correspondence_distance=float(self.config.registration_max_corr_dist),
+            init=np.eye(4),
+            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=int(self.config.registration_max_iter)),
         )
+        return np.asarray(result.transformation), float(result.fitness), float(result.inlier_rmse)
 
 
 class FeatureGlobalThenLocalRegistrationBackend(_BaseRegistrationBackend):

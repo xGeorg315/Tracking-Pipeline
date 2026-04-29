@@ -2,13 +2,22 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import time
 
 import numpy as np
 import pytest
 
-from tracking_pipeline.application.performance import derive_hz
+from tracking_pipeline.application.class_normalization import ClassNormalizer
+from tracking_pipeline.application.performance import PerformanceProfiler, derive_hz
 from tracking_pipeline.application.replay_run import replay_run
-from tracking_pipeline.application.run_pipeline import _live_snapshot_tracker_states, run_pipeline
+from tracking_pipeline.application.run_pipeline import (
+    _live_gt_match_label_history,
+    _live_snapshot_tracker_states,
+    _maybe_write_incremental_live_artifact_snapshot,
+    _maybe_write_live_object_list_snapshot,
+    _snapshot_tracker_tracks,
+    run_pipeline,
+)
 from tracking_pipeline.config.models import (
     AggregationConfig,
     ClusteringConfig,
@@ -37,6 +46,7 @@ from tracking_pipeline.domain.models import (
     Track,
     TrackOutcomeDebug,
 )
+from tracking_pipeline.infrastructure.io.dataset_artifact_writer import DatasetArtifactWriter
 from tracking_pipeline.infrastructure.postprocessing.articulated_vehicle_merge import ArticulatedVehicleMergePostprocessor
 
 
@@ -357,6 +367,47 @@ def test_live_snapshot_tracker_states_keeps_only_latest_frame() -> None:
     assert snapshot_states[0].frame_index == 4
 
 
+def test_live_gt_match_label_history_scopes_labels_to_track_time_window() -> None:
+    track = Track(
+        track_id=1,
+        centers=[np.array([0.0, 0.0, 0.0], dtype=np.float32)],
+        frame_ids=[10],
+        frame_timestamps_ns=[100_000_000_000],
+    )
+    old_label = ObjectLabelData(
+        object_id=1,
+        timestamp_ns=80_000_000_000,
+        points=np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+        obj_class="car",
+        sensor_name="sensor_a",
+        source_path="live",
+    )
+    nearby_label = ObjectLabelData(
+        object_id=1,
+        timestamp_ns=104_000_000_000,
+        points=np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
+        obj_class="car",
+        sensor_name="sensor_a",
+        source_path="live",
+    )
+    future_label = ObjectLabelData(
+        object_id=2,
+        timestamp_ns=120_000_000_000,
+        points=np.array([[2.0, 0.0, 0.0]], dtype=np.float32),
+        obj_class="van",
+        sensor_name="sensor_a",
+        source_path="live",
+    )
+
+    scoped = _live_gt_match_label_history(
+        {1: track},
+        {1: [old_label, nearby_label], 2: [future_label]},
+        margin_sec=5.0,
+    )
+
+    assert scoped == {1: [nearby_label]}
+
+
 class _InterruptingLiveReader:
     def __init__(self, frames: list[FrameData], pending_object_labels: list[ObjectLabelData] | None = None):
         self._frames = list(frames)
@@ -411,6 +462,21 @@ class _InterruptingLiveReader:
             )
             for label in self._pending_object_labels
             if max_timestamp_ns is None or int(label.timestamp_ns) <= int(max_timestamp_ns)
+        ]
+
+    def snapshot_pending_object_labels(self, frame_index: int) -> list[ObjectLabelData]:
+        return [
+            ObjectLabelData(
+                object_id=int(label.object_id),
+                timestamp_ns=int(label.timestamp_ns),
+                points=np.asarray(label.points, dtype=np.float32).copy(),
+                obj_class=str(label.obj_class),
+                obj_class_score=float(label.obj_class_score),
+                sensor_name=str(label.sensor_name),
+                frame_index=int(frame_index),
+                source_path=str(label.source_path),
+            )
+            for label in self._pending_object_labels
         ]
 
     def status_snapshot(self) -> dict[str, object]:
@@ -650,6 +716,10 @@ def test_run_pipeline_merges_articulated_vehicle_tracks(monkeypatch, tmp_path: P
     assert summary.finished_track_count == 2
     assert summary.saved_aggregates == 1
     assert summary.postprocessing_methods == ["articulated_vehicle_merge", "track_quality_scoring"]
+    assert summary.articulated_vehicle_pair_count == 1
+    assert summary.articulated_vehicle_track_count == 2
+    assert summary.articulated_vehicle_merged_component_count == 1
+    assert summary.articulated_vehicle_saved_count == 1
     assert fake_tracker.seen_frame_ids == [0, 1, 2, 3]
     assert set(fake_writer.written_tracks.keys()) == {11, 12}
     lead_track = fake_writer.written_tracks[11]
@@ -665,6 +735,68 @@ def test_run_pipeline_merges_articulated_vehicle_tracks(monkeypatch, tmp_path: P
     assert lead_track.quality_metrics["object_kind"] == "truck_with_trailer"
     assert rear_track.quality_metrics["object_kind"] == "truck_with_trailer"
     assert len(fake_writer.written_aggregate_results) == 2
+    lead_result = next(result for result in fake_writer.written_aggregate_results if int(result.track_id) == 11)
+    rear_result = next(result for result in fake_writer.written_aggregate_results if int(result.track_id) == 12)
+    assert lead_result.status == "saved"
+    assert rear_result.status == "merged_into_long_vehicle_group"
+
+
+def test_incremental_live_pipeline_merges_articulated_vehicle_tracks(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(
+            paths=["qb2_live://class_qb2@10.16.3.160"],
+            format="qb2_live",
+            qb2_live=QB2LiveInputConfig(
+                sensor_name="class_qb2",
+                ip="10.16.3.160",
+                api_key="secret",
+                mqtt=QB2LiveMQTTConfig(host="10.16.3.111", topic="blickfeld/states_160"),
+            ),
+        ),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(frame_selection_line_axis="y"),
+        postprocessing=PostprocessingConfig(enable_articulated_vehicle_merge=True, enable_track_quality_scoring=True),
+        output=OutputConfig(root_dir=str(tmp_path), final_full_recompute=False, live_artifact_flush_interval_sec=0.0),
+        visualization=VisualizationConfig(),
+    )
+
+    class _IncrementalArticulatedTracker(_FakeArticulatedTracker):
+        def __init__(self):
+            super().__init__()
+            self.finished_tracks: dict[int, Track] = {}
+
+        def step(self, detections, frame_idx, frame_timestamp_ns):
+            state = super().step(detections, frame_idx, frame_timestamp_ns)
+            if int(frame_idx) >= 0:
+                self.finished_tracks[int(self.front.track_id)] = self.front
+            if int(frame_idx) >= 1:
+                self.finished_tracks[int(self.rear.track_id)] = self.rear
+            return state
+
+    reader = _InterruptingLiveReader(
+        frames=[
+            FrameData(frame_index=index, timestamp_ns=index + 1, points=np.zeros((1, 3), dtype=np.float32))
+            for index in range(4)
+        ]
+    )
+    fake_writer = _FakeWriter(tmp_path)
+    fake_tracker = _IncrementalArticulatedTracker()
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_reader", lambda cfg: reader)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: fake_tracker)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeStateAwareAccumulator())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda cfg, root: fake_writer)
+
+    summary = run_pipeline(config, tmp_path)
+
+    assert summary.saved_aggregates == 1
+    assert summary.articulated_vehicle_pair_count == 1
+    assert summary.articulated_vehicle_merged_component_count == 1
+    assert set(fake_writer.written_tracks.keys()) == {11, 12}
+    assert fake_writer.written_tracks[11].state["articulated_role"] == "lead"
+    assert fake_writer.written_tracks[12].state["articulated_role"] == "rear"
     lead_result = next(result for result in fake_writer.written_aggregate_results if int(result.track_id) == 11)
     rear_result = next(result for result in fake_writer.written_aggregate_results if int(result.track_id) == 12)
     assert lead_result.status == "saved"
@@ -794,20 +926,21 @@ def test_run_pipeline_finalizes_qb2_live_run_after_keyboard_interrupt(monkeypatc
 
     assert summary.frame_count == 1
     assert summary.input_path == "qb2_live://class_qb2@10.16.3.160"
-    assert summary.object_list_exported_count == 1
+    assert summary.object_list_exported_count == 2
     assert fake_tracker.seen_frame_ids == [0]
     assert reader.close_calls >= 1
     assert reader.drain_calls == [0]
     assert reader.drain_max_timestamp_calls == [200]
-    assert set(fake_writer.object_labels) == {77}
+    assert set(fake_writer.object_labels) == {77, 78}
     assert fake_writer.object_labels[77].frame_index == 0
     assert fake_writer.object_labels[77].source_path == config.input.paths[0]
+    assert fake_writer.object_labels[78].frame_index == 0
     live_status_path = tmp_path / "run" / "live_status.json"
     assert live_status_path.exists()
     live_status = json.loads(live_status_path.read_text(encoding="utf-8"))
     assert live_status["pipeline_phase"] == "completed"
     assert live_status["processed_frames"] == 1
-    assert live_status["object_list_exported_count"] == 1
+    assert live_status["object_list_exported_count"] == 2
     assert "processing_total_hz" in live_status
     assert float(live_status["processing_total_hz"]) >= 0.0
     assert live_status["output_dir"] == str(tmp_path / "run")
@@ -919,7 +1052,7 @@ def test_run_pipeline_writes_live_snapshot_artifacts_for_qb2_live(monkeypatch, t
 
     assert fake_writer.aggregate_write_intensity_flags
     assert len(fake_writer.aggregate_write_intensity_flags) >= 2
-    assert fake_writer.summary_write_count >= 3
+    assert fake_writer.summary_write_count >= 2
     assert fake_writer.track_write_count >= 2
     assert fake_writer.tracker_debug_write_count >= 2
     assert fake_writer.track_outcomes_write_count >= 2
@@ -1002,6 +1135,653 @@ def test_run_pipeline_writes_live_dataset_artifacts_for_qb2_live(monkeypatch, tm
     day_stats_dirs = sorted((dataset_root / "_stats" / "1970-01-01").iterdir())
     assert len(day_stats_dirs) == 1
     assert (day_stats_dirs[0] / "live_status.json").exists()
+
+
+def test_run_pipeline_writes_live_dataset_artifacts_for_qb2_live_without_final_recompute(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(
+            paths=["qb2_live://class_qb2@10.16.3.160"],
+            format="qb2_live",
+            qb2_live=QB2LiveInputConfig(
+                sensor_name="class_qb2",
+                ip="10.16.3.160",
+                api_key="secret",
+                mqtt=QB2LiveMQTTConfig(host="10.16.3.111", topic="blickfeld/states_160"),
+            ),
+        ),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(
+            mode="dataset",
+            dataset_root_dir=str(tmp_path / "dataset"),
+            root_dir=str(tmp_path / "runs_unused"),
+            final_full_recompute=False,
+        ),
+        visualization=VisualizationConfig(),
+    )
+
+    live_object = ObjectLabelData(
+        object_id=42,
+        timestamp_ns=200,
+        points=np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
+        obj_class="car",
+        obj_class_score=0.95,
+        sensor_name="class_qb2",
+        frame_index=0,
+        source_path=config.input.paths[0],
+    )
+    reader = _InterruptingLiveReader(
+        frames=[
+            FrameData(
+                frame_index=0,
+                timestamp_ns=200,
+                points=np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+                source_path=config.input.paths[0],
+                object_labels=[live_object],
+            )
+        ]
+    )
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_reader", lambda cfg: reader)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: _FakeTracker())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
+
+    summary = run_pipeline(config, tmp_path)
+
+    dataset_root = tmp_path / "dataset"
+    assert summary.output_mode == "dataset"
+    assert summary.output_dir == str(dataset_root)
+    assert summary.saved_aggregates == 1
+    assert summary.gt_match_matched_count == 1
+    assert not (tmp_path / "runs_unused").exists()
+    assert (dataset_root / "car" / "1970-01-01" / "gt-pred-different" / "gt").exists()
+    assert (dataset_root / "car" / "1970-01-01" / "gt-pred-different" / "pred").exists()
+    day_stats_dirs = sorted((dataset_root / "_stats" / "1970-01-01").iterdir())
+    assert len(day_stats_dirs) == 1
+    assert (day_stats_dirs[0] / "gt_matching" / "summary.json").exists()
+
+
+def test_run_pipeline_statistics_disabled_keeps_live_aggregates_and_gt_without_stats(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(
+            paths=["qb2_live://class_qb2@10.16.3.160"],
+            format="qb2_live",
+            qb2_live=QB2LiveInputConfig(
+                sensor_name="class_qb2",
+                ip="10.16.3.160",
+                api_key="secret",
+                mqtt=QB2LiveMQTTConfig(host="10.16.3.111", topic="blickfeld/states_160"),
+            ),
+        ),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(
+            root_dir=str(tmp_path),
+            final_full_recompute=False,
+            statistics_enabled=False,
+            live_artifact_flush_interval_sec=0.0,
+        ),
+        visualization=VisualizationConfig(),
+    )
+    live_object = ObjectLabelData(
+        object_id=42,
+        timestamp_ns=200,
+        points=np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
+        obj_class="car",
+        obj_class_score=0.95,
+        sensor_name="class_qb2",
+        frame_index=0,
+        source_path=config.input.paths[0],
+    )
+    reader = _InterruptingLiveReader(
+        frames=[
+            FrameData(
+                frame_index=0,
+                timestamp_ns=200,
+                points=np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+                source_path=config.input.paths[0],
+                object_labels=[live_object],
+            )
+        ]
+    )
+    fake_writer = _FakeWriter(tmp_path)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_reader", lambda cfg: reader)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: _FakeTracker())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda cfg, root: fake_writer)
+
+    summary = run_pipeline(config, tmp_path)
+
+    assert summary.saved_aggregates == 1
+    assert summary.gt_match_saved_track_count == 1
+    assert summary.performance is None
+    assert fake_writer.aggregate_write_intensity_flags
+    assert fake_writer.gt_matching_write_count >= 1
+    assert fake_writer.summary_write_count == 0
+    assert fake_writer.track_write_count == 0
+    assert fake_writer.tracker_debug_write_count == 0
+    assert fake_writer.track_outcomes_write_count == 0
+    assert fake_writer.class_stats_write_count == 0
+    assert (tmp_path / "run" / "aggregate.txt").exists()
+    assert (tmp_path / "run" / "gt_matching.txt").exists()
+    assert not (tmp_path / "run" / "summary.txt").exists()
+    assert not (tmp_path / "run" / "tracks.txt").exists()
+    assert not (tmp_path / "run" / "tracker_debug.txt").exists()
+    assert not (tmp_path / "run" / "track_outcomes.txt").exists()
+    assert not (tmp_path / "run" / "class_stats.txt").exists()
+    assert not (tmp_path / "run" / "live_status.json").exists()
+
+
+def test_run_pipeline_writes_live_gt_matching_for_pending_qb2_labels_without_final_recompute(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(
+            paths=["qb2_live://class_qb2@10.16.3.160"],
+            format="qb2_live",
+            qb2_live=QB2LiveInputConfig(
+                sensor_name="class_qb2",
+                ip="10.16.3.160",
+                api_key="secret",
+                mqtt=QB2LiveMQTTConfig(host="10.16.3.111", topic="blickfeld/states_160"),
+            ),
+        ),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(root_dir=str(tmp_path), final_full_recompute=False),
+        visualization=VisualizationConfig(),
+    )
+
+    pending_object = ObjectLabelData(
+        object_id=77,
+        timestamp_ns=250,
+        points=np.array([[2.0, 0.0, 0.0]], dtype=np.float32),
+        obj_class="car",
+        obj_class_score=0.9,
+        sensor_name="class_qb2",
+        frame_index=-1,
+        source_path=config.input.paths[0],
+    )
+    reader = _InterruptingLiveReader(
+        frames=[
+            FrameData(
+                frame_index=0,
+                timestamp_ns=200,
+                points=np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+                source_path=config.input.paths[0],
+            )
+        ],
+        pending_object_labels=[pending_object],
+    )
+
+    class _FakeFinishingTracker(_FakeTracker):
+        def __init__(self):
+            super().__init__()
+            self.finished_tracks: dict[int, Track] = {}
+
+        def step(self, detections, frame_idx, frame_timestamp_ns):
+            state = super().step(detections, frame_idx, frame_timestamp_ns)
+            self.finished_tracks[int(self.track.track_id)] = self.track
+            return state
+
+    fake_writer = _FakeWriter(tmp_path)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_reader", lambda cfg: reader)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: _FakeFinishingTracker())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda cfg, root: fake_writer)
+
+    summary = run_pipeline(config, tmp_path)
+
+    assert summary.saved_aggregates == 1
+    assert summary.gt_match_saved_track_count == 1
+    assert fake_writer.gt_matching_write_count >= 2
+    assert fake_writer.gt_summary["gt_match_saved_track_count"] == 1
+    assert fake_writer.gt_summary["gt_match_unmatched_saved_count"] == 0
+
+
+def test_incremental_live_dataset_flush_keeps_existing_pred_without_new_saved_tracks(tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(
+            paths=["qb2_live://class_qb2@10.16.3.160"],
+            format="qb2_live",
+            qb2_live=QB2LiveInputConfig(
+                sensor_name="class_qb2",
+                ip="10.16.3.160",
+                api_key="secret",
+                mqtt=QB2LiveMQTTConfig(host="10.16.3.111", topic="blickfeld/states_160"),
+            ),
+        ),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(
+            mode="dataset",
+            dataset_root_dir=str(tmp_path / "dataset"),
+            root_dir=str(tmp_path / "runs_unused"),
+            final_full_recompute=False,
+            live_artifact_flush_interval_sec=0.0,
+        ),
+        visualization=VisualizationConfig(),
+    )
+
+    class_normalizer = ClassNormalizer.from_config(config.class_normalization)
+    profiler = PerformanceProfiler()
+    writer = DatasetArtifactWriter(tmp_path)
+    run_dir = writer.prepare_run_dir(config)
+    writer.write_config_snapshot(run_dir, config)
+
+    fake_tracker = _FakeTracker()
+    track = fake_tracker.track
+    aggregate_result = AggregateResult(
+        track_id=1,
+        points=np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+        selected_frame_ids=[0],
+        status="saved",
+        metrics={
+            "predicted_class_id": 4,
+            "predicted_class_name": "car",
+            "predicted_class_score": 0.95,
+            "registration_pairs": 1,
+            "registration_accepted": 1,
+            "registration_rejected": 0,
+        },
+    )
+    object_label = ObjectLabelData(
+        object_id=42,
+        timestamp_ns=200,
+        points=np.array([[0.95, 0.0, 0.0]], dtype=np.float32),
+        obj_class="car",
+        obj_class_score=0.9,
+        sensor_name="class_qb2",
+        frame_index=0,
+        source_path=config.input.paths[0],
+    )
+
+    class _SnapshotTracker:
+        finished_tracks: dict[int, Track] = {}
+
+        def __init__(self, track: Track):
+            self._track = track
+
+        def snapshot_tracks(self) -> dict[int, Track]:
+            return {int(self._track.track_id): self._track}
+
+    tracker = _SnapshotTracker(track)
+    live_artifact_state = {
+        "last_flush_monotonic": None,
+        "last_tracker_debug_flush_monotonic": None,
+        "pending_flush": True,
+        "pending_saved_results": {1: aggregate_result},
+    }
+    live_snapshot_tracks = {1: track}
+    live_snapshot_aggregate_results = {1: aggregate_result}
+    live_snapshot_track_outcomes = {
+        1: TrackOutcomeDebug(
+            track_id=1,
+            status="saved",
+            decision_stage="saved",
+            decision_reason_code="saved",
+            decision_summary="saved points=1",
+            predicted_class_id=4,
+            predicted_class_name="car",
+            predicted_class_score=0.95,
+            gt_obj_class="car",
+            gt_obj_class_score=0.9,
+        )
+    }
+    tracker_states = [
+        FrameTrackingState(
+            frame_index=0,
+            lane_points=np.zeros((0, 3), dtype=np.float32),
+            detections=[],
+            active_tracks=[],
+        )
+    ]
+    frame_to_playback = {1: 0}
+    last_active_by_track: dict[int, dict[str, object]] = {}
+    object_label_history_by_id = {42: [object_label]}
+    latest_object_labels = {42: object_label}
+    object_list_seen_ids = {42}
+    announced_finished_track_ids: set[int] = set()
+
+    _maybe_write_incremental_live_artifact_snapshot(
+        config=config,
+        profiler=profiler,
+        writer=writer,
+        run_dir=run_dir,
+        lane_box=None,
+        tracker=tracker,
+        postprocessors=[],
+        accumulator=None,
+        classifier=None,
+        class_normalizer=class_normalizer,
+        latest_object_labels=latest_object_labels,
+        object_label_history_by_id=object_label_history_by_id,
+        object_list_seen_ids=object_list_seen_ids,
+        object_list_skipped_empty=0,
+        tracker_states=tracker_states,
+        frame_to_playback=frame_to_playback,
+        last_active_by_track=last_active_by_track,
+        frame_count=1,
+        live_status_reporter=None,
+        live_web_runtime=None,
+        live_artifact_state=live_artifact_state,
+        live_snapshot_tracks=live_snapshot_tracks,
+        live_snapshot_aggregate_results=live_snapshot_aggregate_results,
+        live_snapshot_track_outcomes=live_snapshot_track_outcomes,
+        live_snapshot_announced_finished_track_ids=announced_finished_track_ids,
+        save_aggregate_intensity=False,
+    )
+
+    pred_dir = run_dir / "car" / "1970-01-01" / "gt-pred-same" / "pred"
+    first_pred_json_paths = sorted(pred_dir.glob("*.json"))
+    first_pred_pcd_paths = sorted(pred_dir.glob("*.pcd"))
+    assert len(first_pred_json_paths) == 1
+    assert len(first_pred_pcd_paths) == 1
+
+    _maybe_write_incremental_live_artifact_snapshot(
+        config=config,
+        profiler=profiler,
+        writer=writer,
+        run_dir=run_dir,
+        lane_box=None,
+        tracker=tracker,
+        postprocessors=[],
+        accumulator=None,
+        classifier=None,
+        class_normalizer=class_normalizer,
+        latest_object_labels=latest_object_labels,
+        object_label_history_by_id=object_label_history_by_id,
+        object_list_seen_ids=object_list_seen_ids,
+        object_list_skipped_empty=0,
+        tracker_states=tracker_states,
+        frame_to_playback=frame_to_playback,
+        last_active_by_track=last_active_by_track,
+        frame_count=2,
+        live_status_reporter=None,
+        live_web_runtime=None,
+        live_artifact_state=live_artifact_state,
+        live_snapshot_tracks=live_snapshot_tracks,
+        live_snapshot_aggregate_results=live_snapshot_aggregate_results,
+        live_snapshot_track_outcomes=live_snapshot_track_outcomes,
+        live_snapshot_announced_finished_track_ids=announced_finished_track_ids,
+        save_aggregate_intensity=False,
+    )
+
+    second_pred_json_paths = sorted(pred_dir.glob("*.json"))
+    second_pred_pcd_paths = sorted(pred_dir.glob("*.pcd"))
+    assert second_pred_json_paths == first_pred_json_paths
+    assert second_pred_pcd_paths == first_pred_pcd_paths
+
+
+def test_incremental_live_artifact_snapshot_skips_track_snapshot_before_flush_interval(tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(
+            paths=["qb2_live://class_qb2@10.16.3.160"],
+            format="qb2_live",
+            qb2_live=QB2LiveInputConfig(
+                sensor_name="class_qb2",
+                ip="10.16.3.160",
+                api_key="secret",
+                mqtt=QB2LiveMQTTConfig(host="10.16.3.111", topic="blickfeld/states_160"),
+            ),
+        ),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(
+            mode="dataset",
+            dataset_root_dir=str(tmp_path / "dataset"),
+            final_full_recompute=False,
+            live_artifact_flush_interval_sec=60.0,
+        ),
+        visualization=VisualizationConfig(),
+    )
+
+    class _SnapshotCountingTracker:
+        finished_tracks: dict[int, Track] = {}
+
+        def __init__(self):
+            self.snapshot_calls = 0
+
+        def snapshot_tracks(self) -> dict[int, Track]:
+            self.snapshot_calls += 1
+            return {}
+
+    tracker = _SnapshotCountingTracker()
+
+    _maybe_write_incremental_live_artifact_snapshot(
+        config=config,
+        profiler=PerformanceProfiler(),
+        writer=_FakeWriter(tmp_path),
+        run_dir=tmp_path,
+        lane_box=None,
+        tracker=tracker,
+        postprocessors=[],
+        accumulator=None,
+        classifier=None,
+        class_normalizer=ClassNormalizer.from_config(config.class_normalization),
+        latest_object_labels={},
+        object_label_history_by_id={},
+        object_list_seen_ids=set(),
+        object_list_skipped_empty=0,
+        tracker_states=[],
+        frame_to_playback={},
+        last_active_by_track={},
+        frame_count=1,
+        live_status_reporter=None,
+        live_web_runtime=None,
+        live_artifact_state={
+            "last_flush_monotonic": time.monotonic(),
+            "last_tracker_debug_flush_monotonic": None,
+            "pending_flush": False,
+            "pending_saved_results": {},
+            "labels_dirty": False,
+            "cached_matches": [],
+            "cached_unmatched_saved_tracks": [],
+            "cached_unmatched_gt_objects": [],
+            "cached_gt_match_summary": {},
+            "cached_class_stats": {},
+        },
+        live_snapshot_tracks={},
+        live_snapshot_aggregate_results={},
+        live_snapshot_track_outcomes={},
+        live_snapshot_announced_finished_track_ids=set(),
+        save_aggregate_intensity=False,
+    )
+
+    assert tracker.snapshot_calls == 0
+
+
+def test_incremental_live_artifact_snapshot_skips_active_only_snapshot_after_flush_interval(tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(
+            paths=["qb2_live://class_qb2@10.16.3.160"],
+            format="qb2_live",
+            qb2_live=QB2LiveInputConfig(
+                sensor_name="class_qb2",
+                ip="10.16.3.160",
+                api_key="secret",
+                mqtt=QB2LiveMQTTConfig(host="10.16.3.111", topic="blickfeld/states_160"),
+            ),
+        ),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(
+            mode="dataset",
+            dataset_root_dir=str(tmp_path / "dataset"),
+            final_full_recompute=False,
+            live_artifact_flush_interval_sec=0.0,
+        ),
+        visualization=VisualizationConfig(),
+    )
+
+    class _SnapshotCountingTracker:
+        finished_tracks: dict[int, Track] = {}
+
+        def __init__(self):
+            self.snapshot_calls = 0
+
+        def snapshot_tracks(self) -> dict[int, Track]:
+            self.snapshot_calls += 1
+            return {}
+
+    tracker = _SnapshotCountingTracker()
+
+    _maybe_write_incremental_live_artifact_snapshot(
+        config=config,
+        profiler=PerformanceProfiler(),
+        writer=_FakeWriter(tmp_path),
+        run_dir=tmp_path,
+        lane_box=None,
+        tracker=tracker,
+        postprocessors=[],
+        accumulator=None,
+        classifier=None,
+        class_normalizer=ClassNormalizer.from_config(config.class_normalization),
+        latest_object_labels={},
+        object_label_history_by_id={},
+        object_list_seen_ids=set(),
+        object_list_skipped_empty=0,
+        tracker_states=[],
+        frame_to_playback={},
+        last_active_by_track={},
+        frame_count=5,
+        live_status_reporter=None,
+        live_web_runtime=None,
+        live_artifact_state={
+            "last_flush_monotonic": time.monotonic() - 120.0,
+            "last_tracker_debug_flush_monotonic": None,
+            "pending_flush": False,
+            "pending_saved_results": {},
+            "labels_dirty": False,
+            "cached_matches": [],
+            "cached_unmatched_saved_tracks": [],
+            "cached_unmatched_gt_objects": [],
+            "cached_gt_match_summary": {},
+            "cached_class_stats": {},
+        },
+        live_snapshot_tracks={},
+        live_snapshot_aggregate_results={},
+        live_snapshot_track_outcomes={},
+        live_snapshot_announced_finished_track_ids=set(),
+        save_aggregate_intensity=False,
+    )
+
+    assert tracker.snapshot_calls == 0
+
+
+def test_snapshot_tracker_tracks_keeps_only_lightweight_track_metadata() -> None:
+    track = Track(
+        track_id=7,
+        centers=[
+            np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            np.array([1.0, 2.0, 3.0], dtype=np.float32),
+        ],
+        frame_ids=[10, 11],
+        frame_timestamps_ns=[100, 200],
+        local_points=[
+            np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+            np.array([[1.0, 1.0, 1.0]], dtype=np.float32),
+        ],
+        world_points=[
+            np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+            np.array([[2.0, 2.0, 2.0]], dtype=np.float32),
+        ],
+        local_intensity=[np.array([0.1], dtype=np.float32), np.array([0.2], dtype=np.float32)],
+        world_intensity=[np.array([0.3], dtype=np.float32), np.array([0.4], dtype=np.float32)],
+        point_timestamps_ns=[np.array([100], dtype=np.int64), np.array([200], dtype=np.int64)],
+        bbox_extents=[
+            np.array([1.0, 1.0, 1.0], dtype=np.float32),
+            np.array([2.0, 2.0, 2.0], dtype=np.float32),
+        ],
+        hit_count=2,
+        age=3,
+        missed=1,
+        ended_by_missed=True,
+        source_track_ids=[7],
+        quality_score=0.8,
+        quality_metrics={"continuity": 1.0},
+        state={"tracker_debug_summary": {"matched_count": 2}},
+    )
+
+    class _SnapshotTracker:
+        def snapshot_tracks(self) -> dict[int, Track]:
+            return {int(track.track_id): track}
+
+    snapshot = _snapshot_tracker_tracks(_SnapshotTracker())
+
+    assert set(snapshot) == {7}
+    lightweight_track = snapshot[7]
+    assert lightweight_track.frame_ids == [10, 11]
+    assert lightweight_track.frame_timestamps_ns == [100, 200]
+    assert len(lightweight_track.centers) == 1
+    assert np.allclose(lightweight_track.centers[0], np.array([1.0, 2.0, 3.0], dtype=np.float32))
+    assert len(lightweight_track.bbox_extents) == 1
+    assert np.allclose(lightweight_track.bbox_extents[0], np.array([2.0, 2.0, 2.0], dtype=np.float32))
+    assert lightweight_track.local_points == []
+    assert lightweight_track.world_points == []
+    assert lightweight_track.local_intensity == []
+    assert lightweight_track.world_intensity == []
+    assert lightweight_track.point_timestamps_ns == []
+    assert lightweight_track.hit_count == 2
+    assert lightweight_track.age == 3
+    assert lightweight_track.missed == 1
+    assert lightweight_track.ended_by_missed is True
+    assert lightweight_track.quality_metrics == {"continuity": 1.0}
+    assert lightweight_track.state["tracker_debug_summary"] == {"matched_count": 2}
+
+
+def test_live_object_list_snapshot_heartbeat_does_not_write_without_dirty_state(tmp_path: Path) -> None:
+    class _CountingObjectListWriter:
+        def __init__(self):
+            self.calls = 0
+
+        def write_live_object_list_snapshot(self, run_dir, object_labels):
+            _ = run_dir, object_labels
+            self.calls += 1
+
+    writer = _CountingObjectListWriter()
+    state = {
+        "dirty": False,
+        "last_flush_monotonic": time.monotonic(),
+        "flush_interval_sec": 0.0,
+    }
+    object_label = ObjectLabelData(
+        object_id=1,
+        timestamp_ns=100,
+        points=np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+        obj_class="car",
+        obj_class_score=0.9,
+        sensor_name="sensor_a",
+        frame_index=0,
+        source_path="dummy.pb",
+    )
+
+    wrote = _maybe_write_live_object_list_snapshot(
+        writer,
+        tmp_path,
+        {1: object_label},
+        reporter=None,
+        state=state,
+        mark_dirty=False,
+    )
+
+    assert wrote is False
+    assert writer.calls == 0
 
 
 def test_run_pipeline_rejects_qb2_live_interrupt_before_first_frame(monkeypatch, tmp_path: Path) -> None:

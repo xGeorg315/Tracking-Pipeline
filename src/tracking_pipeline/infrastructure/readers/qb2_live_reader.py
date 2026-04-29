@@ -19,7 +19,6 @@ from tracking_pipeline.domain.models import FrameData, LidarScanData, ObjectLabe
 
 LOGGER = logging.getLogger(__name__)
 _END_OF_STREAM = object()
-_MAX_PENDING_MQTT_LABELS = 5
 
 
 @dataclass(slots=True)
@@ -162,6 +161,9 @@ class QB2LiveReader:
             "dropped_overflow_label_count": 0,
             "raw_frames_received": 0,
             "raw_points_received": 0,
+            "raw_stream_reconnect_count": 0,
+            "last_raw_stream_error": None,
+            "last_raw_stream_reconnect_unix_sec": None,
             "yielded_frame_count": 0,
             "last_raw_frame_index": -1,
             "last_raw_frame_timestamp_ns": None,
@@ -228,6 +230,11 @@ class QB2LiveReader:
         self._sync_pending_status()
         return self._materialize_object_labels(snapshots, int(max(frame_index, 0)))
 
+    def snapshot_pending_object_labels(self, frame_index: int) -> list[ObjectLabelData]:
+        with self._pending_lock:
+            snapshots = list(self._pending_snapshots)
+        return self._materialize_latest_object_labels(snapshots, int(max(frame_index, 0)))
+
     def iter_frames(self, input_paths: list[str]):
         self.close()
         self._reset_runtime_state()
@@ -251,33 +258,52 @@ class QB2LiveReader:
                 self._update_status(reader_state="starting_mqtt")
                 self._start_mqtt_client(modules["mqtt"], calibration, lane_transform_map)
                 point_cloud_service = modules["QB2PointCloudService"](channel)
-                stream_iterator = point_cloud_service.async_stream().__aiter__()
-                self._update_status(reader_state="waiting_for_raw", waiting_for_first_raw_frame=True)
 
                 frame_index = 0
                 while True:
                     self._raise_background_error_if_any()
                     if self._stop_event.is_set():
                         break
+                    if stream_iterator is None:
+                        stream_iterator = point_cloud_service.async_stream().__aiter__()
+                        self._update_status(
+                            reader_state="waiting_for_raw" if frame_index == 0 else "reconnecting_raw",
+                            waiting_for_first_raw_frame=frame_index == 0,
+                        )
                     try:
-                        timeout = None if frame_index == 0 else float(self.config.idle_timeout_sec)
+                        timeout = float(self.config.idle_timeout_sec)
                         payload = loop.run_until_complete(self._next_stream_payload(stream_iterator, timeout))
                     except StopAsyncIteration:
                         break
                     except asyncio.TimeoutError as exc:
                         self._raise_background_error_if_any()
+                        message = (
+                            f"No QB2 frames received within idle_timeout_sec="
+                            f"{float(self.config.idle_timeout_sec):.3f}"
+                        )
+                        if frame_index > 0:
+                            self._record_raw_stream_reconnect(message, frame_index)
+                            LOGGER.warning("QB2 raw stream timed out (%s); reconnecting raw stream", message)
+                            self._close_async_stream(loop, stream_iterator)
+                            stream_iterator = None
+                            if self._stop_event.wait(self._raw_stream_reconnect_backoff_sec()):
+                                break
+                            continue
                         self._update_status(
                             reader_state="idle_timeout",
-                            background_error=(
-                                f"No QB2 frames received within idle_timeout_sec="
-                                f"{float(self.config.idle_timeout_sec):.3f}"
-                            ),
+                            background_error=message,
                         )
-                        raise RuntimeError(
-                            f"No QB2 frames received within idle_timeout_sec={float(self.config.idle_timeout_sec):.3f}"
-                        ) from exc
+                        raise RuntimeError(message) from exc
                     except Exception as exc:
                         self._raise_background_error_if_any()
+                        if self._is_recoverable_raw_stream_error(exc):
+                            self._record_raw_stream_reconnect(str(exc), frame_index)
+                            LOGGER.warning("QB2 raw stream closed (%s); reconnecting raw stream", exc)
+                            self._close_async_stream(loop, stream_iterator)
+                            stream_iterator = None
+                            if self._stop_event.wait(self._raw_stream_reconnect_backoff_sec()):
+                                break
+                            continue
                         self._update_status(reader_state="error", background_error=str(exc))
                         raise exc
                     self._raise_background_error_if_any()
@@ -582,6 +608,7 @@ class QB2LiveReader:
     def _enqueue_pending_snapshot(self, snapshot: _PendingObjectSnapshot) -> None:
         dropped_snapshot_count = 0
         dropped_label_count = 0
+        max_pending_labels = max(1, int(self.config.mqtt_max_pending_labels))
         with self._pending_lock:
             pending = list(self._pending_snapshots)
             pending.append(snapshot)
@@ -590,11 +617,11 @@ class QB2LiveReader:
             kept_pending_reversed: list[_PendingObjectSnapshot] = []
             for item in reversed(pending):
                 label_count = len(item.labels)
-                if kept_label_count >= _MAX_PENDING_MQTT_LABELS:
+                if kept_label_count >= max_pending_labels:
                     dropped_snapshot_count += 1
                     dropped_label_count += label_count
                     continue
-                remaining_capacity = _MAX_PENDING_MQTT_LABELS - kept_label_count
+                remaining_capacity = max_pending_labels - kept_label_count
                 if label_count <= remaining_capacity:
                     kept_pending_reversed.append(item)
                     kept_label_count += label_count
@@ -659,6 +686,27 @@ class QB2LiveReader:
         return labels
 
     @staticmethod
+    def _materialize_latest_object_labels(snapshots: list[_PendingObjectSnapshot], frame_index: int) -> list[ObjectLabelData]:
+        latest_by_object_id: dict[int, ObjectLabelData] = {}
+        for snapshot in snapshots:
+            for label in snapshot.labels:
+                object_id = int(label.object_id)
+                current = latest_by_object_id.get(object_id)
+                if current is not None and int(current.timestamp_ns) > int(label.timestamp_ns):
+                    continue
+                latest_by_object_id[object_id] = ObjectLabelData(
+                    object_id=object_id,
+                    timestamp_ns=int(label.timestamp_ns),
+                    points=np.asarray(label.points, dtype=np.float32).copy(),
+                    obj_class=str(label.obj_class),
+                    obj_class_score=float(label.obj_class_score),
+                    sensor_name=str(label.sensor_name),
+                    frame_index=int(frame_index),
+                    source_path=str(label.source_path),
+                )
+        return [latest_by_object_id[object_id] for object_id in sorted(latest_by_object_id)]
+
+    @staticmethod
     def _filter_optional_array(values: Any, finite_mask: np.ndarray, dtype) -> np.ndarray | None:
         if values is None:
             return None
@@ -689,6 +737,27 @@ class QB2LiveReader:
     def _mqtt_drain_tolerance_ns(self) -> int:
         return int(round(float(self.config.mqtt_drain_tolerance_sec) * 1_000_000_000))
 
+    def _raw_stream_reconnect_backoff_sec(self) -> float:
+        return min(2.0, max(0.25, float(self.config.idle_timeout_sec) * 0.1))
+
+    def _record_raw_stream_reconnect(self, error_message: str, frame_index: int) -> None:
+        self._increment_status_counter("raw_stream_reconnect_count", 1)
+        self._update_status(
+            reader_state="reconnecting_raw",
+            waiting_for_first_raw_frame=frame_index == 0,
+            last_raw_stream_error=str(error_message),
+            last_raw_stream_reconnect_unix_sec=time.time(),
+        )
+
+    @staticmethod
+    def _is_recoverable_raw_stream_error(exc: BaseException) -> bool:
+        exc_name = type(exc).__name__
+        message = str(exc)
+        return (
+            exc_name in {"StreamTerminatedError", "ConnectionResetError", "BrokenPipeError"}
+            or "GOAWAY" in message
+            or "closing connection" in message
+        )
 
     def _sync_pending_status(self) -> None:
         with self._pending_lock:

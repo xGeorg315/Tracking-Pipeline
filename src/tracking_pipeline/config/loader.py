@@ -131,12 +131,16 @@ def _load_input_config(raw_input: dict[str, Any], config_path: Path) -> InputCon
             idle_timeout_sec=float(qb2_live_raw.get("idle_timeout_sec", 5.0) or 0.0),
             mqtt_drain_tolerance_sec=float(qb2_live_raw.get("mqtt_drain_tolerance_sec", 0.25) or 0.0),
             mqtt_max_pending_age_sec=float(qb2_live_raw.get("mqtt_max_pending_age_sec", 3.0) or 0.0),
+            mqtt_max_pending_labels=int(qb2_live_raw.get("mqtt_max_pending_labels", 64) or 64),
         )
     if format_name == "qb2_live":
         paths = [str(value) for value in input_cfg.get("paths", [])]
         if not paths and qb2_live is not None:
             paths = [_qb2_live_source_path(qb2_live.sensor_name, qb2_live.ip)]
         return InputConfig(paths=paths, format=format_name, qb2_live=qb2_live)
+    if format_name == "frame_segment":
+        paths = [str(_resolve_path(value, config_path.parent)) for value in input_cfg.get("paths", [])]
+        return InputConfig(paths=paths, format=format_name, qb2_live=None)
     paths = resolve_input_paths(input_cfg.get("paths", []), config_path.parent, field_name="input.paths")
     return InputConfig(paths=paths, format=format_name, qb2_live=qb2_live)
 

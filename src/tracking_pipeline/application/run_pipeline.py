@@ -37,13 +37,21 @@ from tracking_pipeline.application.performance import (
 )
 from tracking_pipeline.application.track_outcomes import build_track_outcomes
 from tracking_pipeline.config.models import PipelineConfig, RuntimeConfig
-from tracking_pipeline.domain.models import AggregateResult, ObjectLabelData, RunPerformance, RunSummary, Track, TrackOutcomeDebug
+from tracking_pipeline.domain.models import (
+    AggregateResult,
+    GTMatchResult,
+    ObjectLabelData,
+    RunPerformance,
+    RunSummary,
+    Track,
+    TrackOutcomeDebug,
+)
 from tracking_pipeline.infrastructure.logging.run_logger import get_run_logger
 from tracking_pipeline.infrastructure.visualization.live_frame_publisher import LiveFramePublisher
 from tracking_pipeline.infrastructure.visualization.live_pcd_web_server import LivePCDWebServer
 
-LIVE_ARTIFACT_FLUSH_INTERVAL_SEC = 2.0
 LIVE_ARTIFACT_TRACKER_DEBUG_FRAME_COUNT = 1
+LIVE_GT_MATCH_HISTORY_MARGIN_SEC = 5.0
 
 
 class _LiveCliStatusWriter:
@@ -165,10 +173,11 @@ def _apply_runtime_limits(runtime: RuntimeConfig, logger) -> dict[str, object]:
     }
 
 
-def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
+def run_pipeline(config: PipelineConfig, project_root: Path, live_observer=None) -> RunSummary:
     profiler = PerformanceProfiler()
     class_normalizer = ClassNormalizer.from_config(config.class_normalization)
     logger = get_run_logger()
+    statistics_enabled = bool(config.output.statistics_enabled)
     runtime_limits = _apply_runtime_limits(config.runtime, logger)
     with profiler.stage("build_components"):
         lane_box = build_lane_box(config)
@@ -183,6 +192,7 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
     with profiler.stage("prepare_output"):
         run_dir = writer.prepare_run_dir(config)
         writer.write_config_snapshot(run_dir, config)
+    _notify_live_observer(live_observer, logger, "on_run_started", config=config, run_dir=run_dir)
 
     live_web_runtime = _start_live_web_viewer(
         config=config,
@@ -199,9 +209,17 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
         config.input.paths[0],
         logger,
         config.input.format,
+        config.output.live_object_list_flush_interval_sec,
+        config.output.live_artifact_flush_interval_sec,
+        config.output.live_tracker_debug_flush_interval_sec,
+        statistics_enabled,
         runtime_limits,
     )
     live_artifact_state = _build_live_artifact_state(config.input.format)
+    live_object_list_state = _build_live_object_list_state(
+        config.input.format,
+        config.output.live_object_list_flush_interval_sec,
+    )
     try:
         latest_object_labels: dict[int, ObjectLabelData] = {}
         object_label_history_by_id: dict[int, list[ObjectLabelData]] = defaultdict(list)
@@ -209,23 +227,39 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
         object_list_skipped_empty = 0
         live_web_track_outcomes: dict[int, TrackOutcomeDebug] = {}
         live_web_announced_finished_track_ids: set[int] = set()
+        live_snapshot_tracks: dict[int, Track] = {}
+        live_snapshot_aggregate_results: dict[int, AggregateResult] = {}
+        live_snapshot_track_outcomes: dict[int, TrackOutcomeDebug] = {}
+        live_snapshot_announced_finished_track_ids: set[int] = set()
+        track_outcome_frame_to_playback: dict[int, int] = {}
+        track_outcome_last_active: dict[int, dict[str, object]] = {}
         tracker_states = []
         frame_count = 0
         last_processed_frame_index = -1
         last_processed_frame_timestamp_ns = -1
-        if config.input.format == "qb2_live":
+        if config.input.format == "qb2_live" and statistics_enabled:
             with profiler.stage("write_object_list"):
-                _write_live_object_list_snapshot(writer, run_dir, latest_object_labels, live_status_reporter)
+                _maybe_write_live_object_list_snapshot(
+                    writer,
+                    run_dir,
+                    latest_object_labels,
+                    live_status_reporter,
+                    live_object_list_state,
+                    force=True,
+                )
         frame_iterator = iter(reader.iter_frames(config.input.paths))
         interrupted = False
         try:
             with _sigterm_as_keyboard_interrupt():
                 while True:
                     try:
+                        _set_live_pipeline_step(live_status_reporter, "read_frames", frame_count)
                         with profiler.stage("read_frames"):
                             frame = next(frame_iterator)
                     except StopIteration:
                         break
+                    _notify_live_observer(live_observer, logger, "on_frame_read", frame=frame)
+                    _set_live_pipeline_step(live_status_reporter, "ingest_labels", frame_count)
                     skipped_empty, object_list_updated = _ingest_object_labels(
                         frame.object_labels,
                         latest_object_labels,
@@ -233,16 +267,42 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
                         object_list_seen_ids,
                         class_normalizer,
                     )
+                    pending_skipped_empty, pending_object_list_updated = _refresh_latest_object_labels(
+                        _snapshot_pending_object_labels(reader, frame.frame_index),
+                        latest_object_labels,
+                        object_label_history_by_id,
+                        object_list_seen_ids,
+                        class_normalizer,
+                    )
                     object_list_skipped_empty += skipped_empty
-                    if object_list_updated and config.input.format == "qb2_live":
+                    object_list_skipped_empty += pending_skipped_empty
+                    if live_artifact_state is not None and (object_list_updated or pending_object_list_updated):
+                        live_artifact_state["labels_dirty"] = True
+                    if (object_list_updated or pending_object_list_updated) and config.input.format == "qb2_live" and statistics_enabled:
                         with profiler.stage("write_object_list"):
-                            _write_live_object_list_snapshot(writer, run_dir, latest_object_labels, live_status_reporter)
+                            _maybe_write_live_object_list_snapshot(
+                                writer,
+                                run_dir,
+                                latest_object_labels,
+                                live_status_reporter,
+                                live_object_list_state,
+                            )
+                    _set_live_pipeline_step(live_status_reporter, "cluster_frames", frame_count)
                     with profiler.stage("cluster_frames"):
                         cluster_result = clusterer.cluster(frame, lane_box)
+                    _set_live_pipeline_step(live_status_reporter, "tracker_steps", frame_count)
                     with profiler.stage("tracker_steps"):
                         state = tracker.step(cluster_result.detections, frame.frame_index, frame.timestamp_ns)
                     state.cluster_metrics = cluster_result.metrics
-                    tracker_states.append(state)
+                    if statistics_enabled:
+                        _update_track_outcome_context(
+                            state,
+                            playback_index=int(frame_count),
+                            frame_to_playback=track_outcome_frame_to_playback,
+                            last_active_by_track=track_outcome_last_active,
+                        )
+                    if statistics_enabled:
+                        tracker_states.append(state)
                     frame_count += 1
                     last_processed_frame_index = int(frame.frame_index)
                     last_processed_frame_timestamp_ns = int(frame.timestamp_ns)
@@ -267,19 +327,23 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
                         active_track_count=int(len(state.active_tracks)),
                     )
                     _publish_live_web_frame(live_web_runtime, frame, cluster_result, state)
-                    _maybe_update_live_web_finished_track_outcomes(
-                        runtime=live_web_runtime,
-                        tracker=tracker,
-                        lane_box=lane_box,
-                        accumulator=accumulator,
-                        classifier=classifier,
-                        class_normalizer=class_normalizer,
-                        tracker_states=tracker_states,
-                        live_track_outcomes=live_web_track_outcomes,
-                        announced_finished_track_ids=live_web_announced_finished_track_ids,
-                        logger=logger,
-                    )
-                    _maybe_write_live_artifact_snapshot(
+                    if statistics_enabled:
+                        _set_live_pipeline_step(live_status_reporter, "live_web_track_outcomes", frame_count)
+                        _maybe_update_live_web_finished_track_outcomes(
+                            runtime=live_web_runtime,
+                            tracker=tracker,
+                            lane_box=lane_box,
+                            accumulator=accumulator,
+                            classifier=classifier,
+                            class_normalizer=class_normalizer,
+                            frame_to_playback=track_outcome_frame_to_playback,
+                            last_active_by_track=track_outcome_last_active,
+                            live_track_outcomes=live_web_track_outcomes,
+                            announced_finished_track_ids=live_web_announced_finished_track_ids,
+                            logger=logger,
+                        )
+                    _set_live_pipeline_step(live_status_reporter, "write_live_artifacts", frame_count)
+                    _maybe_write_incremental_live_artifact_snapshot(
                         config=config,
                         profiler=profiler,
                         writer=writer,
@@ -295,13 +359,31 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
                         object_list_seen_ids=object_list_seen_ids,
                         object_list_skipped_empty=object_list_skipped_empty,
                         tracker_states=tracker_states,
+                        frame_to_playback=track_outcome_frame_to_playback,
+                        last_active_by_track=track_outcome_last_active,
                         frame_count=frame_count,
                         live_status_reporter=live_status_reporter,
                         live_web_runtime=live_web_runtime,
                         live_artifact_state=live_artifact_state,
-                        force=False,
+                        live_snapshot_tracks=live_snapshot_tracks,
+                        live_snapshot_aggregate_results=live_snapshot_aggregate_results,
+                        live_snapshot_track_outcomes=live_snapshot_track_outcomes,
+                        live_snapshot_announced_finished_track_ids=live_snapshot_announced_finished_track_ids,
                         save_aggregate_intensity=config.output.save_aggregate_intensity,
+                        live_observer=live_observer,
+                        logger=logger,
                     )
+                    if config.input.format == "qb2_live" and statistics_enabled:
+                        with profiler.stage("write_object_list"):
+                            _maybe_write_live_object_list_snapshot(
+                                writer,
+                                run_dir,
+                                latest_object_labels,
+                                live_status_reporter,
+                                live_object_list_state,
+                                mark_dirty=False,
+                            )
+                    _set_live_pipeline_step(live_status_reporter, "frame_complete", frame_count)
         except KeyboardInterrupt:
             interrupted = True
             _update_live_status_reporter(
@@ -333,9 +415,17 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
                 class_normalizer,
             )
             object_list_skipped_empty += skipped_empty
-            if object_list_updated and config.input.format == "qb2_live":
+            if live_artifact_state is not None and object_list_updated:
+                live_artifact_state["labels_dirty"] = True
+            if object_list_updated and config.input.format == "qb2_live" and statistics_enabled:
                 with profiler.stage("write_object_list"):
-                    _write_live_object_list_snapshot(writer, run_dir, latest_object_labels, live_status_reporter)
+                    _maybe_write_live_object_list_snapshot(
+                        writer,
+                        run_dir,
+                        latest_object_labels,
+                        live_status_reporter,
+                        live_object_list_state,
+                    )
             _update_live_status_reporter(
                 live_status_reporter,
                 object_list_exported_count=int(len(latest_object_labels)),
@@ -364,155 +454,293 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
             object_list_exported_count=int(len(latest_object_labels)),
             object_list_seen_ids=int(len(object_list_seen_ids)),
         )
-        _maybe_write_live_artifact_snapshot(
-            config=config,
-            profiler=profiler,
-            writer=writer,
-            run_dir=run_dir,
-            lane_box=lane_box,
-            tracker=tracker,
-            postprocessors=postprocessors,
-            accumulator=accumulator,
-            classifier=classifier,
-            class_normalizer=class_normalizer,
-            latest_object_labels=latest_object_labels,
-            object_label_history_by_id=object_label_history_by_id,
-            object_list_seen_ids=object_list_seen_ids,
-            object_list_skipped_empty=object_list_skipped_empty,
-            tracker_states=tracker_states,
-            frame_count=frame_count,
-            live_status_reporter=live_status_reporter,
-            live_web_runtime=live_web_runtime,
-            live_artifact_state=live_artifact_state,
-            force=True,
-            save_aggregate_intensity=config.output.save_aggregate_intensity,
-        )
+        if str(config.input.format) == "qb2_live" and not bool(config.output.final_full_recompute):
+            with profiler.stage("tracker_finalize"):
+                finalized_tracks = tracker.finalize()
+            finished_tracks = getattr(tracker, "finished_tracks", None)
+            if not isinstance(finished_tracks, dict) and isinstance(finalized_tracks, dict):
+                finished_tracks = finalized_tracks
+            if isinstance(finished_tracks, dict):
+                new_tracks, new_results = _process_incremental_finished_tracks(
+                    finished_tracks=finished_tracks,
+                    lane_box=lane_box,
+                    postprocessors=postprocessors,
+                    accumulator=accumulator,
+                    classifier=classifier,
+                    class_normalizer=class_normalizer,
+                    frame_to_playback=track_outcome_frame_to_playback,
+                    last_active_by_track=track_outcome_last_active,
+                    profiler=profiler,
+                    announced_finished_track_ids=live_snapshot_announced_finished_track_ids,
+                    live_snapshot_tracks=live_snapshot_tracks,
+                    live_snapshot_aggregate_results=live_snapshot_aggregate_results,
+                    live_snapshot_track_outcomes=live_snapshot_track_outcomes,
+                    pending_snapshot_results=live_artifact_state["pending_saved_results"] if live_artifact_state is not None else None,
+                    collect_track_outcomes=statistics_enabled,
+                )
+                if new_tracks:
+                    _notify_live_observer(
+                        live_observer,
+                        logger,
+                        "on_live_aggregates",
+                        tracks=new_tracks,
+                        aggregate_results=new_results,
+                    )
 
-        with profiler.stage("tracker_finalize"):
-            tracks = tracker.finalize()
-        for processor in postprocessors:
-            with profiler.stage("postprocess_tracks"):
-                tracks = processor.process(tracks)
-
-        aggregate_results: list[AggregateResult] = []
-        registration_attempts = 0
-        registration_accepted = 0
-        registration_rejected = 0
-        aggregation_component_wall = {component_name: 0.0 for component_name in AGGREGATION_COMPONENT_NAMES}
-        aggregation_component_cpu = {component_name: 0.0 for component_name in AGGREGATION_COMPONENT_NAMES}
-        aggregation_component_calls = {component_name: 0 for component_name in AGGREGATION_COMPONENT_NAMES}
-
-        for track in tracks.values():
-            with profiler.stage("accumulate_tracks"):
-                result = accumulator.accumulate(track, lane_box)
-            aggregate_results.append(result)
-            metrics = result.metrics
-            registration_attempts += int(metrics.get("registration_pairs", 0))
-            registration_accepted += int(metrics.get("registration_accepted", 0))
-            registration_rejected += int(metrics.get("registration_rejected", 0))
-            _accumulate_aggregation_component_metrics(
-                aggregation_component_wall,
-                aggregation_component_cpu,
-                aggregation_component_calls,
-                result,
-                config.aggregation.algorithm,
-                config.aggregation.enable_tail_bridge,
+            aggregate_results = list(live_snapshot_aggregate_results.values())
+            with profiler.stage("match_gt"):
+                matched_gt, unmatched_saved_tracks, unmatched_gt_objects, gt_match_summary = match_saved_aggregates_to_gt(
+                    live_snapshot_tracks,
+                    aggregate_results,
+                    dict(object_label_history_by_id),
+                    class_normalizer,
+                )
+                apply_gt_matches_to_results(aggregate_results, matched_gt, unmatched_saved_tracks)
+            _notify_live_observer(
+                live_observer,
+                logger,
+                "on_live_aggregates",
+                tracks=live_snapshot_tracks,
+                aggregate_results=aggregate_results,
             )
-        if hasattr(accumulator, "merge_long_vehicle_aggregates"):
-            with profiler.stage("accumulate_tracks"):
-                aggregate_results = accumulator.merge_long_vehicle_aggregates(tracks, aggregate_results, lane_box)
-        with profiler.stage("classify_aggregates"):
-            aggregate_results = classify_aggregate_results(aggregate_results, classifier, class_normalizer)
-        with profiler.stage("match_gt"):
-            matched_gt, unmatched_saved_tracks, unmatched_gt_objects, gt_match_summary = match_saved_aggregates_to_gt(
-                tracks,
-                aggregate_results,
-                dict(object_label_history_by_id),
-                class_normalizer,
+            class_stats = (
+                build_class_statistics(aggregate_results, latest_object_labels, class_normalizer)
+                if statistics_enabled
+                else _empty_class_statistics()
             )
-            apply_gt_matches_to_results(aggregate_results, matched_gt, unmatched_saved_tracks)
-        class_stats = build_class_statistics(aggregate_results, latest_object_labels, class_normalizer)
-        _begin_writer_snapshot(writer, run_dir)
-        for result in aggregate_results:
-            if result.status == "saved":
-                with profiler.stage("write_aggregates"):
-                    writer.write_aggregate(run_dir, result, save_intensity=config.output.save_aggregate_intensity)
-        track_outcomes = build_track_outcomes(tracks, aggregate_results, tracker_states)
+            summary = _build_incremental_live_summary(
+                config=config,
+                run_dir=run_dir,
+                postprocessors=postprocessors,
+                tracks=live_snapshot_tracks,
+                aggregate_results=aggregate_results,
+                latest_object_labels=latest_object_labels,
+                object_list_seen_ids=object_list_seen_ids,
+                object_list_skipped_empty=object_list_skipped_empty,
+                class_stats=class_stats,
+                frame_count=frame_count,
+                gt_match_summary=gt_match_summary,
+            )
+            _begin_writer_snapshot(writer, run_dir)
+            _clear_live_artifact_outputs(writer, run_dir)
+            for result in aggregate_results:
+                if str(result.status) == "saved":
+                    with profiler.stage("write_aggregates"):
+                        writer.write_aggregate(run_dir, result, save_intensity=config.output.save_aggregate_intensity)
+            with _writer_sample_batch(writer):
+                with profiler.stage("write_object_list"):
+                    if statistics_enabled:
+                        _maybe_write_live_object_list_snapshot(
+                            writer,
+                            run_dir,
+                            latest_object_labels,
+                            live_status_reporter,
+                            live_object_list_state,
+                            force=True,
+                        )
+                    else:
+                        _write_live_object_list_snapshot(writer, run_dir, latest_object_labels, live_status_reporter)
+                with profiler.stage("write_gt_matching"):
+                    writer.write_gt_matching(run_dir, matched_gt, unmatched_saved_tracks, unmatched_gt_objects, gt_match_summary)
+            if statistics_enabled:
+                with _writer_stats_batch(writer):
+                    with profiler.stage("write_tracks"):
+                        writer.write_tracks(run_dir, live_snapshot_tracks, aggregate_results)
+                        writer.write_tracker_debug(run_dir, tracker_states)
+                        writer.write_track_outcomes(run_dir, live_snapshot_track_outcomes)
+                        writer.write_class_stats(run_dir, class_stats)
+                    with profiler.stage("write_summary"):
+                        writer.write_summary(run_dir, summary)
+                _update_live_web_snapshot(live_web_runtime, live_snapshot_track_outcomes, summary)
+        else:
+            if str(config.input.format) == "qb2_live" and statistics_enabled:
+                _write_live_artifact_snapshot(
+                    config=config,
+                    profiler=profiler,
+                    writer=writer,
+                    run_dir=run_dir,
+                    lane_box=lane_box,
+                    tracker=tracker,
+                    postprocessors=postprocessors,
+                    accumulator=accumulator,
+                    classifier=classifier,
+                    class_normalizer=class_normalizer,
+                    latest_object_labels=latest_object_labels,
+                    object_label_history_by_id=object_label_history_by_id,
+                    object_list_seen_ids=object_list_seen_ids,
+                    object_list_skipped_empty=object_list_skipped_empty,
+                    tracker_states=tracker_states,
+                    frame_count=frame_count,
+                    live_status_reporter=live_status_reporter,
+                    live_web_runtime=live_web_runtime,
+                    save_aggregate_intensity=config.output.save_aggregate_intensity,
+                )
 
-        with profiler.stage("write_object_list"):
-            writer.write_object_list(run_dir, latest_object_labels)
-        with profiler.stage("write_gt_matching"):
-            writer.write_gt_matching(run_dir, matched_gt, unmatched_saved_tracks, unmatched_gt_objects, gt_match_summary)
+            with profiler.stage("tracker_finalize"):
+                tracks = tracker.finalize()
+            for processor in postprocessors:
+                with profiler.stage("postprocess_tracks"):
+                    tracks = processor.process(tracks)
 
-        status_counts = Counter(result.status for result in aggregate_results)
-        quality_scores = [track.quality_score for track in tracks.values() if track.quality_score is not None]
-        summary = RunSummary(
-            input_path=config.input.paths[0],
-            input_paths=list(config.input.paths),
-            output_mode=str(config.output.mode),
-            tracker_algorithm=config.tracking.algorithm,
-            accumulator_algorithm=config.aggregation.algorithm,
-            clusterer_algorithm=config.clustering.algorithm,
-            frame_count=frame_count,
-            finished_track_count=len(tracks),
-            saved_aggregates=sum(1 for result in aggregate_results if result.status == "saved"),
-            registration_attempts=registration_attempts,
-            registration_accepted=registration_accepted,
-            registration_rejected=registration_rejected,
-            output_dir=str(run_dir),
-            postprocessing_methods=[processor.name for processor in postprocessors],
-            aggregate_status_counts=dict(status_counts),
-            track_quality_mean=float(sum(quality_scores) / len(quality_scores)) if quality_scores else 0.0,
-            object_list_exported_count=len(latest_object_labels),
-            object_list_seen_ids=len(object_list_seen_ids),
-            object_list_skipped_empty=int(object_list_skipped_empty),
-            gt_match_saved_track_count=int(gt_match_summary["gt_match_saved_track_count"]),
-            gt_match_matched_count=int(gt_match_summary["gt_match_matched_count"]),
-            gt_match_unmatched_saved_count=int(gt_match_summary["gt_match_unmatched_saved_count"]),
-            gt_match_unmatched_gt_count=int(gt_match_summary["gt_match_unmatched_gt_count"]),
-            gt_match_mode=str(gt_match_summary["gt_match_mode"]),
-            gt_match_assignment=str(gt_match_summary["gt_match_assignment"]),
-            gt_match_mean_timestamp_delta_ns=float(gt_match_summary["gt_match_mean_timestamp_delta_ns"]),
-            gt_match_max_timestamp_delta_ns=int(gt_match_summary["gt_match_max_timestamp_delta_ns"]),
-            predicted_class_counts=dict(class_stats["predicted_class_counts"]),
-            gt_class_counts=dict(class_stats["gt_class_counts"]),
-            matched_gt_class_counts=dict(class_stats["matched_gt_class_counts"]),
-            class_comparison_count=int(class_stats["class_comparison_count"]),
-            class_match_count=int(class_stats["class_match_count"]),
-            class_mismatch_count=int(class_stats["class_mismatch_count"]),
-            class_count_rows=[dict(row) for row in class_stats["class_count_rows"]],
-            performance=_snapshot_with_aggregation_components(
-                profiler,
-                aggregation_component_wall,
-                aggregation_component_cpu,
-                aggregation_component_calls,
-                frame_count,
-            ),
-        )
-        with profiler.stage("write_tracks"):
-            writer.write_tracks(run_dir, tracks, aggregate_results)
-            writer.write_tracker_debug(run_dir, tracker_states)
-            writer.write_track_outcomes(run_dir, track_outcomes)
-            writer.write_class_stats(run_dir, class_stats)
-        _update_live_web_snapshot(live_web_runtime, track_outcomes, summary)
-        summary.performance = _snapshot_with_aggregation_components(
-            profiler,
-            aggregation_component_wall,
-            aggregation_component_cpu,
-            aggregation_component_calls,
-            summary.frame_count,
-        )
-        with profiler.stage("write_summary"):
-            writer.write_summary(run_dir, summary)
-        # Persist the final profile snapshot after measuring the summary write itself.
-        summary.performance = _snapshot_with_aggregation_components(
-            profiler,
-            aggregation_component_wall,
-            aggregation_component_cpu,
-            aggregation_component_calls,
-            summary.frame_count,
-        )
-        writer.write_summary(run_dir, summary)
+            aggregate_results: list[AggregateResult] = []
+            registration_attempts = 0
+            registration_accepted = 0
+            registration_rejected = 0
+            aggregation_component_wall = {component_name: 0.0 for component_name in AGGREGATION_COMPONENT_NAMES}
+            aggregation_component_cpu = {component_name: 0.0 for component_name in AGGREGATION_COMPONENT_NAMES}
+            aggregation_component_calls = {component_name: 0 for component_name in AGGREGATION_COMPONENT_NAMES}
+
+            for track in tracks.values():
+                with profiler.stage("accumulate_tracks"):
+                    result = accumulator.accumulate(track, lane_box)
+                aggregate_results.append(result)
+                metrics = result.metrics
+                registration_attempts += int(metrics.get("registration_pairs", 0))
+                registration_accepted += int(metrics.get("registration_accepted", 0))
+                registration_rejected += int(metrics.get("registration_rejected", 0))
+                _accumulate_aggregation_component_metrics(
+                    aggregation_component_wall,
+                    aggregation_component_cpu,
+                    aggregation_component_calls,
+                    result,
+                    config.aggregation.algorithm,
+                    config.aggregation.enable_tail_bridge,
+                )
+            if hasattr(accumulator, "merge_long_vehicle_aggregates"):
+                with profiler.stage("accumulate_tracks"):
+                    aggregate_results = accumulator.merge_long_vehicle_aggregates(tracks, aggregate_results, lane_box)
+            with profiler.stage("classify_aggregates"):
+                aggregate_results = classify_aggregate_results(aggregate_results, classifier, class_normalizer)
+            with profiler.stage("match_gt"):
+                matched_gt, unmatched_saved_tracks, unmatched_gt_objects, gt_match_summary = match_saved_aggregates_to_gt(
+                    tracks,
+                    aggregate_results,
+                    dict(object_label_history_by_id),
+                    class_normalizer,
+                )
+                apply_gt_matches_to_results(aggregate_results, matched_gt, unmatched_saved_tracks)
+            _notify_live_observer(
+                live_observer,
+                logger,
+                "on_live_aggregates",
+                tracks=tracks,
+                aggregate_results=aggregate_results,
+            )
+            class_stats = (
+                build_class_statistics(aggregate_results, latest_object_labels, class_normalizer)
+                if statistics_enabled
+                else _empty_class_statistics()
+            )
+            _begin_writer_snapshot(writer, run_dir)
+            for result in aggregate_results:
+                if result.status == "saved":
+                    with profiler.stage("write_aggregates"):
+                        writer.write_aggregate(run_dir, result, save_intensity=config.output.save_aggregate_intensity)
+            track_outcomes = (
+                build_track_outcomes(
+                    tracks,
+                    aggregate_results,
+                    tracker_states,
+                    frame_to_playback=track_outcome_frame_to_playback,
+                    last_active_by_track=track_outcome_last_active,
+                )
+                if statistics_enabled
+                else {}
+            )
+
+            with _writer_sample_batch(writer):
+                with profiler.stage("write_object_list"):
+                    if statistics_enabled:
+                        _maybe_write_live_object_list_snapshot(
+                            writer,
+                            run_dir,
+                            latest_object_labels,
+                            live_status_reporter,
+                            live_object_list_state,
+                            force=True,
+                        )
+                    else:
+                        _write_live_object_list_snapshot(writer, run_dir, latest_object_labels, live_status_reporter)
+                with profiler.stage("write_gt_matching"):
+                    writer.write_gt_matching(run_dir, matched_gt, unmatched_saved_tracks, unmatched_gt_objects, gt_match_summary)
+
+            status_counts = Counter(result.status for result in aggregate_results)
+            quality_scores = [track.quality_score for track in tracks.values() if track.quality_score is not None]
+            articulated_summary = _build_articulated_vehicle_summary(tracks, aggregate_results)
+            summary = RunSummary(
+                input_path=config.input.paths[0],
+                input_paths=list(config.input.paths),
+                output_mode=str(config.output.mode),
+                tracker_algorithm=config.tracking.algorithm,
+                accumulator_algorithm=config.aggregation.algorithm,
+                clusterer_algorithm=config.clustering.algorithm,
+                frame_count=frame_count,
+                finished_track_count=len(tracks),
+                saved_aggregates=sum(1 for result in aggregate_results if result.status == "saved"),
+                registration_attempts=registration_attempts,
+                registration_accepted=registration_accepted,
+                registration_rejected=registration_rejected,
+                output_dir=str(run_dir),
+                postprocessing_methods=[processor.name for processor in postprocessors],
+                aggregate_status_counts=dict(status_counts),
+                **articulated_summary,
+                track_quality_mean=float(sum(quality_scores) / len(quality_scores)) if quality_scores else 0.0,
+                object_list_exported_count=len(latest_object_labels),
+                object_list_seen_ids=len(object_list_seen_ids),
+                object_list_skipped_empty=int(object_list_skipped_empty),
+                gt_match_saved_track_count=int(gt_match_summary["gt_match_saved_track_count"]),
+                gt_match_matched_count=int(gt_match_summary["gt_match_matched_count"]),
+                gt_match_unmatched_saved_count=int(gt_match_summary["gt_match_unmatched_saved_count"]),
+                gt_match_unmatched_gt_count=int(gt_match_summary["gt_match_unmatched_gt_count"]),
+                gt_match_mode=str(gt_match_summary["gt_match_mode"]),
+                gt_match_assignment=str(gt_match_summary["gt_match_assignment"]),
+                gt_match_mean_timestamp_delta_ns=float(gt_match_summary["gt_match_mean_timestamp_delta_ns"]),
+                gt_match_max_timestamp_delta_ns=int(gt_match_summary["gt_match_max_timestamp_delta_ns"]),
+                predicted_class_counts=dict(class_stats["predicted_class_counts"]),
+                gt_class_counts=dict(class_stats["gt_class_counts"]),
+                matched_gt_class_counts=dict(class_stats["matched_gt_class_counts"]),
+                class_comparison_count=int(class_stats["class_comparison_count"]),
+                class_match_count=int(class_stats["class_match_count"]),
+                class_mismatch_count=int(class_stats["class_mismatch_count"]),
+                class_count_rows=[dict(row) for row in class_stats["class_count_rows"]],
+                performance=(
+                    _snapshot_with_aggregation_components(
+                        profiler,
+                        aggregation_component_wall,
+                        aggregation_component_cpu,
+                        aggregation_component_calls,
+                        frame_count,
+                    )
+                    if statistics_enabled
+                    else None
+                ),
+            )
+            if statistics_enabled:
+                with _writer_stats_batch(writer):
+                    with profiler.stage("write_tracks"):
+                        writer.write_tracks(run_dir, tracks, aggregate_results)
+                        writer.write_tracker_debug(run_dir, tracker_states)
+                        writer.write_track_outcomes(run_dir, track_outcomes)
+                        writer.write_class_stats(run_dir, class_stats)
+                    with profiler.stage("write_summary"):
+                        writer.write_summary(run_dir, summary)
+                _update_live_web_snapshot(live_web_runtime, track_outcomes, summary)
+                summary.performance = _snapshot_with_aggregation_components(
+                    profiler,
+                    aggregation_component_wall,
+                    aggregation_component_cpu,
+                    aggregation_component_calls,
+                    summary.frame_count,
+                )
+                # Persist the final profile snapshot after measuring the summary write itself.
+                summary.performance = _snapshot_with_aggregation_components(
+                    profiler,
+                    aggregation_component_wall,
+                    aggregation_component_cpu,
+                    aggregation_component_calls,
+                    summary.frame_count,
+                )
+                writer.write_summary(run_dir, summary)
         _update_live_status_reporter(
             live_status_reporter,
             pipeline_phase="completed",
@@ -535,20 +763,49 @@ def run_pipeline(config: PipelineConfig, project_root: Path) -> RunSummary:
         )
         return summary
     finally:
+        _notify_live_observer(live_observer, logger, "on_run_finished")
         _stop_live_web_viewer(live_web_runtime)
         _stop_live_status_reporter(live_status_reporter, reader)
 
 
-def _start_live_status_reporter(reader, writer, run_dir: Path, input_path: str, logger, input_format: str, runtime_limits: dict[str, object]):
+def _notify_live_observer(observer, logger, method_name: str, **kwargs):
+    if observer is None:
+        return None
+    method = getattr(observer, method_name, None)
+    if not callable(method):
+        return None
+    try:
+        return method(**kwargs)
+    except Exception as exc:  # pragma: no cover - defensive isolation for live diagnostics
+        if logger is not None:
+            logger.info("Live observer callback %s failed: %s", method_name, exc)
+        return None
+
+
+def _start_live_status_reporter(
+    reader,
+    writer,
+    run_dir: Path,
+    input_path: str,
+    logger,
+    input_format: str,
+    live_object_list_flush_interval_sec: float,
+    live_artifact_flush_interval_sec: float,
+    live_tracker_debug_flush_interval_sec: float,
+    statistics_enabled: bool,
+    runtime_limits: dict[str, object],
+):
     if str(input_format) != "qb2_live":
         return None
     started_monotonic = time.monotonic()
+    persist_status = bool(statistics_enabled)
     status_path = _writer_output_path(writer, "live_status_path", run_dir, run_dir / "live_status.json")
     object_list_manifest_path = _writer_output_path(writer, "object_list_manifest_path", run_dir, run_dir / "object_list" / "manifest.jsonl")
     live_artifact_dir = _writer_output_path(writer, "live_artifact_dir", run_dir, run_dir)
     reporter = {
         "run_dir": run_dir,
         "status_path": status_path,
+        "persist_status": persist_status,
         "writer": writer,
         "cli_status": _LiveCliStatusWriter(),
         "state": {
@@ -560,12 +817,14 @@ def _start_live_status_reporter(reader, writer, run_dir: Path, input_path: str, 
             "processing_total_hz": 0.0,
             "processing_recent_hz": 0.0,
             "live_artifact_dir": str(live_artifact_dir),
-            "live_artifact_flush_interval_sec": float(LIVE_ARTIFACT_FLUSH_INTERVAL_SEC),
+            "live_artifact_flush_interval_sec": float(live_artifact_flush_interval_sec),
+            "live_tracker_debug_flush_interval_sec": float(live_tracker_debug_flush_interval_sec),
             "live_artifact_write_count": 0,
             "last_live_artifact_write_unix_sec": None,
             "object_list_exported_count": 0,
             "object_list_seen_ids": 0,
             "object_list_manifest_path": str(object_list_manifest_path),
+            "live_object_list_flush_interval_sec": float(live_object_list_flush_interval_sec),
             "live_object_list_write_count": 0,
             "last_live_object_list_write_unix_sec": None,
             "runtime_requested_cpu_cores": int(runtime_limits.get("requested_cpu_cores", 0) or 0),
@@ -576,9 +835,12 @@ def _start_live_status_reporter(reader, writer, run_dir: Path, input_path: str, 
             "finished_track_count": 0,
             "saved_aggregates": 0,
             "interrupted": False,
+            "current_pipeline_step": "starting",
+            "current_pipeline_step_frame": 0,
             "_started_monotonic": float(started_monotonic),
             "_last_processed_monotonic": None,
             "_last_processed_frame_count": 0,
+            "_current_pipeline_step_started_monotonic": float(started_monotonic),
         },
         "lock": threading.Lock(),
         "stop_event": threading.Event(),
@@ -587,7 +849,10 @@ def _start_live_status_reporter(reader, writer, run_dir: Path, input_path: str, 
     payload = _build_live_status_payload(reader, reporter)
     _persist_live_status_payload(reporter, payload)
     logger.info("Live run active: %s", run_dir)
-    logger.info("Live status file: %s", reporter["status_path"])
+    if persist_status:
+        logger.info("Live status file: %s", reporter["status_path"])
+    else:
+        logger.info("Live status file disabled by output.statistics_enabled=false; CLI Hz status remains active")
     logger.info("Live artifact snapshots: %s", run_dir)
     logger.info("Waiting for QB2 raw frames; press Ctrl+C to finalize the current run")
     cli_status = reporter["cli_status"]
@@ -683,7 +948,8 @@ def _maybe_update_live_web_finished_track_outcomes(
     accumulator,
     classifier,
     class_normalizer: ClassNormalizer,
-    tracker_states: list,
+    frame_to_playback: dict[int, int],
+    last_active_by_track: dict[int, dict[str, object]],
     live_track_outcomes: dict[int, TrackOutcomeDebug],
     announced_finished_track_ids: set[int],
     logger,
@@ -718,7 +984,14 @@ def _maybe_update_live_web_finished_track_outcomes(
         if hasattr(accumulator, "merge_long_vehicle_aggregates"):
             aggregate_results = accumulator.merge_long_vehicle_aggregates(new_tracks, aggregate_results, lane_box)
         aggregate_results = classify_aggregate_results(aggregate_results, classifier, class_normalizer)
-        live_track_outcomes.update(build_track_outcomes(new_tracks, aggregate_results, tracker_states))
+        live_track_outcomes.update(
+            build_track_outcomes(
+                new_tracks,
+                aggregate_results,
+                frame_to_playback=frame_to_playback,
+                last_active_by_track=last_active_by_track,
+            )
+        )
         announced_finished_track_ids.update(new_tracks)
         publisher.update_track_outcomes(live_track_outcomes)
         publisher.update_status(
@@ -727,6 +1000,21 @@ def _maybe_update_live_web_finished_track_outcomes(
         )
     except Exception as exc:  # pragma: no cover - defensive
         logger.info("Live web track outcome update failed: %s", exc)
+
+
+def _update_track_outcome_context(
+    state,
+    *,
+    playback_index: int,
+    frame_to_playback: dict[int, int],
+    last_active_by_track: dict[int, dict[str, object]],
+) -> None:
+    frame_to_playback[int(state.frame_index)] = int(playback_index)
+    for active_track in getattr(state, "active_tracks", []) or []:
+        last_active_by_track[int(active_track.track_id)] = {
+            "playback_index": int(playback_index),
+            "center": np.asarray(active_track.center, dtype=np.float32).copy(),
+        }
 
 
 def _stop_live_web_viewer(runtime) -> None:
@@ -771,6 +1059,21 @@ def _update_live_status_reporter(reporter, **updates: object) -> None:
             state["_last_processed_frame_count"] = int(processed_frames)
 
 
+def _set_live_pipeline_step(reporter, step: str, frame_count: int) -> None:
+    if reporter is None:
+        return
+    with reporter["lock"]:
+        state = reporter["state"]
+        current_step = str(state.get("current_pipeline_step", "") or "")
+        current_frame = int(state.get("current_pipeline_step_frame", -1) or -1)
+        next_frame = int(frame_count)
+        if current_step == str(step) and current_frame == next_frame:
+            return
+        state["current_pipeline_step"] = str(step)
+        state["current_pipeline_step_frame"] = next_frame
+        state["_current_pipeline_step_started_monotonic"] = float(time.monotonic())
+
+
 def _stop_live_status_reporter(reporter, reader) -> None:
     if reporter is None:
         return
@@ -808,6 +1111,11 @@ def _build_live_status_payload(reader, reporter) -> dict[str, object]:
             for key, value in dict(reporter["state"]).items()
             if not str(key).startswith("_")
         }
+        step_started_monotonic = reporter["state"].get("_current_pipeline_step_started_monotonic")
+    if step_started_monotonic is None:
+        state["current_pipeline_step_age_sec"] = None
+    else:
+        state["current_pipeline_step_age_sec"] = max(0.0, time.monotonic() - float(step_started_monotonic))
     return {
         "updated_at_unix_sec": float(time.time()),
         "output_dir": str(reporter["run_dir"]),
@@ -835,6 +1143,8 @@ def _write_live_status_file(path: Path, payload: dict[str, object]) -> None:
 
 
 def _persist_live_status_payload(reporter, payload: dict[str, object]) -> None:
+    if not bool(reporter.get("persist_status", True)):
+        return
     _write_live_status_file(reporter["status_path"], payload)
     writer = reporter.get("writer")
     write_live_status = getattr(writer, "write_live_status", None)
@@ -864,8 +1174,10 @@ def _format_live_status_line(payload: dict[str, object]) -> str:
     return (
         "live phase={phase} f={processed} hz={recent_hz:.2f}/{total_hz:.2f} tr={active_tracks} "
         "aw={artifact_writes} ow={object_writes} raw={raw} mqtt={mqtt_msgs} snap={mqtt_snapshots} "
-        "pend={pending_labels} conn={mqtt_connected} wait={waiting_first_raw} "
-        "raw_age={last_raw_age} mqtt_age={last_mqtt_age} state={reader_state}"
+        "q={pending_labels}/{pending_snapshots} drop={dropped_overflow_labels}/{dropped_stale_labels} "
+        "conn={mqtt_connected} wait={waiting_first_raw} reconn={raw_reconnects} "
+        "raw_age={last_raw_age} mqtt_age={last_mqtt_age} state={reader_state} "
+        "step={pipeline_step} step_age={pipeline_step_age}"
     ).format(
         phase=str(payload.get("pipeline_phase", "unknown")),
         processed=int(payload.get("processed_frames", 0) or 0),
@@ -878,11 +1190,17 @@ def _format_live_status_line(payload: dict[str, object]) -> str:
         mqtt_msgs=int(reader.get("mqtt_messages_received", 0) or 0),
         mqtt_snapshots=int(reader.get("mqtt_snapshots_received", 0) or 0),
         pending_labels=int(reader.get("pending_label_count", 0) or 0),
+        pending_snapshots=int(reader.get("pending_snapshot_count", 0) or 0),
+        dropped_overflow_labels=int(reader.get("dropped_overflow_label_count", 0) or 0),
+        dropped_stale_labels=int(reader.get("dropped_stale_label_count", 0) or 0),
         mqtt_connected="yes" if bool(reader.get("mqtt_connected", False)) else "no",
         waiting_first_raw="yes" if bool(reader.get("waiting_for_first_raw_frame", False)) else "no",
+        raw_reconnects=int(reader.get("raw_stream_reconnect_count", 0) or 0),
         last_raw_age=_format_live_age(reader.get("last_raw_age_sec")),
         last_mqtt_age=_format_live_age(reader.get("last_mqtt_age_sec")),
         reader_state=str(reader.get("reader_state", "unknown")),
+        pipeline_step=str(payload.get("current_pipeline_step", "unknown")),
+        pipeline_step_age=_format_live_age(payload.get("current_pipeline_step_age_sec")),
     )
 
 
@@ -892,8 +1210,56 @@ def _format_live_age(value: object) -> str:
     return f"{float(value):.1f}s"
 
 
+def _build_live_object_list_state(input_format: str, flush_interval_sec: float) -> dict[str, float | bool | None] | None:
+    if str(input_format) != "qb2_live":
+        return None
+    return {
+        "dirty": False,
+        "last_flush_monotonic": None,
+        "flush_interval_sec": float(max(0.0, float(flush_interval_sec))),
+    }
+
+
+def _maybe_write_live_object_list_snapshot(
+    writer,
+    run_dir: Path,
+    object_labels: dict[int, ObjectLabelData],
+    reporter,
+    state,
+    *,
+    force: bool = False,
+    mark_dirty: bool = True,
+) -> bool:
+    if state is None:
+        _write_live_object_list_snapshot(writer, run_dir, object_labels, reporter)
+        return True
+    if mark_dirty and not force:
+        state["dirty"] = True
+    last_flush_monotonic = state.get("last_flush_monotonic")
+    flush_interval_sec = float(state.get("flush_interval_sec", 0.0) or 0.0)
+    dirty = bool(state.get("dirty"))
+    should_write = bool(force and (bool(state.get("dirty")) or last_flush_monotonic is None))
+    if not should_write:
+        if not dirty and last_flush_monotonic is not None:
+            return False
+        now = time.monotonic()
+        should_write = dirty and (
+            last_flush_monotonic is None or flush_interval_sec <= 0.0 or (now - float(last_flush_monotonic)) >= flush_interval_sec
+        )
+        if not should_write:
+            return False
+    _write_live_object_list_snapshot(writer, run_dir, object_labels, reporter)
+    state["dirty"] = False
+    state["last_flush_monotonic"] = float(time.monotonic())
+    return True
+
+
 def _write_live_object_list_snapshot(writer, run_dir: Path, object_labels: dict[int, ObjectLabelData], reporter) -> None:
-    writer.write_object_list(run_dir, object_labels)
+    write_live_object_list_snapshot = getattr(writer, "write_live_object_list_snapshot", None)
+    if callable(write_live_object_list_snapshot):
+        write_live_object_list_snapshot(run_dir, object_labels)
+    else:
+        writer.write_object_list(run_dir, object_labels)
     if reporter is None:
         return
     flushed_at = float(time.time())
@@ -908,13 +1274,24 @@ def _write_live_object_list_snapshot(writer, run_dir: Path, object_labels: dict[
         )
 
 
-def _build_live_artifact_state(input_format: str) -> dict[str, float | None] | None:
+def _build_live_artifact_state(input_format: str) -> dict[str, object] | None:
     if str(input_format) != "qb2_live":
         return None
-    return {"last_flush_monotonic": None}
+    return {
+        "last_flush_monotonic": None,
+        "last_tracker_debug_flush_monotonic": None,
+        "pending_flush": False,
+        "pending_saved_results": {},
+        "labels_dirty": False,
+        "cached_matches": [],
+        "cached_unmatched_saved_tracks": [],
+        "cached_unmatched_gt_objects": [],
+        "cached_gt_match_summary": None,
+        "cached_class_stats": None,
+    }
 
 
-def _maybe_write_live_artifact_snapshot(
+def _maybe_write_incremental_live_artifact_snapshot(
     *,
     config: PipelineConfig,
     profiler: PerformanceProfiler,
@@ -931,48 +1308,548 @@ def _maybe_write_live_artifact_snapshot(
     object_list_seen_ids: set[int],
     object_list_skipped_empty: int,
     tracker_states: list,
+    frame_to_playback: dict[int, int],
+    last_active_by_track: dict[int, dict[str, object]],
     frame_count: int,
     live_status_reporter,
     live_web_runtime,
     live_artifact_state,
-    force: bool,
+    live_snapshot_tracks: dict[int, Track],
+    live_snapshot_aggregate_results: dict[int, AggregateResult],
+    live_snapshot_track_outcomes: dict[int, TrackOutcomeDebug],
+    live_snapshot_announced_finished_track_ids: set[int],
     save_aggregate_intensity: bool,
+    live_observer=None,
+    logger=None,
+    force: bool = False,
 ) -> None:
     if live_artifact_state is None:
         return
-    if live_web_runtime is not None and not force:
+    statistics_enabled = bool(config.output.statistics_enabled)
+    finished_tracks = getattr(tracker, "finished_tracks", None)
+    if isinstance(finished_tracks, dict) and finished_tracks:
+        _set_live_pipeline_step(live_status_reporter, "accumulate_finished_tracks", frame_count)
+        new_tracks, aggregate_results = _process_incremental_finished_tracks(
+            finished_tracks=finished_tracks,
+            lane_box=lane_box,
+            postprocessors=postprocessors,
+            accumulator=accumulator,
+            classifier=classifier,
+            class_normalizer=class_normalizer,
+            frame_to_playback=frame_to_playback,
+            last_active_by_track=last_active_by_track,
+            profiler=profiler,
+            announced_finished_track_ids=live_snapshot_announced_finished_track_ids,
+            live_snapshot_tracks=live_snapshot_tracks,
+            live_snapshot_aggregate_results=live_snapshot_aggregate_results,
+            live_snapshot_track_outcomes=live_snapshot_track_outcomes,
+            pending_snapshot_results=live_artifact_state["pending_saved_results"],
+            collect_track_outcomes=statistics_enabled,
+        )
+        if new_tracks:
+            live_artifact_state["pending_flush"] = True
+            _notify_live_observer(
+                live_observer,
+                logger,
+                "on_live_aggregates",
+                tracks=new_tracks,
+                aggregate_results=aggregate_results,
+            )
+
+    dataset_snapshot_dirty = (
+        bool(force)
+        or bool(live_artifact_state.get("pending_flush"))
+        or (statistics_enabled and bool(live_artifact_state.get("labels_dirty")))
+    )
+    if not dataset_snapshot_dirty:
         return
+
     now = time.monotonic()
     last_flush_monotonic = live_artifact_state.get("last_flush_monotonic")
-    if (
-        not force
-        and last_flush_monotonic is not None
-        and max(0.0, now - float(last_flush_monotonic)) < float(LIVE_ARTIFACT_FLUSH_INTERVAL_SEC)
-    ):
+    flush_interval_sec = float(max(0.0, float(config.output.live_artifact_flush_interval_sec)))
+    if not force and last_flush_monotonic is not None and flush_interval_sec > 0.0:
+        if (now - float(last_flush_monotonic)) < flush_interval_sec:
+            return
+    aggregate_results = list(live_snapshot_aggregate_results.values())
+    tracks_to_write = _snapshot_tracker_tracks(tracker) if statistics_enabled else dict(live_snapshot_tracks)
+    if statistics_enabled:
+        for track_id, track in live_snapshot_tracks.items():
+            tracks_to_write[int(track_id)] = _clone_track_metadata(track)
+    if not tracks_to_write and not aggregate_results and not latest_object_labels:
         return
-    snapshot_tracker_states = _live_snapshot_tracker_states(tracker_states)
-    _write_live_artifact_snapshot(
+    cached_gt_match_summary = live_artifact_state.get("cached_gt_match_summary")
+    cached_class_stats = live_artifact_state.get("cached_class_stats")
+    if dataset_snapshot_dirty or cached_gt_match_summary is None or (statistics_enabled and cached_class_stats is None):
+        pending_results_by_track = {
+            int(track_id): result
+            for track_id, result in dict(live_artifact_state.get("pending_saved_results") or {}).items()
+        }
+        pending_saved_results_by_track = {
+            int(track_id): result
+            for track_id, result in pending_results_by_track.items()
+            if str(getattr(result, "status", "")) == "saved"
+        }
+        cached_matches = list(live_artifact_state.get("cached_matches") or [])
+        cached_unmatched_saved_tracks = list(live_artifact_state.get("cached_unmatched_saved_tracks") or [])
+        cached_unmatched_gt_objects = list(live_artifact_state.get("cached_unmatched_gt_objects") or [])
+        replaced_track_ids = set(pending_results_by_track)
+        rematch_track_ids = set(pending_saved_results_by_track)
+        if cached_gt_match_summary is None and not rematch_track_ids:
+            rematch_track_ids = {int(result.track_id) for result in aggregate_results if str(result.status) == "saved"}
+            replaced_track_ids.update(rematch_track_ids)
+
+        if rematch_track_ids:
+            match_tracks = {
+                int(track_id): live_snapshot_tracks[int(track_id)]
+                for track_id in sorted(rematch_track_ids)
+                if int(track_id) in live_snapshot_tracks
+            }
+            match_results = [
+                live_snapshot_aggregate_results[int(track_id)]
+                for track_id in sorted(match_tracks)
+                if int(track_id) in live_snapshot_aggregate_results
+            ]
+            scoped_label_history = _live_gt_match_label_history(
+                match_tracks,
+                object_label_history_by_id,
+                margin_sec=LIVE_GT_MATCH_HISTORY_MARGIN_SEC,
+            )
+            _set_live_pipeline_step(live_status_reporter, "match_gt", frame_count)
+            with profiler.stage("match_gt"):
+                new_matches, new_unmatched_saved, new_unmatched_gt, _ = match_saved_aggregates_to_gt(
+                    match_tracks,
+                    match_results,
+                    scoped_label_history,
+                    class_normalizer,
+                )
+                apply_gt_matches_to_results(match_results, new_matches, new_unmatched_saved)
+            matched_gt = [match for match in cached_matches if int(match.track_id) not in replaced_track_ids] + new_matches
+            unmatched_saved_tracks = [
+                match for match in cached_unmatched_saved_tracks if int(match.track_id) not in replaced_track_ids
+            ] + new_unmatched_saved
+            replaced_gt_object_ids = {
+                int(match.gt_object_id)
+                for match in cached_matches
+                if int(match.track_id) in replaced_track_ids and match.gt_object_id is not None
+            }
+            cached_unmatched_gt_by_object = {
+                int(match.gt_object_id): match
+                for match in cached_unmatched_gt_objects
+                if match.gt_object_id is not None
+                and int(match.gt_object_id) not in replaced_gt_object_ids
+            }
+            for match in new_unmatched_gt:
+                if match.gt_object_id is not None:
+                    cached_unmatched_gt_by_object[int(match.gt_object_id)] = match
+            unmatched_gt_objects = [cached_unmatched_gt_by_object[object_id] for object_id in sorted(cached_unmatched_gt_by_object)]
+        else:
+            matched_gt = [match for match in cached_matches if int(match.track_id) not in replaced_track_ids]
+            unmatched_saved_tracks = [
+                match for match in cached_unmatched_saved_tracks if int(match.track_id) not in replaced_track_ids
+            ]
+            replaced_gt_object_ids = {
+                int(match.gt_object_id)
+                for match in cached_matches
+                if int(match.track_id) in replaced_track_ids and match.gt_object_id is not None
+            }
+            unmatched_gt_objects = [
+                match
+                for match in cached_unmatched_gt_objects
+                if match.gt_object_id is None or int(match.gt_object_id) not in replaced_gt_object_ids
+            ]
+        gt_match_summary = _live_gt_match_summary(matched_gt, unmatched_saved_tracks, unmatched_gt_objects)
+
+        class_stats = (
+            build_class_statistics(
+                aggregate_results,
+                latest_object_labels,
+                class_normalizer,
+            )
+            if statistics_enabled
+            else _empty_class_statistics()
+        )
+        live_artifact_state["cached_matches"] = list(matched_gt)
+        live_artifact_state["cached_unmatched_saved_tracks"] = list(unmatched_saved_tracks)
+        live_artifact_state["cached_unmatched_gt_objects"] = list(unmatched_gt_objects)
+        live_artifact_state["cached_gt_match_summary"] = dict(gt_match_summary)
+        live_artifact_state["cached_class_stats"] = dict(class_stats)
+        live_artifact_state["labels_dirty"] = False
+    else:
+        matched_gt = list(live_artifact_state.get("cached_matches") or [])
+        unmatched_saved_tracks = list(live_artifact_state.get("cached_unmatched_saved_tracks") or [])
+        unmatched_gt_objects = list(live_artifact_state.get("cached_unmatched_gt_objects") or [])
+        gt_match_summary = dict(cached_gt_match_summary)
+        class_stats = dict(cached_class_stats) if statistics_enabled else _empty_class_statistics()
+
+    summary = _build_incremental_live_summary(
         config=config,
-        profiler=profiler,
-        writer=writer,
         run_dir=run_dir,
-        lane_box=lane_box,
-        tracker=tracker,
         postprocessors=postprocessors,
-        accumulator=accumulator,
-        classifier=classifier,
-        class_normalizer=class_normalizer,
+        tracks=tracks_to_write,
+        aggregate_results=aggregate_results,
         latest_object_labels=latest_object_labels,
-        object_label_history_by_id=object_label_history_by_id,
         object_list_seen_ids=object_list_seen_ids,
         object_list_skipped_empty=object_list_skipped_empty,
-        tracker_states=snapshot_tracker_states,
+        class_stats=class_stats,
         frame_count=frame_count,
-        live_status_reporter=live_status_reporter,
-        live_web_runtime=live_web_runtime,
-        save_aggregate_intensity=save_aggregate_intensity,
+        gt_match_summary=gt_match_summary,
     )
-    live_artifact_state["last_flush_monotonic"] = float(time.monotonic())
+    track_outcomes_to_write = dict(live_snapshot_track_outcomes) if statistics_enabled else {}
+    unsummarized_tracks = {
+        int(track_id): track
+        for track_id, track in tracks_to_write.items()
+        if int(track_id) not in track_outcomes_to_write
+    }
+    if statistics_enabled and unsummarized_tracks:
+        track_outcomes_to_write.update(
+            build_track_outcomes(
+                unsummarized_tracks,
+                {},
+                frame_to_playback=frame_to_playback,
+                last_active_by_track=last_active_by_track,
+            )
+        )
+
+    _begin_writer_snapshot(writer, run_dir)
+    if dataset_snapshot_dirty:
+        _set_live_pipeline_step(live_status_reporter, "write_aggregates", frame_count)
+        for result in aggregate_results:
+            if str(result.status) == "saved":
+                with profiler.stage("write_aggregates"):
+                    writer.write_aggregate(run_dir, result, save_intensity=save_aggregate_intensity)
+        _set_live_pipeline_step(live_status_reporter, "write_object_list_gt", frame_count)
+        with _writer_sample_batch(writer):
+            with profiler.stage("write_object_list"):
+                writer.write_object_list(run_dir, latest_object_labels)
+            with profiler.stage("write_gt_matching"):
+                writer.write_gt_matching(run_dir, matched_gt, unmatched_saved_tracks, unmatched_gt_objects, gt_match_summary)
+    if statistics_enabled:
+        with _writer_stats_batch(writer):
+            with profiler.stage("write_tracks"):
+                writer.write_tracks(run_dir, tracks_to_write, aggregate_results)
+                tracker_debug_interval_sec = float(max(0.0, float(config.output.live_tracker_debug_flush_interval_sec)))
+                last_tracker_debug_flush = live_artifact_state.get("last_tracker_debug_flush_monotonic")
+                should_write_tracker_debug = bool(force)
+                if not should_write_tracker_debug:
+                    should_write_tracker_debug = last_tracker_debug_flush is None or tracker_debug_interval_sec <= 0.0
+                    if not should_write_tracker_debug:
+                        should_write_tracker_debug = (now - float(last_tracker_debug_flush)) >= tracker_debug_interval_sec
+                if should_write_tracker_debug:
+                    writer.write_tracker_debug(run_dir, _live_snapshot_tracker_states(tracker_states))
+                    live_artifact_state["last_tracker_debug_flush_monotonic"] = float(now)
+                writer.write_track_outcomes(run_dir, track_outcomes_to_write)
+                writer.write_class_stats(run_dir, class_stats)
+            with profiler.stage("write_summary"):
+                writer.write_summary(run_dir, summary)
+
+    live_artifact_state["last_flush_monotonic"] = float(now)
+    live_artifact_state["pending_flush"] = False
+    live_artifact_state["pending_saved_results"] = {}
+    if statistics_enabled:
+        _update_live_status_after_artifact_snapshot(live_status_reporter, summary)
+
+
+def _live_gt_match_label_history(
+    tracks: dict[int, Track],
+    object_label_history_by_id: dict[int, list[ObjectLabelData]],
+    *,
+    margin_sec: float,
+) -> dict[int, list[ObjectLabelData]]:
+    if not tracks:
+        return {}
+    timestamp_values = [
+        int(timestamp)
+        for track in tracks.values()
+        for timestamp in track.frame_timestamps_ns
+    ]
+    if not timestamp_values:
+        return dict(object_label_history_by_id)
+    margin_ns = int(round(max(0.0, float(margin_sec)) * 1_000_000_000))
+    min_timestamp_ns = int(min(timestamp_values)) - margin_ns
+    max_timestamp_ns = int(max(timestamp_values)) + margin_ns
+    scoped: dict[int, list[ObjectLabelData]] = {}
+    for object_id, history in object_label_history_by_id.items():
+        labels = [
+            label
+            for label in history
+            if min_timestamp_ns <= int(label.timestamp_ns) <= max_timestamp_ns
+        ]
+        if labels:
+            scoped[int(object_id)] = labels
+    return scoped
+
+
+def _live_gt_match_summary(
+    matched_gt: list[GTMatchResult],
+    unmatched_saved_tracks: list[GTMatchResult],
+    unmatched_gt_objects: list[GTMatchResult],
+) -> dict[str, int | float | str]:
+    saved_results = list(matched_gt) + list(unmatched_saved_tracks)
+    matched_deltas = [
+        int(match.timestamp_delta_ns)
+        for match in saved_results
+        if bool(match.matched) and match.timestamp_delta_ns is not None
+    ]
+    return {
+        "gt_match_saved_track_count": int(len(saved_results)),
+        "gt_match_matched_count": int(sum(1 for match in saved_results if bool(match.matched))),
+        "gt_match_unmatched_saved_count": int(sum(1 for match in saved_results if not bool(match.matched))),
+        "gt_match_unmatched_gt_count": int(len(unmatched_gt_objects)),
+        "gt_match_mode": "track_center_trajectory",
+        "gt_match_assignment": "one_to_one",
+        "gt_match_mean_timestamp_delta_ns": float(sum(matched_deltas) / len(matched_deltas)) if matched_deltas else 0.0,
+        "gt_match_max_timestamp_delta_ns": int(max(matched_deltas)) if matched_deltas else 0,
+    }
+
+
+def _process_incremental_finished_tracks(
+    *,
+    finished_tracks: dict[int, Track],
+    lane_box,
+    postprocessors,
+    accumulator,
+    classifier,
+    class_normalizer: ClassNormalizer,
+    frame_to_playback: dict[int, int],
+    last_active_by_track: dict[int, dict[str, object]],
+    profiler: PerformanceProfiler,
+    announced_finished_track_ids: set[int],
+    live_snapshot_tracks: dict[int, Track],
+    live_snapshot_aggregate_results: dict[int, AggregateResult],
+    live_snapshot_track_outcomes: dict[int, TrackOutcomeDebug],
+    pending_snapshot_results: dict[int, AggregateResult] | None = None,
+    collect_track_outcomes: bool = True,
+) -> tuple[dict[int, Track], list[AggregateResult]]:
+    new_track_ids = [
+        int(track_id)
+        for track_id in sorted(int(track_id) for track_id in finished_tracks)
+        if int(track_id) not in announced_finished_track_ids
+    ]
+    if not new_track_ids:
+        return {}, []
+
+    new_tracks: dict[int, Track] = {}
+    for track_id in new_track_ids:
+        track = finished_tracks.get(int(track_id))
+        if isinstance(track, Track):
+            new_tracks[int(track_id)] = _clone_track(track)
+    if not new_tracks:
+        announced_finished_track_ids.update(new_track_ids)
+        return {}, []
+
+    candidate_tracks = {int(track_id): _clone_track(track) for track_id, track in live_snapshot_tracks.items()}
+    candidate_tracks.update({int(track_id): _clone_track(track) for track_id, track in new_tracks.items()})
+    before_signatures = {
+        int(track_id): _incremental_postprocess_signature(track)
+        for track_id, track in candidate_tracks.items()
+    }
+    processed_tracks = candidate_tracks
+    for processor in postprocessors:
+        with profiler.stage("postprocess_tracks"):
+            processed_tracks = processor.process(processed_tracks)
+
+    affected_track_ids = set(int(track_id) for track_id in new_tracks)
+    for track_id, track in processed_tracks.items():
+        previous_signature = before_signatures.get(int(track_id))
+        current_signature = _incremental_postprocess_signature(track)
+        if previous_signature != current_signature:
+            affected_track_ids.add(int(track_id))
+            affected_track_ids.update(_long_vehicle_component_ids(track))
+    for track_id in list(affected_track_ids):
+        track = processed_tracks.get(int(track_id))
+        if track is not None:
+            affected_track_ids.update(_long_vehicle_component_ids(track))
+    affected_tracks = {
+        int(track_id): processed_tracks[int(track_id)]
+        for track_id in sorted(affected_track_ids)
+        if int(track_id) in processed_tracks
+    }
+    if not affected_tracks:
+        announced_finished_track_ids.update(new_tracks)
+        return {}, []
+
+    aggregate_results: list[AggregateResult] = []
+    for track in affected_tracks.values():
+        with profiler.stage("accumulate_tracks"):
+            result = accumulator.accumulate(track, lane_box)
+        aggregate_results.append(result)
+    if hasattr(accumulator, "merge_long_vehicle_aggregates"):
+        with profiler.stage("accumulate_tracks"):
+            aggregate_results = accumulator.merge_long_vehicle_aggregates(affected_tracks, aggregate_results, lane_box)
+    with profiler.stage("classify_aggregates"):
+        aggregate_results = classify_aggregate_results(aggregate_results, classifier, class_normalizer)
+
+    announced_finished_track_ids.update(new_tracks)
+    live_snapshot_tracks.update({int(track_id): _clone_track(track) for track_id, track in processed_tracks.items()})
+    for result in aggregate_results:
+        live_snapshot_aggregate_results[int(result.track_id)] = result
+        if pending_snapshot_results is not None:
+            pending_snapshot_results[int(result.track_id)] = result
+    if bool(collect_track_outcomes):
+        live_snapshot_track_outcomes.update(
+            build_track_outcomes(
+                affected_tracks,
+                aggregate_results,
+                frame_to_playback=frame_to_playback,
+                last_active_by_track=last_active_by_track,
+            )
+        )
+    return affected_tracks, aggregate_results
+
+
+def _incremental_postprocess_signature(track: Track) -> tuple[object, ...]:
+    relevant_state = {
+        str(key): value
+        for key, value in dict(track.state).items()
+        if str(key).startswith("articulated_")
+        or str(key).startswith("long_vehicle_component")
+        or str(key) == "object_kind"
+    }
+    return (
+        None if track.quality_score is None else float(track.quality_score),
+        _signature_value(track.quality_metrics),
+        _signature_value(relevant_state),
+    )
+
+
+def _long_vehicle_component_ids(track: Track) -> set[int]:
+    raw_ids = (
+        track.state.get("long_vehicle_component_track_ids")
+        or track.state.get("articulated_component_track_ids")
+        or []
+    )
+    component_ids: set[int] = set()
+    for raw_id in raw_ids:
+        try:
+            component_ids.add(int(raw_id))
+        except Exception:
+            continue
+    if component_ids:
+        component_ids.add(int(track.track_id))
+    return component_ids
+
+
+def _signature_value(value):
+    if isinstance(value, np.ndarray):
+        return tuple(_signature_value(item) for item in value.tolist())
+    if isinstance(value, dict):
+        return tuple((str(key), _signature_value(value[key])) for key in sorted(value))
+    if isinstance(value, (list, tuple)):
+        return tuple(_signature_value(item) for item in value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _empty_class_statistics() -> dict[str, object]:
+    return {
+        "predicted_class_counts": {},
+        "gt_class_counts": {},
+        "matched_gt_class_counts": {},
+        "class_comparison_count": 0,
+        "class_match_count": 0,
+        "class_mismatch_count": 0,
+        "class_count_rows": [],
+    }
+
+
+def _build_articulated_vehicle_summary(
+    tracks: dict[int, Track],
+    aggregate_results: list[AggregateResult],
+) -> dict[str, int]:
+    pair_ids: set[tuple[int, ...] | int] = set()
+    articulated_track_ids: set[int] = set()
+    for track_id, track in tracks.items():
+        if not bool(track.state.get("articulated_vehicle")):
+            continue
+        articulated_track_ids.add(int(track_id))
+        component_ids = track.state.get("articulated_component_track_ids")
+        if component_ids:
+            pair_ids.add(tuple(sorted(int(component_id) for component_id in component_ids)))
+        elif track.state.get("articulated_pair_id") is not None:
+            pair_ids.add(int(track.state.get("articulated_pair_id")))
+
+    merged_component_count = 0
+    saved_count = 0
+    for result in aggregate_results:
+        if str(result.status) == "merged_into_long_vehicle_group":
+            merged_component_count += 1
+        if str(result.status) == "saved" and bool(result.metrics.get("articulated_vehicle")):
+            saved_count += 1
+
+    return {
+        "articulated_vehicle_pair_count": int(len(pair_ids)),
+        "articulated_vehicle_track_count": int(len(articulated_track_ids)),
+        "articulated_vehicle_merged_component_count": int(merged_component_count),
+        "articulated_vehicle_saved_count": int(saved_count),
+    }
+
+
+def _build_incremental_live_summary(
+    *,
+    config: PipelineConfig,
+    run_dir: Path,
+    postprocessors,
+    tracks: dict[int, Track],
+    aggregate_results: list[AggregateResult],
+    latest_object_labels: dict[int, ObjectLabelData],
+    object_list_seen_ids: set[int],
+    object_list_skipped_empty: int,
+    class_stats: dict[str, object],
+    frame_count: int,
+    gt_match_summary: dict[str, int | float | str] | None = None,
+) -> RunSummary:
+    status_counts = Counter(result.status for result in aggregate_results)
+    quality_scores = [track.quality_score for track in tracks.values() if track.quality_score is not None]
+    registration_attempts = int(sum(int(result.metrics.get("registration_pairs", 0) or 0) for result in aggregate_results))
+    registration_accepted = int(sum(int(result.metrics.get("registration_accepted", 0) or 0) for result in aggregate_results))
+    registration_rejected = int(sum(int(result.metrics.get("registration_rejected", 0) or 0) for result in aggregate_results))
+    input_paths = list(config.input.paths)
+    input_path = str(input_paths[0]) if input_paths else ""
+    gt_match_summary = {} if gt_match_summary is None else dict(gt_match_summary)
+    articulated_summary = _build_articulated_vehicle_summary(tracks, aggregate_results)
+    return RunSummary(
+        input_path=input_path,
+        input_paths=input_paths,
+        output_mode=str(config.output.mode),
+        tracker_algorithm=config.tracking.algorithm,
+        accumulator_algorithm=config.aggregation.algorithm,
+        clusterer_algorithm=config.clustering.algorithm,
+        frame_count=int(frame_count),
+        finished_track_count=int(len(tracks)),
+        saved_aggregates=int(sum(1 for result in aggregate_results if str(result.status) == "saved")),
+        registration_attempts=registration_attempts,
+        registration_accepted=registration_accepted,
+        registration_rejected=registration_rejected,
+        output_dir=str(run_dir),
+        postprocessing_methods=[processor.name for processor in postprocessors],
+        aggregate_status_counts=dict(status_counts),
+        **articulated_summary,
+        track_quality_mean=float(sum(quality_scores) / len(quality_scores)) if quality_scores else 0.0,
+        object_list_exported_count=int(len(latest_object_labels)),
+        object_list_seen_ids=int(len(object_list_seen_ids)),
+        object_list_skipped_empty=int(object_list_skipped_empty),
+        gt_match_saved_track_count=int(gt_match_summary.get("gt_match_saved_track_count", 0)),
+        gt_match_matched_count=int(gt_match_summary.get("gt_match_matched_count", 0)),
+        gt_match_unmatched_saved_count=int(gt_match_summary.get("gt_match_unmatched_saved_count", 0)),
+        gt_match_unmatched_gt_count=int(gt_match_summary.get("gt_match_unmatched_gt_count", 0)),
+        gt_match_mode=str(gt_match_summary.get("gt_match_mode", "")),
+        gt_match_assignment=str(gt_match_summary.get("gt_match_assignment", "")),
+        gt_match_mean_timestamp_delta_ns=float(gt_match_summary.get("gt_match_mean_timestamp_delta_ns", 0.0)),
+        gt_match_max_timestamp_delta_ns=int(gt_match_summary.get("gt_match_max_timestamp_delta_ns", 0)),
+        predicted_class_counts=dict(class_stats["predicted_class_counts"]),
+        gt_class_counts=dict(class_stats["gt_class_counts"]),
+        matched_gt_class_counts=dict(class_stats["matched_gt_class_counts"]),
+        class_comparison_count=int(class_stats["class_comparison_count"]),
+        class_match_count=int(class_stats["class_match_count"]),
+        class_mismatch_count=int(class_stats["class_mismatch_count"]),
+        class_count_rows=[dict(row) for row in class_stats["class_count_rows"]],
+        performance=None,
+    )
 
 
 def _write_live_artifact_snapshot(
@@ -1050,15 +1927,17 @@ def _write_live_artifact_snapshot(
         if result.status == "saved":
             with profiler.stage("write_aggregates"):
                 writer.write_aggregate(run_dir, result, save_intensity=save_aggregate_intensity)
-    with profiler.stage("write_object_list"):
-        writer.write_object_list(run_dir, latest_object_labels)
-    with profiler.stage("write_gt_matching"):
-        writer.write_gt_matching(run_dir, matched_gt, unmatched_saved_tracks, unmatched_gt_objects, gt_match_summary)
-    with profiler.stage("write_tracks"):
-        writer.write_tracks(run_dir, tracks, aggregate_results)
-        writer.write_tracker_debug(run_dir, tracker_states)
-        writer.write_track_outcomes(run_dir, track_outcomes)
-        writer.write_class_stats(run_dir, class_stats)
+    with _writer_sample_batch(writer):
+        with profiler.stage("write_object_list"):
+            writer.write_object_list(run_dir, latest_object_labels)
+        with profiler.stage("write_gt_matching"):
+            writer.write_gt_matching(run_dir, matched_gt, unmatched_saved_tracks, unmatched_gt_objects, gt_match_summary)
+    with _writer_stats_batch(writer):
+        with profiler.stage("write_tracks"):
+            writer.write_tracks(run_dir, tracks, aggregate_results)
+            writer.write_tracker_debug(run_dir, tracker_states)
+            writer.write_track_outcomes(run_dir, track_outcomes)
+            writer.write_class_stats(run_dir, class_stats)
 
     summary = RunSummary(
         input_path=config.input.paths[0],
@@ -1076,6 +1955,7 @@ def _write_live_artifact_snapshot(
         output_dir=str(run_dir),
         postprocessing_methods=[processor.name for processor in postprocessors],
         aggregate_status_counts=dict(status_counts),
+        **_build_articulated_vehicle_summary(tracks, aggregate_results),
         track_quality_mean=float(sum(quality_scores) / len(quality_scores)) if quality_scores else 0.0,
         object_list_exported_count=len(latest_object_labels),
         object_list_seen_ids=len(object_list_seen_ids),
@@ -1110,8 +1990,9 @@ def _write_live_artifact_snapshot(
         aggregation_component_calls,
         summary.frame_count,
     )
-    with profiler.stage("write_summary"):
-        writer.write_summary(run_dir, summary)
+    with _writer_stats_batch(writer):
+        with profiler.stage("write_summary"):
+            writer.write_summary(run_dir, summary)
     _update_live_web_snapshot(live_web_runtime, track_outcomes, summary)
     _update_live_status_after_artifact_snapshot(live_status_reporter, summary)
 
@@ -1126,6 +2007,32 @@ def _begin_writer_snapshot(writer, run_dir: Path) -> None:
     begin_snapshot = getattr(writer, "begin_snapshot", None)
     if callable(begin_snapshot):
         begin_snapshot(run_dir)
+
+
+@contextmanager
+def _writer_sample_batch(writer):
+    begin_sample_batch = getattr(writer, "begin_sample_batch", None)
+    end_sample_batch = getattr(writer, "end_sample_batch", None)
+    if callable(begin_sample_batch):
+        begin_sample_batch()
+    try:
+        yield
+    finally:
+        if callable(end_sample_batch):
+            end_sample_batch()
+
+
+@contextmanager
+def _writer_stats_batch(writer):
+    begin_stats_batch = getattr(writer, "begin_stats_batch", None)
+    end_stats_batch = getattr(writer, "end_stats_batch", None)
+    if callable(begin_stats_batch):
+        begin_stats_batch()
+    try:
+        yield
+    finally:
+        if callable(end_stats_batch):
+            end_stats_batch()
 
 
 def _clear_live_artifact_outputs(writer, run_dir: Path) -> None:
@@ -1145,7 +2052,7 @@ def _snapshot_tracker_tracks(tracker) -> dict[int, Track]:
     snapshot_tracks = getattr(tracker, "snapshot_tracks", None)
     if callable(snapshot_tracks):
         tracks = snapshot_tracks()
-        return {int(track_id): _clone_track(track) for track_id, track in sorted(dict(tracks).items())}
+        return {int(track_id): _clone_track_metadata(track) for track_id, track in sorted(dict(tracks).items())}
 
     combined: dict[int, Track] = {}
     finished_tracks = getattr(tracker, "finished_tracks", None)
@@ -1160,7 +2067,30 @@ def _snapshot_tracker_tracks(tracker) -> dict[int, Track]:
         track = getattr(tracker, "track")
         if isinstance(track, Track):
             combined[int(track.track_id)] = track
-    return {int(track_id): _clone_track(track) for track_id, track in sorted(combined.items())}
+    return {int(track_id): _clone_track_metadata(track) for track_id, track in sorted(combined.items())}
+
+
+def _clone_track_metadata(track: Track) -> Track:
+    cloned_state = {
+        str(key): copy.deepcopy(value)
+        for key, value in dict(track.state).items()
+        if str(key) != "kf"
+    }
+    return Track(
+        track_id=int(track.track_id),
+        centers=[] if not track.centers else [np.asarray(track.centers[-1], dtype=np.float32).copy()],
+        frame_ids=[int(frame_id) for frame_id in track.frame_ids],
+        frame_timestamps_ns=[int(timestamp_ns) for timestamp_ns in track.frame_timestamps_ns],
+        bbox_extents=[] if not track.bbox_extents else [np.asarray(track.bbox_extents[-1], dtype=np.float32).copy()],
+        hit_count=int(track.hit_count),
+        age=int(track.age),
+        missed=int(track.missed),
+        ended_by_missed=bool(track.ended_by_missed),
+        source_track_ids=[int(track_id) for track_id in track.source_track_ids],
+        quality_score=None if track.quality_score is None else float(track.quality_score),
+        quality_metrics=copy.deepcopy(track.quality_metrics),
+        state=cloned_state,
+    )
 
 
 def _clone_track(track: Track) -> Track:
@@ -1256,6 +2186,13 @@ def _drain_pending_object_labels(
     return list(drain(frame_index, max_timestamp_ns=max_timestamp_ns))
 
 
+def _snapshot_pending_object_labels(reader, frame_index: int) -> list[ObjectLabelData]:
+    snapshot = getattr(reader, "snapshot_pending_object_labels", None)
+    if not callable(snapshot):
+        return []
+    return list(snapshot(frame_index))
+
+
 def _ingest_object_labels(
     object_labels: list[ObjectLabelData],
     latest_object_labels: dict[int, ObjectLabelData],
@@ -1271,12 +2208,57 @@ def _ingest_object_labels(
             skipped_empty += 1
             continue
         normalized_object_label = class_normalizer.normalize_object_label(object_label)
-        object_label_history_by_id[int(object_label.object_id)].append(normalized_object_label)
+        _upsert_object_label_history(object_label_history_by_id, normalized_object_label)
         current = latest_object_labels.get(int(object_label.object_id))
         if _is_newer_object_label(normalized_object_label, current):
             latest_object_labels[int(object_label.object_id)] = normalized_object_label
             updated = True
     return skipped_empty, updated
+
+
+def _refresh_latest_object_labels(
+    object_labels: list[ObjectLabelData],
+    latest_object_labels: dict[int, ObjectLabelData],
+    object_label_history_by_id: dict[int, list[ObjectLabelData]],
+    object_list_seen_ids: set[int],
+    class_normalizer: ClassNormalizer,
+) -> tuple[int, bool]:
+    skipped_empty = 0
+    updated = False
+    for object_label in object_labels:
+        object_list_seen_ids.add(int(object_label.object_id))
+        if len(object_label.points) == 0:
+            skipped_empty += 1
+            continue
+        normalized_object_label = class_normalizer.normalize_object_label(object_label)
+        _upsert_object_label_history(object_label_history_by_id, normalized_object_label)
+        current = latest_object_labels.get(int(object_label.object_id))
+        if _is_newer_object_label(normalized_object_label, current):
+            latest_object_labels[int(object_label.object_id)] = normalized_object_label
+            updated = True
+    return skipped_empty, updated
+
+
+def _upsert_object_label_history(
+    object_label_history_by_id: dict[int, list[ObjectLabelData]],
+    object_label: ObjectLabelData,
+) -> None:
+    history = object_label_history_by_id.setdefault(int(object_label.object_id), [])
+    if not history:
+        history.append(object_label)
+        return
+
+    last_label = history[-1]
+    last_timestamp_ns = int(last_label.timestamp_ns)
+    current_timestamp_ns = int(object_label.timestamp_ns)
+    if current_timestamp_ns < last_timestamp_ns:
+        return
+    if current_timestamp_ns == last_timestamp_ns:
+        if int(object_label.frame_index) <= int(last_label.frame_index):
+            return
+        history[-1] = object_label
+        return
+    history.append(object_label)
 
 
 def _is_newer_object_label(candidate: ObjectLabelData, current: ObjectLabelData | None) -> bool:

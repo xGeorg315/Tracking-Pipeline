@@ -59,9 +59,6 @@ class LiveSnapshotLoader:
         self._fallback_track_exit_line_axis = str(config.aggregation.frame_selection_line_axis)
         self._cache: dict[str, tuple[int, Any]] = {}
 
-    def invalidate_cache(self) -> None:
-        self._cache.clear()
-
     def load(self, run_id: str | None = None, force: bool = False) -> LiveSnapshot:
         context = self.resolve_run_context(run_id)
         if context is None:

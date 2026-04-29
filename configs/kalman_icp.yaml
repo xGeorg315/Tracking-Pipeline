@@ -12,6 +12,7 @@ input:
       keepalive: 60
     max_frames: 0
     idle_timeout_sec: 30.0
+    mqtt_max_pending_labels: 100
 # input:
 #   paths:
 #     - ../data/medium_2 # 115 Vehicles
@@ -60,8 +61,10 @@ postprocessing:
 output:
   mode: dataset
   dataset_root_dir: dataset
+  live_object_list_flush_interval_sec: 1.0
+  live_artifact_flush_interval_sec: 2.0
+  live_tracker_debug_flush_interval_sec: 10.0
 warumup_runs: 1
 measure_runs: 1
 runtime:
   cpu_cores: 4
-

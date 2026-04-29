@@ -65,6 +65,7 @@ output:
 | `idle_timeout_sec` | `5.0` | Abbruch, wenn so lange keine neuen QB2-Rohframes eintreffen |
 | `mqtt_drain_tolerance_sec` | `0.25` | kleine Zeit-Toleranz fuer leicht vorlaufende MQTT-Labels beim Anhaengen an Raw-Frames |
 | `mqtt_max_pending_age_sec` | `3.0` | Pending-MQTT-Labels, die relativ zum aktuellen Raw-Frame aelter sind, werden aus der Queue geloescht |
+| `mqtt_max_pending_labels` | `64` | maximales Pending-Budget fuer noch nicht angehaengte MQTT-Labels; bei Overflow bleiben die neuesten Labels erhalten |
 
 Typische Live-Konfiguration:
 
@@ -213,14 +214,10 @@ Hinweise:
 | `registration_max_iter` | `80` | Iterationslimit fuer lokales Alignment |
 | `registration_min_fitness` | `0.25` | Mindestfitness fuer akzeptierte Registrierung |
 | `registration_max_translation` | `3.2` | Obergrenze fuer akzeptierte Translation |
-| `registration_max_tz` | `null` | optionale Obergrenze fuer die absolute `z`-Verschiebung der akzeptierten Registrierung |
 | `registration_allowed_dofs` | `[tx, ty, tz, roll, pitch, yaw]` | erlaubte Freiheitsgrade fuer die angewendete Registrierungs-Transformation |
-| `registration_preserve_anchor_points` | `false` | behaelt beim `registration_voxel_fusion` die Punkte des intern gewaehlten Registration-Ankers garantiert im finalen Aggregate |
 | `enable_registration_underfill_fallback` | `false` | faellt bei zu wenigen behaltenen Registration-Chunks auf die unregistrierten selektierten Chunks zurueck |
 | `registration_min_kept_chunks` | `4` | Mindestanzahl an Registration-Chunks vor dem optionalen Underfill-Fallback |
 | `global_registration_voxel` | `0.12` | Downsampling fuer globales Feature-Matching |
-
-Der Registration-Anchor wird backend-intern bestimmt. Aktuell priorisiert die Heuristik die groesste longitudinale Ausdehnung entlang `frame_selection_line_axis`, danach groessere Gesamt-Extent-Norm und erst danach die Punktzahl.
 
 ### Fusion und Save-Gating
 
@@ -333,14 +330,21 @@ Wichtige Semantik:
 | `save_aggregate_intensity` | `false` | schreibt range-korrigierte Reflectivity als PCD-Feld `reflectivity` mit |
 | `require_track_exit` | `true` | speichert nur Tracks, die die Lane-Box verlassen haben |
 | `track_exit_edge_margin` | `0.9` | Offset der Exit-Linie von der Min-Seite der Lane-Laengsachse; der letzte Track-Center muss diese Linie passiert haben |
+| `statistics_enabled` | `true` | schreibt Run-/Live-Statistiken wie `_stats`, Summary, Tracks, Tracker-Debug, Track-Outcomes, Class-Stats und Performance; `false` laesst Core-Artefakte wie Aggregate und GT-Matching aktiv |
+| `final_full_recompute` | `true` | fuehrt am Run-Ende den vollstaendigen Recompute ueber alle Tracks inkl. GT-Matching aus; `false` beendet den Run schneller und nutzt den inkrementellen Live-Stand als groben Endstand |
+| `live_object_list_flush_interval_sec` | `1.0` | Mindestabstand zwischen zwei Live-Object-List-Flushes; `0` schreibt sofort bei jeder Aenderung |
+| `live_artifact_flush_interval_sec` | `2.0` | Mindestabstand zwischen zwei inkrementellen Live-Snapshot-Flushes fuer Tracks/Outcomes/Summary; `0` schreibt sofort bei jedem neuen beendeten Track |
+| `live_tracker_debug_flush_interval_sec` | `10.0` | Mindestabstand fuer Live-Tracker-Debug-Snapshots in den Stats-Dateien; `0` schreibt bei jedem Live-Snapshot |
 
 Hinweise:
 
 - Es wird immer genau eines geschrieben: entweder der Run-Ordner oder der Dataset-Baum.
 - `benchmark` lehnt `output.mode: dataset` bewusst ab.
-- Im `dataset`-Modus liegen Tagesstatistiken unter `dataset/_stats/YYYY-MM-DD/<run_id>/`.
+- Im `dataset`-Modus liegen Tagesstatistiken unter `dataset/_stats/YYYY-MM-DD/<run_id>/`, sofern `statistics_enabled: true` gesetzt ist.
+- Mit `statistics_enabled: false` wird kein `_stats`-Baum erzeugt; Live-Aggregate und GT-Matching-Dataset-Samples werden weiter geschrieben.
 - `tracking-pipeline live-view -c <config>` unterstuetzt in v1 nur `output.mode: dataset` und liest die bestehenden Snapshot-Dateien read-only aus diesem Baum.
 - `tracking-pipeline live-web -c <config> [--host <host>] [--port <port>]` bleibt ein Snapshot-Fallback fuer denselben Dataset-Pfad; der echte Live-Raw-PCD-Webviewer wird direkt aus `tracking-pipeline run` heraus ueber `visualization.live_web_*` gestartet.
+- Die drei `live_*_flush_interval_sec`-Schalter beeinflussen nur laufende Live-Snapshots; mit `statistics_enabled: true` wird der finale Stats-Output am Ende weiterhin vollstaendig geschrieben.
 
 ## `visualization`
 

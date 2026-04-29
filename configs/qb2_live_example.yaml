@@ -12,8 +12,9 @@ input:
       keepalive: 60
     max_frames: 0
     idle_timeout_sec: 30.0
-    mqtt_drain_tolerance_sec: 0.25
-    mqtt_max_pending_age_sec: 3.0
+    mqtt_drain_tolerance_sec: 5.0
+    mqtt_max_pending_age_sec: 20.0
+    mqtt_max_pending_labels: 300
 # input:
 #   paths:
 #     - ../data/medium_2 # 115 Vehicles
@@ -31,8 +32,6 @@ tracking:
 aggregation:
   algorithm: registration_voxel_fusion
   registration_backend: icp_point_to_plane
-  registration_allowed_dofs: [tx, ty, tz]
-  registration_preserve_anchor_points: true
   frame_selection_method: keyframe_motion
   keyframe_keep: 8
   enable_registration_underfill_fallback: true
@@ -41,7 +40,6 @@ aggregation:
   registration_min_kept_chunks: 2
   registration_max_iter: 30
   registration_max_translation: 3.5
-  registration_max_tz: 200.0
   registration_min_fitness: 0.3
   registration_max_corr_dist: 0.5
   shape_consistency_filter: false
@@ -49,7 +47,6 @@ aggregation:
   enable_confidence_point_cap: false
   confidence_point_cap_max_points: 2048
   confidence_point_cap_bins: 16
-  fusion_skip_sum_if_vehicle_points_above: 2048
 postprocessing:
   enable_trajectory_smoothing: false 
   enable_articulated_vehicle_merge: true
@@ -62,9 +59,16 @@ postprocessing:
   articulated_max_hitch_gap_std: 0.6
   articulated_max_speed_delta: 0.30
   articulated_min_combined_length: 5.0
+classification:
+  enabled: true
 output:
   mode: dataset
   dataset_root_dir: /mnt/data/Tracking-Pipeline/dataset
+  statistics_enabled: false
+  final_full_recompute: false
+  live_object_list_flush_interval_sec: 5.0
+  live_artifact_flush_interval_sec: 20.0
+  live_tracker_debug_flush_interval_sec: 60.0
 warumup_runs: 1
 measure_runs: 1
 runtime:

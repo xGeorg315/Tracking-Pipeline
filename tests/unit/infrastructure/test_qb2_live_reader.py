@@ -19,6 +19,7 @@ def _live_config(
     *,
     mqtt_drain_tolerance_sec: float = 0.25,
     mqtt_max_pending_age_sec: float = 3.0,
+    mqtt_max_pending_labels: int = 64,
 ) -> QB2LiveInputConfig:
     return QB2LiveInputConfig(
         sensor_name="class_qb2",
@@ -34,6 +35,7 @@ def _live_config(
         idle_timeout_sec=0.1,
         mqtt_drain_tolerance_sec=mqtt_drain_tolerance_sec,
         mqtt_max_pending_age_sec=mqtt_max_pending_age_sec,
+        mqtt_max_pending_labels=mqtt_max_pending_labels,
     )
 
 
@@ -333,7 +335,9 @@ def test_qb2_live_reader_drops_pending_labels_older_than_three_seconds() -> None
 
 
 def test_qb2_live_reader_caps_pending_mqtt_labels_at_ten() -> None:
-    reader = QB2LiveReader(_live_config(mqtt_drain_tolerance_sec=0.0, mqtt_max_pending_age_sec=30.0))
+    reader = QB2LiveReader(
+        _live_config(mqtt_drain_tolerance_sec=0.0, mqtt_max_pending_age_sec=30.0, mqtt_max_pending_labels=10)
+    )
     original_monotonic = qb2_live_reader.time.monotonic
     qb2_live_reader.time.monotonic = lambda: 10.0
     try:
@@ -556,6 +560,136 @@ def test_qb2_live_reader_iter_frames_streams_raw_frames_and_attaches_mqtt_object
     assert _FakeMQTTClient.instances[0].disconnected is True
 
 
+def test_qb2_live_reader_reconnects_raw_stream_after_goaway(monkeypatch) -> None:
+    raw_frames = [
+        _make_raw_frame(
+            timestamp_ns=100,
+            points=np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+            direction_id=np.array([0], dtype=np.uint32),
+            point_timestamps_ns=np.array([90], dtype=np.uint64),
+        ),
+        _make_raw_frame(
+            timestamp_ns=200,
+            points=np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
+            direction_id=np.array([1], dtype=np.uint32),
+            point_timestamps_ns=np.array([190], dtype=np.uint64),
+        ),
+    ]
+
+    class StreamTerminatedError(Exception):
+        pass
+
+    class _FakeTokenFactory:
+        def __init__(self, application_key_secret: str):
+            self.application_key_secret = application_key_secret
+
+    class _FakeChannel:
+        def __init__(self, fqdn_or_ip: str, token: object):
+            self.fqdn_or_ip = fqdn_or_ip
+            self.token = token
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            _ = exc_type, exc, tb
+            return False
+
+    class _FakePointCloudService:
+        stream_calls = 0
+
+        def __init__(self, channel: object):
+            _ = channel
+
+        async def async_stream(self):
+            call_index = _FakePointCloudService.stream_calls
+            _FakePointCloudService.stream_calls += 1
+            if call_index == 0:
+                yield types.SimpleNamespace(frame=raw_frames[0])
+                raise StreamTerminatedError("Received GOAWAY frame, closing connection; error_code: 0")
+            yield types.SimpleNamespace(frame=raw_frames[1])
+
+    class _FakeScanPatternService:
+        def __init__(self, channel: object):
+            _ = channel
+
+        def get(self):
+            return types.SimpleNamespace(
+                scan_pattern=types.SimpleNamespace(
+                    vertical=types.SimpleNamespace(field_of_view=np.deg2rad(20.0), scanlines_up=2, scanlines_down=2),
+                    horizontal=types.SimpleNamespace(field_of_view=np.deg2rad(40.0)),
+                    pulse=types.SimpleNamespace(angle_spacing=np.deg2rad(10.0)),
+                    frame_mode=1,
+                )
+            )
+
+    class _FakeDataSourceService:
+        def __init__(self, channel: object):
+            _ = channel
+
+        def get(self):
+            transform = types.SimpleNamespace(
+                translation=types.SimpleNamespace(x=0.0, y=0.0, z=0.0),
+                rotation=types.SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+            )
+            lidar_cfg = types.SimpleNamespace(disabled=False, map_from_lidar=transform)
+            return types.SimpleNamespace(data_source=types.SimpleNamespace(qb2_setup=types.SimpleNamespace(lidars=[lidar_cfg])))
+
+    class _FakeZoneService:
+        def __init__(self, channel: object):
+            _ = channel
+
+        def list(self):
+            return types.SimpleNamespace(zones=[_make_zone("lane-a", center=(10.0, 0.0, 0.0), dimensions=(2.0, 6.0, 1.0))])
+
+    class _FakeMQTTClient:
+        def __init__(self, protocol=None):
+            self.protocol = protocol
+            self.on_connect = None
+            self.on_message = None
+
+        def connect(self, host: str, port: int, keepalive: int) -> None:
+            _ = host, port, keepalive
+
+        def subscribe(self, topic: str) -> None:
+            _ = topic
+
+        def loop_start(self) -> None:
+            return None
+
+        def loop_stop(self) -> None:
+            return None
+
+        def disconnect(self) -> None:
+            return None
+
+    def _import_module(name: str):
+        if name == "blickfeld_qb2":
+            return types.SimpleNamespace(Channel=_FakeChannel, TokenFactory=_FakeTokenFactory)
+        if name == "blickfeld_qb2.core_processing.services":
+            return types.SimpleNamespace(PointCloud=_FakePointCloudService)
+        if name == "blickfeld_qb2.system.services":
+            return types.SimpleNamespace(ScanPattern=_FakeScanPatternService)
+        if name == "blickfeld_qb2.percept_pipeline.services":
+            return types.SimpleNamespace(DataSource=_FakeDataSourceService, Zone=_FakeZoneService)
+        if name == "paho.mqtt.client":
+            return types.SimpleNamespace(Client=_FakeMQTTClient, MQTTv5=5)
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(qb2_live_reader.importlib, "import_module", _import_module)
+    monkeypatch.setattr(QB2LiveReader, "_raw_stream_reconnect_backoff_sec", lambda self: 0.0)
+    reader = QB2LiveReader(_live_config())
+
+    frames = list(reader.iter_frames(["qb2_live://class_qb2@10.16.3.160"]))
+    status = reader.status_snapshot()
+
+    assert [frame.frame_index for frame in frames] == [0, 1]
+    assert [frame.timestamp_ns for frame in frames] == [100, 200]
+    assert _FakePointCloudService.stream_calls == 2
+    assert status["raw_stream_reconnect_count"] == 1
+    assert "GOAWAY" in str(status["last_raw_stream_error"])
+
+
 def test_qb2_live_reader_streams_raw_frames_on_iterator_thread(monkeypatch) -> None:
     observed_thread_ids: list[int] = []
     raw_frames = [
@@ -670,7 +804,7 @@ def test_qb2_live_reader_streams_raw_frames_on_iterator_thread(monkeypatch) -> N
     assert reader._background_error is None
 
 
-def test_qb2_live_reader_maps_stream_timeout_to_runtime_error(monkeypatch) -> None:
+def test_qb2_live_reader_maps_initial_stream_timeout_to_runtime_error(monkeypatch) -> None:
     class _FakeTokenFactory:
         def __init__(self, application_key_secret: str):
             self.application_key_secret = application_key_secret
@@ -692,14 +826,8 @@ def test_qb2_live_reader_maps_stream_timeout_to_runtime_error(monkeypatch) -> No
             _ = channel
 
         async def async_stream(self):
-            yield types.SimpleNamespace(
-                frame=_make_raw_frame(
-                    timestamp_ns=100,
-                    points=np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
-                    direction_id=np.array([0], dtype=np.uint32),
-                    point_timestamps_ns=np.array([90], dtype=np.uint64),
-                )
-            )
+            if False:
+                yield None
             await asyncio.sleep(3600)
 
     class _FakeScanPatternService:
@@ -773,8 +901,134 @@ def test_qb2_live_reader_maps_stream_timeout_to_runtime_error(monkeypatch) -> No
     reader = QB2LiveReader(_live_config())
 
     frame_iterator = reader.iter_frames(["qb2_live://class_qb2@10.16.3.160"])
-    first_frame = next(frame_iterator)
 
-    assert first_frame.frame_index == 0
     with pytest.raises(RuntimeError, match="No QB2 frames received within idle_timeout_sec=0.100"):
         next(frame_iterator)
+
+
+def test_qb2_live_reader_reconnects_raw_stream_after_timeout(monkeypatch) -> None:
+    raw_frames = [
+        _make_raw_frame(
+            timestamp_ns=100,
+            points=np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+            direction_id=np.array([0], dtype=np.uint32),
+            point_timestamps_ns=np.array([90], dtype=np.uint64),
+        ),
+        _make_raw_frame(
+            timestamp_ns=200,
+            points=np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
+            direction_id=np.array([1], dtype=np.uint32),
+            point_timestamps_ns=np.array([190], dtype=np.uint64),
+        ),
+    ]
+
+    class _FakeTokenFactory:
+        def __init__(self, application_key_secret: str):
+            self.application_key_secret = application_key_secret
+
+    class _FakeChannel:
+        def __init__(self, fqdn_or_ip: str, token: object):
+            self.fqdn_or_ip = fqdn_or_ip
+            self.token = token
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            _ = exc_type, exc, tb
+            return False
+
+    class _FakePointCloudService:
+        stream_calls = 0
+
+        def __init__(self, channel: object):
+            _ = channel
+
+        async def async_stream(self):
+            call_index = _FakePointCloudService.stream_calls
+            _FakePointCloudService.stream_calls += 1
+            if call_index == 0:
+                yield types.SimpleNamespace(frame=raw_frames[0])
+                await asyncio.sleep(3600)
+                return
+            yield types.SimpleNamespace(frame=raw_frames[1])
+
+    class _FakeScanPatternService:
+        def __init__(self, channel: object):
+            _ = channel
+
+        def get(self):
+            return types.SimpleNamespace(
+                scan_pattern=types.SimpleNamespace(
+                    vertical=types.SimpleNamespace(field_of_view=np.deg2rad(20.0), scanlines_up=2, scanlines_down=2),
+                    horizontal=types.SimpleNamespace(field_of_view=np.deg2rad(40.0)),
+                    pulse=types.SimpleNamespace(angle_spacing=np.deg2rad(10.0)),
+                    frame_mode=1,
+                )
+            )
+
+    class _FakeDataSourceService:
+        def __init__(self, channel: object):
+            _ = channel
+
+        def get(self):
+            transform = types.SimpleNamespace(
+                translation=types.SimpleNamespace(x=0.0, y=0.0, z=0.0),
+                rotation=types.SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+            )
+            lidar_cfg = types.SimpleNamespace(disabled=False, map_from_lidar=transform)
+            return types.SimpleNamespace(data_source=types.SimpleNamespace(qb2_setup=types.SimpleNamespace(lidars=[lidar_cfg])))
+
+    class _FakeZoneService:
+        def __init__(self, channel: object):
+            _ = channel
+
+        def list(self):
+            return types.SimpleNamespace(zones=[_make_zone("lane-a", center=(10.0, 0.0, 0.0), dimensions=(2.0, 6.0, 1.0))])
+
+    class _FakeMQTTClient:
+        def __init__(self, protocol=None):
+            self.protocol = protocol
+            self.on_connect = None
+            self.on_message = None
+
+        def connect(self, host: str, port: int, keepalive: int) -> None:
+            _ = host, port, keepalive
+
+        def subscribe(self, topic: str) -> None:
+            _ = topic
+
+        def loop_start(self) -> None:
+            return None
+
+        def loop_stop(self) -> None:
+            return None
+
+        def disconnect(self) -> None:
+            return None
+
+    def _import_module(name: str):
+        if name == "blickfeld_qb2":
+            return types.SimpleNamespace(Channel=_FakeChannel, TokenFactory=_FakeTokenFactory)
+        if name == "blickfeld_qb2.core_processing.services":
+            return types.SimpleNamespace(PointCloud=_FakePointCloudService)
+        if name == "blickfeld_qb2.system.services":
+            return types.SimpleNamespace(ScanPattern=_FakeScanPatternService)
+        if name == "blickfeld_qb2.percept_pipeline.services":
+            return types.SimpleNamespace(DataSource=_FakeDataSourceService, Zone=_FakeZoneService)
+        if name == "paho.mqtt.client":
+            return types.SimpleNamespace(Client=_FakeMQTTClient, MQTTv5=5)
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(qb2_live_reader.importlib, "import_module", _import_module)
+    monkeypatch.setattr(QB2LiveReader, "_raw_stream_reconnect_backoff_sec", lambda self: 0.0)
+    reader = QB2LiveReader(_live_config())
+
+    frames = list(reader.iter_frames(["qb2_live://class_qb2@10.16.3.160"]))
+    status = reader.status_snapshot()
+
+    assert [frame.frame_index for frame in frames] == [0, 1]
+    assert [frame.timestamp_ns for frame in frames] == [100, 200]
+    assert _FakePointCloudService.stream_calls == 2
+    assert status["raw_stream_reconnect_count"] == 1
+    assert "idle_timeout_sec=0.100" in str(status["last_raw_stream_error"])

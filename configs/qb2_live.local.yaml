@@ -11,7 +11,10 @@ input:
       topic: blickfeld/states_160
       keepalive: 60
     max_frames: 0
-    idle_timeout_sec: 30.0
+    idle_timeout_sec: 1.0
+    mqtt_drain_tolerance_sec: 5.0
+    mqtt_max_pending_age_sec: 20.0
+    mqtt_max_pending_labels: 300
 # input:
 #   paths:
 #     - ../data/medium_2 # 115 Vehicles
@@ -59,8 +62,12 @@ postprocessing:
 output:
   mode: dataset
   dataset_root_dir: dataset
+  statistics_enabled: true
+  final_full_recompute: false
+  live_object_list_flush_interval_sec: 5.0
+  live_artifact_flush_interval_sec: 10.0
+  live_tracker_debug_flush_interval_sec: 20.0
 warumup_runs: 1
 measure_runs: 1
 runtime:
   cpu_cores: 4
-

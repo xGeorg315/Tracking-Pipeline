@@ -5,6 +5,7 @@ from pathlib import Path
 
 from tracking_pipeline.application.benchmark_run import BenchmarkRunner
 from tracking_pipeline.application.live_view import live_view
+from tracking_pipeline.application.live_local_test import live_local_test
 from tracking_pipeline.application.live_web import live_web
 from tracking_pipeline.application.replay_run import replay_run
 from tracking_pipeline.application.run_pipeline import run_pipeline
@@ -64,6 +65,18 @@ def build_parser() -> argparse.ArgumentParser:
     live_web_parser.add_argument("--host", default="127.0.0.1", help="Bind host, e.g. 127.0.0.1 or 0.0.0.0")
     live_web_parser.add_argument("--port", type=int, default=8765, help="Bind port for the HTTP viewer")
 
+    live_local_parser = subparsers.add_parser("live-local-test", help="Compare live aggregates against a local segment replay")
+    live_local_parser.add_argument("-c", "--config", required=True, help="Path to a YAML config")
+    live_local_parser.add_argument("--duration-sec", type=float, default=15.0, help="Segment recording duration in seconds")
+    live_local_parser.add_argument("--compare-tolerance", type=float, default=1e-5, help="Absolute point coordinate tolerance")
+    live_local_parser.add_argument(
+        "--live-aggregate-timeout-sec",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for live aggregates after local replay",
+    )
+    live_local_parser.add_argument("--local-cpu-cores", type=int, default=1, help="CPU core limit for local replay")
+
     benchmark_parser = subparsers.add_parser("benchmark", help="Benchmark multiple presets on one or more sequences")
     benchmark_parser.add_argument("-c", "--config", required=True, help="Path to a benchmark YAML config")
     return parser
@@ -117,6 +130,18 @@ def main() -> None:
             run_id=str(args.run_id or "").strip() or None,
             host=str(args.host or "").strip() or "127.0.0.1",
             port=int(args.port),
+        )
+        return
+
+    if args.command == "live-local-test":
+        config = load_config(args.config)
+        live_local_test(
+            config,
+            project_root,
+            duration_sec=float(args.duration_sec),
+            compare_tolerance=float(args.compare_tolerance),
+            live_aggregate_timeout_sec=float(args.live_aggregate_timeout_sec),
+            local_cpu_cores=int(args.local_cpu_cores),
         )
         return
 

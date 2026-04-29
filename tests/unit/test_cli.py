@@ -63,3 +63,30 @@ def test_build_parser_accepts_live_web_command_with_host_and_port() -> None:
     assert args.run_id == "run_123"
     assert args.host == "0.0.0.0"
     assert args.port == 9001
+
+
+def test_build_parser_accepts_live_local_test_options() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "live-local-test",
+            "-c",
+            "configs/qb2_live_example.yaml",
+            "--duration-sec",
+            "15",
+            "--compare-tolerance",
+            "0.00001",
+            "--live-aggregate-timeout-sec",
+            "30",
+            "--local-cpu-cores",
+            "1",
+        ]
+    )
+
+    assert args.command == "live-local-test"
+    assert args.config == "configs/qb2_live_example.yaml"
+    assert args.duration_sec == 15
+    assert args.compare_tolerance == 0.00001
+    assert args.live_aggregate_timeout_sec == 30
+    assert args.local_cpu_cores == 1

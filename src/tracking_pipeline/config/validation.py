@@ -9,7 +9,7 @@ import yaml
 from tracking_pipeline.config.models import BenchmarkConfig, PipelineConfig
 
 
-SUPPORTED_INPUT_FORMATS = {"a42_pb", "qb2_live"}
+SUPPORTED_INPUT_FORMATS = {"a42_pb", "qb2_live", "frame_segment"}
 SUPPORTED_CLUSTERERS = {
     "dbscan",
     "euclidean_clustering",
@@ -107,6 +107,15 @@ def validate_config(config: PipelineConfig) -> None:
         for input_path in config.input.paths:
             if not Path(input_path).exists():
                 raise ConfigError(f"Input path does not exist: {input_path}")
+    elif config.input.format == "frame_segment":
+        if not config.input.paths:
+            raise ConfigError("input.paths must not be empty")
+        for input_path in config.input.paths:
+            path = Path(input_path)
+            if not path.exists():
+                raise ConfigError(f"Input path does not exist: {input_path}")
+            if not (path / "manifest.jsonl").is_file():
+                raise ConfigError(f"Frame segment manifest does not exist: {path / 'manifest.jsonl'}")
     elif config.input.format == "qb2_live":
         if config.input.qb2_live is None:
             raise ConfigError("input.qb2_live must be configured for input.format=qb2_live")
@@ -129,6 +138,8 @@ def validate_config(config: PipelineConfig) -> None:
             raise ConfigError("input.qb2_live.mqtt_drain_tolerance_sec must be >= 0")
         if float(live.mqtt_max_pending_age_sec) <= 0:
             raise ConfigError("input.qb2_live.mqtt_max_pending_age_sec must be > 0")
+        if int(live.mqtt_max_pending_labels) < 1:
+            raise ConfigError("input.qb2_live.mqtt_max_pending_labels must be >= 1")
         if int(live.mqtt.port) <= 0:
             raise ConfigError("input.qb2_live.mqtt.port must be > 0")
         if int(live.mqtt.keepalive) <= 0:
@@ -166,6 +177,16 @@ def validate_config(config: PipelineConfig) -> None:
         raise ConfigError("output.root_dir must not be empty")
     if not str(config.output.dataset_root_dir).strip():
         raise ConfigError("output.dataset_root_dir must not be empty")
+    if not isinstance(config.output.final_full_recompute, bool):
+        raise ConfigError("output.final_full_recompute must be a boolean")
+    if not isinstance(config.output.statistics_enabled, bool):
+        raise ConfigError("output.statistics_enabled must be a boolean")
+    if float(config.output.live_object_list_flush_interval_sec) < 0:
+        raise ConfigError("output.live_object_list_flush_interval_sec must be >= 0")
+    if float(config.output.live_artifact_flush_interval_sec) < 0:
+        raise ConfigError("output.live_artifact_flush_interval_sec must be >= 0")
+    if float(config.output.live_tracker_debug_flush_interval_sec) < 0:
+        raise ConfigError("output.live_tracker_debug_flush_interval_sec must be >= 0")
     if int(config.runtime.cpu_cores) < 0:
         raise ConfigError("runtime.cpu_cores must be >= 0")
     if not isinstance(config.aggregation.symmetry_completion, bool):
@@ -176,8 +197,6 @@ def validate_config(config: PipelineConfig) -> None:
         raise ConfigError("aggregation.truncate_after_lane_end_touch must be a boolean")
     if not isinstance(config.aggregation.enable_registration_underfill_fallback, bool):
         raise ConfigError("aggregation.enable_registration_underfill_fallback must be a boolean")
-    if not isinstance(config.aggregation.registration_preserve_anchor_points, bool):
-        raise ConfigError("aggregation.registration_preserve_anchor_points must be a boolean")
     if not isinstance(config.aggregation.enable_confidence_point_cap, bool):
         raise ConfigError("aggregation.enable_confidence_point_cap must be a boolean")
     if not isinstance(config.aggregation.enable_tail_bridge, bool):
@@ -226,8 +245,6 @@ def validate_config(config: PipelineConfig) -> None:
         raise ConfigError("aggregation.confidence_point_cap_max_points must be >= 1")
     if config.aggregation.confidence_point_cap_bins < 1:
         raise ConfigError("aggregation.confidence_point_cap_bins must be >= 1")
-    if config.aggregation.registration_max_tz is not None and float(config.aggregation.registration_max_tz) < 0:
-        raise ConfigError("aggregation.registration_max_tz must be >= 0")
     if config.tracking.min_track_hits < 1:
         raise ConfigError("tracking.min_track_hits must be >= 1")
     if config.postprocessing.stitching_max_gap < 0:

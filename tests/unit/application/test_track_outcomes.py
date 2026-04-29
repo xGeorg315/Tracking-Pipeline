@@ -124,3 +124,34 @@ def test_build_track_outcomes_prefers_last_active_predicted_state_for_playback_p
     assert outcome.last_frame_id == 102
     assert outcome.last_playback_index == 3
     assert np.allclose(outcome.last_center, predicted_center)
+
+
+def test_build_track_outcomes_accepts_incremental_playback_caches() -> None:
+    track = Track(track_id=7, hit_count=2, age=2, missed=0, ended_by_missed=False)
+    for frame_id, center_y in ((100, 1.0), (101, 2.0)):
+        center = np.array([0.0, center_y, 0.0], dtype=np.float32)
+        points = np.array([center], dtype=np.float32)
+        track.centers.append(center.copy())
+        track.frame_ids.append(frame_id)
+        track.world_points.append(points.copy())
+        track.local_points.append((points - center).astype(np.float32))
+        track.bbox_extents.append(np.array([0.1, 0.1, 0.1], dtype=np.float32))
+
+    result = AggregateResult(
+        track_id=7,
+        points=np.zeros((0, 3), dtype=np.float32),
+        selected_frame_ids=[100, 101],
+        status="saved",
+        metrics={"decision_stage": "saved", "decision_reason_code": "saved", "decision_summary": "saved"},
+    )
+
+    outcomes = build_track_outcomes(
+        {7: track},
+        [result],
+        frame_to_playback={100: 0, 101: 1},
+        last_active_by_track={7: {"playback_index": 5, "center": np.array([1.0, 9.0, 0.0], dtype=np.float32)}},
+    )
+
+    outcome = outcomes[7]
+    assert outcome.last_playback_index == 5
+    assert np.allclose(outcome.last_center, np.array([1.0, 9.0, 0.0], dtype=np.float32))

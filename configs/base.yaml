@@ -60,9 +60,7 @@ aggregation:
   registration_max_iter: 80
   registration_min_fitness: 0.25
   registration_max_translation: 3.2
-  registration_max_tz: null
   registration_allowed_dofs: [tx, ty, tz, roll, pitch, yaw]
-  registration_preserve_anchor_points: false
   global_registration_voxel: 0.12
   fusion_voxel_size: 0.05
   fusion_min_observations: 1

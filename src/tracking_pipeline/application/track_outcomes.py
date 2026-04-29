@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 
 from tracking_pipeline.domain.models import AggregateResult, FrameTrackingState, Track, TrackOutcomeDebug
@@ -8,14 +10,23 @@ from tracking_pipeline.domain.models import AggregateResult, FrameTrackingState,
 def build_track_outcomes(
     tracks: dict[int, Track],
     aggregate_results: list[AggregateResult] | dict[int, AggregateResult],
-    states: list[FrameTrackingState],
+    states: list[FrameTrackingState] | None = None,
+    *,
+    frame_to_playback: dict[int, int] | None = None,
+    last_active_by_track: dict[int, dict[str, Any]] | None = None,
 ) -> dict[int, TrackOutcomeDebug]:
     if isinstance(aggregate_results, dict):
         by_track_id = {int(track_id): result for track_id, result in aggregate_results.items()}
     else:
         by_track_id = {int(result.track_id): result for result in aggregate_results}
-    frame_to_playback = {int(state.frame_index): int(index) for index, state in enumerate(states)}
-    last_active_by_track = _last_active_track_states(states)
+    if frame_to_playback is None:
+        frame_to_playback = _frame_to_playback(states or [])
+    else:
+        frame_to_playback = {int(frame_index): int(playback_index) for frame_index, playback_index in frame_to_playback.items()}
+    if last_active_by_track is None:
+        last_active_by_track = _last_active_track_states(states or [])
+    else:
+        last_active_by_track = _normalize_last_active_by_track(last_active_by_track)
 
     outcomes: dict[int, TrackOutcomeDebug] = {}
     for track_id, track in sorted(tracks.items()):
@@ -60,6 +71,10 @@ def build_track_outcomes(
     return outcomes
 
 
+def _frame_to_playback(states: list[FrameTrackingState]) -> dict[int, int]:
+    return {int(state.frame_index): int(index) for index, state in enumerate(states)}
+
+
 def _last_active_track_states(states: list[FrameTrackingState]) -> dict[int, dict[str, int | np.ndarray]]:
     last_active_by_track: dict[int, dict[str, int | np.ndarray]] = {}
     for playback_index, state in enumerate(states):
@@ -69,6 +84,24 @@ def _last_active_track_states(states: list[FrameTrackingState]) -> dict[int, dic
                 "center": np.asarray(active_track.center, dtype=np.float32).copy(),
             }
     return last_active_by_track
+
+
+def _normalize_last_active_by_track(
+    last_active_by_track: dict[int, dict[str, Any]],
+) -> dict[int, dict[str, int | np.ndarray]]:
+    normalized: dict[int, dict[str, int | np.ndarray]] = {}
+    for track_id, payload in last_active_by_track.items():
+        if not isinstance(payload, dict):
+            continue
+        playback_index = payload.get("playback_index")
+        center = payload.get("center")
+        if playback_index is None or center is None:
+            continue
+        normalized[int(track_id)] = {
+            "playback_index": int(playback_index),
+            "center": np.asarray(center, dtype=np.float32).copy(),
+        }
+    return normalized
 
 
 def _track_debug_summary(track: Track) -> dict[str, int]:

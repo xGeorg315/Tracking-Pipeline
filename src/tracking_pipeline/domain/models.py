@@ -324,6 +324,10 @@ class RunSummary:
     output_dir: str
     postprocessing_methods: list[str] = field(default_factory=list)
     aggregate_status_counts: dict[str, int] = field(default_factory=dict)
+    articulated_vehicle_pair_count: int = 0
+    articulated_vehicle_track_count: int = 0
+    articulated_vehicle_merged_component_count: int = 0
+    articulated_vehicle_saved_count: int = 0
     track_quality_mean: float = 0.0
     object_list_exported_count: int = 0
     object_list_seen_ids: int = 0

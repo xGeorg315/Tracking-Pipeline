@@ -6,7 +6,7 @@ import os
 import sys
 import types
 
-from tracking_pipeline.application.run_pipeline import _LiveCliStatusWriter, _apply_runtime_limits
+from tracking_pipeline.application.run_pipeline import _LiveCliStatusWriter, _apply_runtime_limits, _format_live_status_line
 from tracking_pipeline.config.models import RuntimeConfig
 
 
@@ -54,6 +54,43 @@ def test_live_cli_status_writer_rewrites_multiline_status_in_place() -> None:
     rendered = stream.getvalue()
     assert "\033[1A" in rendered
     assert rendered.count("\033[2K") >= 2
+
+
+def test_format_live_status_line_includes_queue_and_drop_counters() -> None:
+    payload = {
+        "pipeline_phase": "processing_frames",
+        "processed_frames": 42,
+        "processing_recent_hz": 3.5,
+        "processing_total_hz": 2.25,
+        "active_track_count": 7,
+        "live_artifact_write_count": 4,
+        "live_object_list_write_count": 9,
+        "current_pipeline_step": "read_frames",
+        "current_pipeline_step_age_sec": 1.25,
+        "reader": {
+            "raw_frames_received": 42,
+            "mqtt_messages_received": 100,
+            "mqtt_snapshots_received": 95,
+            "pending_label_count": 3,
+            "pending_snapshot_count": 2,
+            "dropped_overflow_label_count": 11,
+            "dropped_stale_label_count": 1,
+            "mqtt_connected": True,
+            "waiting_for_first_raw_frame": False,
+            "last_raw_age_sec": 0.4,
+            "last_mqtt_age_sec": 0.2,
+            "reader_state": "streaming",
+        },
+    }
+
+    line = _format_live_status_line(payload)
+
+    assert "hz=3.50/2.25" in line
+    assert "q=3/2" in line
+    assert "drop=11/1" in line
+    assert "reconn=0" in line
+    assert "step=read_frames" in line
+    assert "step_age=1.2s" in line
 
 
 def test_apply_runtime_limits_uses_affinity_and_sets_thread_env(monkeypatch) -> None:

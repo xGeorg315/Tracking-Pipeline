@@ -82,7 +82,6 @@ class VoxelFusionAccumulator:
     _LONG_VEHICLE_TAIL_EXTENT_RATIO = 0.20
     _LONG_VEHICLE_TAIL_CANDIDATE_COUNT = 2
     _LONG_VEHICLE_REJECTED_CHUNK_WEIGHT = 0.35
-    _LONG_VEHICLE_MIN_PAIR_DISTANCE_M = 2.0
 
     def __init__(self, config: AggregationConfig, output_config: OutputConfig, tracking_config: TrackingConfig):
         self.config = config
@@ -275,11 +274,6 @@ class VoxelFusionAccumulator:
             selection_info,
             long_vehicle_mode_applied=long_vehicle_mode_applied,
         )
-        anchor_points_to_preserve, anchor_intensity_to_preserve = self._registration_anchor_points_to_preserve(
-            accumulation_input,
-            prepared_intensity,
-            registration_metrics,
-        )
         chunk_weights = self._chunk_weights(track, accumulation_input, registration_metrics, long_vehicle_mode_applied)
         confidence_chunk_weights = self._confidence_chunk_weights(accumulation_input, chunk_weights, registration_metrics)
         with component_profiler.stage("fusion_core"):
@@ -290,16 +284,12 @@ class VoxelFusionAccumulator:
                 confidence_chunk_weights,
                 min_observations=self._required_observations(len(accumulation_input)),
             )
-        fusion_skip_sum_threshold = max(0, int(self.config.fusion_skip_sum_if_vehicle_points_above))
-        fusion_sum_skipped = fusion_skip_sum_threshold > 0 and raw_points_total > fusion_skip_sum_threshold
         if len(fused_xyz) == 0:
             metrics = {
                 **self._base_metrics(track),
                 **selection_info,
                 **motion_deskew_metrics,
                 **registration_metrics,
-                "fusion_sum_skipped": bool(fusion_sum_skipped),
-                "fusion_skip_sum_threshold": int(fusion_skip_sum_threshold),
                 **self._aggregation_timing_metrics(component_profiler.snapshot()),
             }
             return self._result(
@@ -353,8 +343,6 @@ class VoxelFusionAccumulator:
                 "raw_point_count": raw_points_total,
                 "fusion_voxels_total": fusion_voxels_total,
                 "fusion_voxels_kept": fusion_voxels_kept,
-                "fusion_sum_skipped": bool(fusion_sum_skipped),
-                "fusion_skip_sum_threshold": int(fusion_skip_sum_threshold),
                 "point_count_after_fusion": prefilter_points,
                 "point_count_after_stat_filter": stat_filtered_points,
                 "point_count_after_downsample": final_points,
@@ -378,7 +366,6 @@ class VoxelFusionAccumulator:
             candidate_points_world = None
             candidate_intensity_world = None
             candidate_status = "missing"
-            preserved_anchor_points_appended = 0
 
             if final_points != 0:
                 point_count_before_confidence_cap = int(len(filtered_xyz))
@@ -403,34 +390,18 @@ class VoxelFusionAccumulator:
                     completed_intensity,
                     candidate_anchor_center_world,
                 )
+                metrics["point_count_after_downsample"] = int(len(completed_xyz))
                 point_count_after_confidence_cap = int(len(capped_xyz))
                 candidate_status = "available"
-            completed_xyz, completed_intensity, preserved_anchor_points_appended = self._append_registration_anchor_points(
-                completed_xyz if final_points != 0 else np.zeros((0, 3), dtype=np.float32),
-                completed_intensity if final_points != 0 else None,
-                anchor_points_to_preserve,
-                anchor_intensity_to_preserve,
-            )
-            metrics["registration_anchor_points_preserved"] = bool(self.config.registration_preserve_anchor_points)
-            metrics["registration_anchor_point_count"] = int(len(anchor_points_to_preserve))
-            metrics["registration_anchor_points_appended"] = int(preserved_anchor_points_appended)
-            metrics["point_count_after_downsample"] = int(len(completed_xyz))
-            if len(completed_xyz) > 0:
-                candidate_points_world, candidate_intensity_world = self._candidate_world_outputs(
-                    completed_xyz,
-                    completed_intensity,
-                    candidate_anchor_center_world,
-                )
-                candidate_status = "available"
-                if len(completed_xyz) < int(self.config.min_saved_aggregate_points):
+                if final_points < int(self.config.min_saved_aggregate_points):
                     result_status = "skipped_min_saved_points"
-                    result_point_count_after_downsample = int(len(completed_xyz))
+                    result_point_count_after_downsample = final_points
                 else:
                     quality_threshold = self._quality_threshold(long_vehicle_mode_applied)
                     if float(track.quality_score or 0.0) < quality_threshold:
                         metrics["quality_threshold"] = quality_threshold
                         result_status = "skipped_quality_threshold"
-                        result_point_count_after_downsample = int(len(completed_xyz))
+                        result_point_count_after_downsample = final_points
                         result_quality_threshold = quality_threshold
                     else:
                         result_status = "saved"
@@ -1037,7 +1008,6 @@ class VoxelFusionAccumulator:
         attempt_dropped_count = max(0, int(input_count - attempt_output_count))
         synced_metrics = dict(registration_metrics)
         synced_metrics["registration_input_chunk_count"] = int(input_count)
-        anchor_input_index = int(synced_metrics.get("registration_anchor_input_index", 0) or 0)
         chunk_weights = synced_metrics.get("registration_chunk_weights")
         if not isinstance(chunk_weights, list) or len(chunk_weights) != len(keep_indices):
             attempt_chunk_weights = [1.0 for _ in keep_indices]
@@ -1058,9 +1028,6 @@ class VoxelFusionAccumulator:
             effective_frame_ids = [int(frame_id) for frame_id in selected_frame_ids]
             effective_keep_indices = list(range(input_count))
             effective_chunk_weights = [1.0 for _ in effective_keep_indices]
-            effective_anchor_output_index = (
-                effective_keep_indices.index(anchor_input_index) if anchor_input_index in effective_keep_indices else 0
-            )
         else:
             effective_chunks = list(accumulation_input)
             effective_intensity = [prepared_intensity[index] for index in keep_indices]
@@ -1068,9 +1035,6 @@ class VoxelFusionAccumulator:
             effective_frame_ids = [int(selected_frame_ids[index]) for index in keep_indices]
             effective_keep_indices = list(keep_indices)
             effective_chunk_weights = attempt_chunk_weights
-            effective_anchor_output_index = (
-                keep_indices.index(anchor_input_index) if anchor_input_index in keep_indices else 0
-            )
         synced_metrics["registration_fallback_applied"] = bool(fallback_applied)
         synced_metrics["registration_fallback_min_kept_chunks"] = int(fallback_min_kept_chunks)
         synced_metrics["registration_attempt_output_chunk_count"] = attempt_output_count
@@ -1081,7 +1045,6 @@ class VoxelFusionAccumulator:
         synced_metrics["registration_dropped_count"] = max(0, int(input_count - len(effective_keep_indices)))
         synced_metrics["registration_keep_indices"] = list(effective_keep_indices)
         synced_metrics["registration_chunk_weights"] = list(effective_chunk_weights)
-        synced_metrics["registration_anchor_output_index"] = int(effective_anchor_output_index)
         return (
             effective_chunks,
             effective_intensity,
@@ -1357,8 +1320,6 @@ class VoxelFusionAccumulator:
             "chunk_quality_segment_end_frame": -1 if not frame_ids else int(frame_ids[-1]),
             "peak_chunk_point_count": 0,
             "peak_chunk_extent_norm": 0.0,
-            "front_candidate_frame_ids": [],
-            "front_candidate_kept_count": 0,
             "tail_candidate_frame_ids": [],
             "tail_candidate_kept_count": 0,
         }
@@ -1367,13 +1328,8 @@ class VoxelFusionAccumulator:
         if not self.config.chunk_quality_filter:
             return list(chunks), list(centers), list(frame_ids), empty_metrics
 
-        front_candidate_indices = (
-            self._long_vehicle_end_candidate_indices(chunks, centers, frame_ids, prefer_front=True)
-            if long_vehicle_mode_applied
-            else []
-        )
         tail_candidate_indices = (
-            self._long_vehicle_end_candidate_indices(chunks, centers, frame_ids, prefer_front=False)
+            self._long_vehicle_tail_candidate_indices(chunks, centers, frame_ids)
             if long_vehicle_mode_applied
             else []
         )
@@ -1419,19 +1375,17 @@ class VoxelFusionAccumulator:
                 start_idx, end_idx = self._expand_segment_around_peak(peak_index, total)
 
         kept_indices = list(range(start_idx, end_idx + 1))
-        if long_vehicle_mode_applied and (tail_candidate_indices or front_candidate_indices):
+        if long_vehicle_mode_applied and tail_candidate_indices:
             tail_point_ratio = min(float(self.config.chunk_min_points_ratio_to_peak), self._LONG_VEHICLE_TAIL_POINT_RATIO)
             tail_extent_ratio = min(float(self.config.chunk_min_extent_ratio_to_peak), self._LONG_VEHICLE_TAIL_EXTENT_RATIO)
             tail_point_threshold = tail_point_ratio * float(max(peak_point_count, 1))
             tail_extent_threshold = tail_extent_ratio * float(max(peak_extent_norm, 1e-6))
-            edge_candidate_indices = sorted(set(front_candidate_indices).union(tail_candidate_indices))
             tail_keep_indices = [
                 int(index)
-                for index in edge_candidate_indices
+                for index in tail_candidate_indices
                 if float(point_counts[index]) >= tail_point_threshold and float(extent_norms[index]) >= tail_extent_threshold
             ]
             kept_indices = sorted(set(kept_indices).union(tail_keep_indices))
-        kept_index_set = set(kept_indices)
         metrics = {
             "chunk_quality_filter_enabled": True,
             "chunk_quality_total": total,
@@ -1440,10 +1394,8 @@ class VoxelFusionAccumulator:
             "chunk_quality_segment_end_frame": int(frame_ids[max(kept_indices)]),
             "peak_chunk_point_count": peak_point_count,
             "peak_chunk_extent_norm": peak_extent_norm,
-            "front_candidate_frame_ids": [int(frame_ids[index]) for index in front_candidate_indices],
-            "front_candidate_kept_count": int(sum(1 for index in front_candidate_indices if index in kept_index_set)),
             "tail_candidate_frame_ids": [int(frame_ids[index]) for index in tail_candidate_indices],
-            "tail_candidate_kept_count": int(sum(1 for index in tail_candidate_indices if index in kept_index_set)),
+            "tail_candidate_kept_count": int(sum(1 for index in tail_candidate_indices if index in set(kept_indices))),
         }
         return (
             [chunks[index] for index in kept_indices],
@@ -1452,13 +1404,11 @@ class VoxelFusionAccumulator:
             metrics,
         )
 
-    def _long_vehicle_end_candidate_indices(
+    def _long_vehicle_tail_candidate_indices(
         self,
         chunks: list[np.ndarray],
         centers: list[np.ndarray],
         frame_ids: list[int],
-        *,
-        prefer_front: bool,
     ) -> list[int]:
         _ = frame_ids
         if not chunks:
@@ -1476,9 +1426,8 @@ class VoxelFusionAccumulator:
             rear_span = abs(float(np.min(signed))) if len(signed) else 0.0
             front_span = max(0.0, float(np.max(signed))) if len(signed) else 0.0
             total_span = rear_span + front_span
-            preferred_span = front_span if prefer_front else rear_span
-            preferred_ratio = 0.0 if total_span <= 1e-6 else preferred_span / total_span
-            scored.append((preferred_ratio, preferred_span, int(index)))
+            rear_ratio = 0.0 if total_span <= 1e-6 else rear_span / total_span
+            scored.append((rear_ratio, rear_span, int(index)))
         if not scored:
             return []
         scored.sort(key=lambda item: (item[0], item[1], -item[2]), reverse=True)
@@ -1520,36 +1469,15 @@ class VoxelFusionAccumulator:
                     continue
                 best_index = int(max(candidate_indices.tolist(), key=lambda idx: (int(point_counts[idx]), -idx)))
                 selected_indices.add(best_index)
-        front_candidate_frame_ids = [int(frame_id) for frame_id in selection_info.get("front_candidate_frame_ids", [])]
         tail_candidate_frame_ids = [int(frame_id) for frame_id in selection_info.get("tail_candidate_frame_ids", [])]
-        for frame_id in front_candidate_frame_ids + tail_candidate_frame_ids:
+        for frame_id in tail_candidate_frame_ids:
             index = frame_to_index.get(int(frame_id))
             if index is not None:
                 selected_indices.add(int(index))
-        anchor_candidate_index = self._long_vehicle_anchor_candidate_index(filtered_chunks)
-        if anchor_candidate_index is not None:
-            selected_indices.add(int(anchor_candidate_index))
-            support_candidate_index = self._long_vehicle_support_candidate_index(filtered_centers, anchor_candidate_index)
-            if support_candidate_index is not None:
-                selected_indices.add(int(support_candidate_index))
         ordered_indices = sorted(selected_indices)
-        ordered_frame_ids = {int(filtered_frame_ids[index]) for index in ordered_indices}
         augmented_info = dict(selection_info)
-        augmented_info["front_candidate_kept_count"] = int(
-            sum(1 for frame_id in front_candidate_frame_ids if int(frame_id) in ordered_frame_ids)
-        )
         augmented_info["tail_candidate_kept_count"] = int(
-            sum(1 for frame_id in tail_candidate_frame_ids if int(frame_id) in ordered_frame_ids)
-        )
-        augmented_info["long_vehicle_min_pair_distance_m"] = float(self._LONG_VEHICLE_MIN_PAIR_DISTANCE_M)
-        augmented_info["long_vehicle_anchor_candidate_frame_id"] = (
-            int(filtered_frame_ids[anchor_candidate_index]) if anchor_candidate_index is not None else -1
-        )
-        augmented_info["long_vehicle_support_frame_id"] = (
-            int(filtered_frame_ids[support_candidate_index]) if support_candidate_index is not None else -1
-        )
-        augmented_info["long_vehicle_min_pair_applied"] = bool(
-            anchor_candidate_index is not None and support_candidate_index is not None
+            sum(1 for frame_id in tail_candidate_frame_ids if int(frame_id) in {int(filtered_frame_ids[index]) for index in ordered_indices})
         )
         augmented_info["long_vehicle_coverage_bins_selected"] = 3
         return (
@@ -1558,49 +1486,6 @@ class VoxelFusionAccumulator:
             [int(filtered_frame_ids[index]) for index in ordered_indices],
             augmented_info,
         )
-
-    def _long_vehicle_anchor_candidate_index(self, chunks: list[np.ndarray]) -> int | None:
-        if not chunks:
-            return None
-        axis_idx = axis_to_index(self.config.frame_selection_line_axis)
-        lateral_idx, _ = orthogonal_axes(axis_idx)
-
-        def _score(index: int) -> tuple[float, float, float, float, int]:
-            points = np.asarray(chunks[index], dtype=np.float32)
-            if len(points) == 0:
-                return (0.0, 0.0, 0.0, 0.0, -int(index))
-            extent = compute_extent(points).astype(np.float64, copy=False)
-            longitudinal_extent = float(extent[axis_idx])
-            lateral_extent = float(extent[lateral_idx])
-            return (
-                longitudinal_extent * lateral_extent,
-                longitudinal_extent,
-                lateral_extent,
-                float(len(points)),
-                -int(index),
-            )
-
-        return int(max(range(len(chunks)), key=_score))
-
-    def _long_vehicle_support_candidate_index(self, centers: list[np.ndarray], anchor_index: int) -> int | None:
-        if not centers or anchor_index < 0 or anchor_index >= len(centers):
-            return None
-        axis_idx = axis_to_index(self.config.frame_selection_line_axis)
-        direction = self._track_motion_direction(centers)
-        anchor_center = np.asarray(centers[anchor_index], dtype=np.float64)
-        anchor_position = float(anchor_center[axis_idx]) * float(direction)
-        support_candidates: list[tuple[float, int]] = []
-        for index, center in enumerate(centers):
-            if index == anchor_index:
-                continue
-            center_position = float(np.asarray(center, dtype=np.float64)[axis_idx]) * float(direction)
-            signed_gap = anchor_position - center_position
-            if signed_gap >= float(self._LONG_VEHICLE_MIN_PAIR_DISTANCE_M):
-                support_candidates.append((signed_gap, int(index)))
-        if not support_candidates:
-            return None
-        support_candidates.sort(key=lambda item: (item[0], item[1]))
-        return int(support_candidates[0][1])
 
     def _restore_long_vehicle_rejected_chunks(
         self,
@@ -1619,8 +1504,6 @@ class VoxelFusionAccumulator:
         long_vehicle_mode_applied: bool,
     ) -> tuple[list[np.ndarray], list[np.ndarray | None], list[np.ndarray], list[int], dict[str, Any]]:
         metrics = dict(registration_metrics)
-        metrics.setdefault("front_registration_rejected_count", 0)
-        metrics.setdefault("front_fallback_used", False)
         metrics.setdefault("rear_registration_rejected_count", 0)
         metrics.setdefault("rear_fallback_used", False)
         if not long_vehicle_mode_applied or len(prepared_chunks) <= len(accumulation_input):
@@ -1633,25 +1516,13 @@ class VoxelFusionAccumulator:
         if not dropped_indices:
             return accumulation_input, prepared_intensity, selected_centers, selected_frame_ids, metrics
 
-        front_candidate_frame_ids = {int(frame_id) for frame_id in selection_info.get("front_candidate_frame_ids", [])}
         tail_candidate_frame_ids = {int(frame_id) for frame_id in selection_info.get("tail_candidate_frame_ids", [])}
         role = str(track.state.get("long_vehicle_component_role") or track.state.get("articulated_role") or "")
-        dropped_frame_ids = {
-            int(selected_frame_ids[index])
-            for index in dropped_indices
-            if index < len(selected_frame_ids)
-        }
-        dropped_front_frame_ids = dropped_frame_ids.intersection(front_candidate_frame_ids)
-        dropped_rear_frame_ids = dropped_frame_ids.intersection(tail_candidate_frame_ids)
-        should_fallback = (
-            bool(role in {"rear", "fragment"} and dropped_rear_frame_ids)
-            or bool(role in {"lead", "front", "fragment"} and dropped_front_frame_ids)
-            or bool(dropped_front_frame_ids)
-            or bool(dropped_rear_frame_ids)
+        should_fallback = bool(role in {"rear", "fragment"}) or any(
+            int(selected_frame_ids[index]) in tail_candidate_frame_ids for index in dropped_indices if index < len(selected_frame_ids)
         )
         if not should_fallback:
-            metrics["front_registration_rejected_count"] = int(len(dropped_front_frame_ids))
-            metrics["rear_registration_rejected_count"] = int(len(dropped_rear_frame_ids))
+            metrics["rear_registration_rejected_count"] = int(len(dropped_indices))
             return accumulation_input, prepared_intensity, selected_centers, selected_frame_ids, metrics
 
         kept_set = set(keep_indices)
@@ -1674,10 +1545,8 @@ class VoxelFusionAccumulator:
         metrics["registration_keep_indices"] = list(range(len(restored_chunks)))
         metrics["registration_output_chunk_count"] = int(len(restored_chunks))
         metrics["registration_dropped_count"] = max(0, int(len(prepared_chunks) - len(restored_chunks)))
-        metrics["front_registration_rejected_count"] = int(len(dropped_front_frame_ids))
-        metrics["rear_registration_rejected_count"] = int(len(dropped_rear_frame_ids))
-        metrics["front_fallback_used"] = bool(dropped_front_frame_ids)
-        metrics["rear_fallback_used"] = bool(dropped_rear_frame_ids)
+        metrics["rear_registration_rejected_count"] = int(len(dropped_indices))
+        metrics["rear_fallback_used"] = True
         return restored_chunks, restored_intensity, restored_centers, restored_frame_ids, metrics
 
     def _track_motion_direction(self, centers: list[np.ndarray]) -> float:
@@ -1695,75 +1564,6 @@ class VoxelFusionAccumulator:
         if track.centers:
             return np.asarray(np.median(np.asarray(track.centers, dtype=np.float32), axis=0), dtype=np.float32)
         return np.zeros((3,), dtype=np.float32)
-
-    def _registration_anchor_points_to_preserve(
-        self,
-        accumulation_input: list[np.ndarray],
-        prepared_intensity: list[np.ndarray | None],
-        registration_metrics: dict[str, Any],
-    ) -> tuple[np.ndarray, np.ndarray | None]:
-        if self.fusion_method != "registration_voxel_fusion" or not bool(self.config.registration_preserve_anchor_points):
-            return np.zeros((0, 3), dtype=np.float32), None
-        if not accumulation_input:
-            return np.zeros((0, 3), dtype=np.float32), None
-        anchor_output_index = int(registration_metrics.get("registration_anchor_output_index", 0) or 0)
-        if anchor_output_index < 0 or anchor_output_index >= len(accumulation_input):
-            anchor_output_index = 0
-        anchor_points = np.asarray(accumulation_input[anchor_output_index], dtype=np.float32)
-        anchor_intensity = None
-        if prepared_intensity:
-            anchor_values = prepared_intensity[anchor_output_index]
-            if anchor_values is not None and len(np.asarray(anchor_values, dtype=np.float32)) == len(anchor_points):
-                anchor_intensity = np.asarray(anchor_values, dtype=np.float32).copy()
-        return anchor_points.copy(), anchor_intensity
-
-    def _append_registration_anchor_points(
-        self,
-        points: np.ndarray,
-        intensity: np.ndarray | None,
-        anchor_points: np.ndarray,
-        anchor_intensity: np.ndarray | None,
-    ) -> tuple[np.ndarray, np.ndarray | None, int]:
-        current_points = np.asarray(points, dtype=np.float32)
-        fixed_points = np.asarray(anchor_points, dtype=np.float32)
-        if len(fixed_points) == 0:
-            current_intensity = None if intensity is None else np.asarray(intensity, dtype=np.float32)
-            return current_points, current_intensity, 0
-
-        existing_rows = {tuple(float(value) for value in row.tolist()) for row in current_points}
-        append_indices = [
-            index
-            for index, row in enumerate(fixed_points)
-            if tuple(float(value) for value in row.tolist()) not in existing_rows
-        ]
-        if not append_indices:
-            current_intensity = None if intensity is None else np.asarray(intensity, dtype=np.float32)
-            return current_points, current_intensity, 0
-
-        appended_points = fixed_points[np.asarray(append_indices, dtype=np.int32)]
-        combined_points = (
-            appended_points.astype(np.float32, copy=False)
-            if len(current_points) == 0
-            else np.vstack([current_points, appended_points]).astype(np.float32, copy=False)
-        )
-
-        current_intensity = None if intensity is None else np.asarray(intensity, dtype=np.float32)
-        if anchor_intensity is None or len(np.asarray(anchor_intensity, dtype=np.float32)) != len(fixed_points):
-            if current_intensity is not None and len(current_intensity) == len(current_points):
-                return combined_points, None, len(append_indices)
-            return combined_points, current_intensity, len(append_indices)
-
-        appended_intensity = np.asarray(anchor_intensity, dtype=np.float32)[np.asarray(append_indices, dtype=np.int32)]
-        if current_intensity is None:
-            return combined_points, appended_intensity.astype(np.float32, copy=False), len(append_indices)
-        if len(current_intensity) != len(current_points):
-            return combined_points, None, len(append_indices)
-        combined_intensity = (
-            appended_intensity.astype(np.float32, copy=False)
-            if len(current_intensity) == 0
-            else np.concatenate([current_intensity, appended_intensity], axis=0).astype(np.float32, copy=False)
-        )
-        return combined_points, combined_intensity, len(append_indices)
 
     def _candidate_world_outputs(
         self,
@@ -1932,7 +1732,6 @@ class VoxelFusionAccumulator:
             for points, intensity in zip(chunks, intensities)
         )
         raw_points = 0
-        skip_sum_threshold = max(0, int(getattr(self.config, "fusion_skip_sum_if_vehicle_points_above", 0) or 0))
         chunk_voxels: list[np.ndarray] = []
         chunk_point_means: list[np.ndarray] = []
         chunk_weights_per_voxel: list[np.ndarray] = []
@@ -1954,8 +1753,6 @@ class VoxelFusionAccumulator:
             confidence_weights_per_voxel.append(np.full((group_count,), confidence_weight, dtype=np.float64))
             if has_intensity and intensity_means is not None:
                 chunk_intensity_means.append(intensity_means)
-            if skip_sum_threshold > 0 and raw_points > skip_sum_threshold:
-                break
         if not chunk_voxels:
             return np.zeros((0, 3), dtype=np.float32), None, np.zeros((0,), dtype=np.float32), raw_points, 0, 0
 
