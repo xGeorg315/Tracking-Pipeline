@@ -202,10 +202,17 @@ class VoxelFusionAccumulator:
         )
         candidate_anchor_center_world = self._candidate_anchor_center_world(selected_centers, track)
         if not self.output_config.save_world:
-            selected_chunks = [
-                (np.asarray(points, dtype=np.float32) - np.asarray(center, dtype=np.float32)).astype(np.float32, copy=False)
-                for points, center in zip(selected_chunks, selected_centers)
-            ]
+            if self._use_tracker_pose_icp_init():
+                anchor_center = np.asarray(candidate_anchor_center_world, dtype=np.float32)
+                selected_chunks = [
+                    (np.asarray(points, dtype=np.float32) - anchor_center).astype(np.float32, copy=False)
+                    for points in selected_chunks
+                ]
+            else:
+                selected_chunks = [
+                    (np.asarray(points, dtype=np.float32) - np.asarray(center, dtype=np.float32)).astype(np.float32, copy=False)
+                    for points, center in zip(selected_chunks, selected_centers)
+                ]
 
         selected_triplets = [
             (
@@ -232,11 +239,22 @@ class VoxelFusionAccumulator:
                 prepared_chunk_count=0,
             )
 
+        registration_initial_guesses = self._registration_initial_guesses(selected_centers)
         if self._should_profile_registration():
             with component_profiler.stage("registration"):
-                accumulation_input, registration_metrics = self._prepare_for_fusion(prepared_chunks)
+                accumulation_input, registration_metrics = self._prepare_for_fusion(
+                    prepared_chunks,
+                    initial_guesses=registration_initial_guesses,
+                )
         else:
-            accumulation_input, registration_metrics = self._prepare_for_fusion(prepared_chunks)
+            accumulation_input, registration_metrics = self._prepare_for_fusion(
+                prepared_chunks,
+                initial_guesses=registration_initial_guesses,
+            )
+        if registration_initial_guesses is not None:
+            registration_metrics = dict(registration_metrics)
+            registration_metrics["registration_init_source"] = "kalman_centers"
+            registration_metrics["registration_init_reference_frame_id"] = int(selected_frame_ids[0]) if selected_frame_ids else -1
         pre_registration_centers = [np.asarray(center, dtype=np.float32).copy() for center in selected_centers]
         pre_registration_frame_ids = [int(frame_id) for frame_id in selected_frame_ids]
         pre_registration_intensity = [None if values is None else np.asarray(values, dtype=np.float32).copy() for values in prepared_intensity]
@@ -968,7 +986,12 @@ class VoxelFusionAccumulator:
             return float(base_plane)
         return float(robust_midpoint)
 
-    def _prepare_for_fusion(self, chunks: list[np.ndarray]) -> tuple[list[np.ndarray], dict[str, Any]]:
+    def _prepare_for_fusion(
+        self,
+        chunks: list[np.ndarray],
+        *,
+        initial_guesses: list[np.ndarray | None] | None = None,
+    ) -> tuple[list[np.ndarray], dict[str, Any]]:
         return chunks, {
             "alignment_method": "none",
             "registration_backend": "disabled",
@@ -980,7 +1003,26 @@ class VoxelFusionAccumulator:
             "registration_dropped_count": 0,
             "registration_keep_indices": list(range(len(chunks))),
             "registration_chunk_weights": [1.0 for _ in chunks],
+            "registration_init_translations": []
         }
+
+    def _use_tracker_pose_icp_init(self) -> bool:
+        return (
+            self.fusion_method == "registration_voxel_fusion"
+            and str(self.tracking_config.algorithm) in {"kalman_nn", "hungarian_kalman"}
+        )
+
+    def _registration_initial_guesses(self, selected_centers: list[np.ndarray]) -> list[np.ndarray | None] | None:
+        if not self._use_tracker_pose_icp_init() or len(selected_centers) <= 1:
+            return None
+        reference_center = np.asarray(selected_centers[0], dtype=np.float64)
+        initial_guesses: list[np.ndarray | None] = [np.eye(4, dtype=np.float64)]
+        for center in selected_centers[1:]:
+            current_center = np.asarray(center, dtype=np.float64)
+            init = np.eye(4, dtype=np.float64)
+            init[:3, 3] = reference_center - current_center
+            initial_guesses.append(init)
+        return initial_guesses
 
     def _apply_registration_subset(
         self,

@@ -16,5 +16,10 @@ class RegistrationVoxelFusionAccumulator(VoxelFusionAccumulator):
         super().__init__(config, output_config, tracking_config)
         self.backend = build_registration_backend(config)
 
-    def _prepare_for_fusion(self, chunks: list[np.ndarray]) -> tuple[list[np.ndarray], dict[str, Any]]:
-        return self.backend.align_chunks(chunks)
+    def _prepare_for_fusion(
+        self,
+        chunks: list[np.ndarray],
+        *,
+        initial_guesses: list[np.ndarray | None] | None = None,
+    ) -> tuple[list[np.ndarray], dict[str, Any]]:
+        return self.backend.align_chunks(chunks, initial_guesses=initial_guesses)

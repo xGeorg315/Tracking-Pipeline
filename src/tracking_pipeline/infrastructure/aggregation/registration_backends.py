@@ -29,6 +29,22 @@ def _canonicalize_registration_allowed_dofs(raw_dofs: list[str] | tuple[str, ...
     return tuple(ordered)
 
 
+def _canonicalize_registration_max_dof_change(raw_limits: dict[str, float] | None) -> dict[str, float]:
+    if not isinstance(raw_limits, dict):
+        return {}
+    normalized: dict[str, float] = {}
+    for raw_dof, raw_limit in raw_limits.items():
+        dof = str(raw_dof).strip().lower()
+        try:
+            limit = float(raw_limit)
+        except (TypeError, ValueError):
+            continue
+        if dof not in _ALL_REGISTRATION_DOFS or limit < 0.0:
+            continue
+        normalized[dof] = limit
+    return {dof: normalized[dof] for dof in _ALL_REGISTRATION_DOFS if dof in normalized}
+
+
 def _nearest_rotation_matrix(rotation: np.ndarray) -> np.ndarray:
     u, _, vh = np.linalg.svd(np.asarray(rotation, dtype=np.float64))
     nearest = u @ vh
@@ -70,8 +86,13 @@ class _BaseRegistrationBackend:
         self.config = config
         self._allowed_dofs = _canonicalize_registration_allowed_dofs(config.registration_allowed_dofs)
         self._allowed_dofs_set = set(self._allowed_dofs)
+        self._max_dof_change = _canonicalize_registration_max_dof_change(config.registration_max_dof_change)
 
-    def align_chunks(self, chunks: list[np.ndarray]) -> tuple[list[np.ndarray], dict[str, Any]]:
+    def align_chunks(
+        self,
+        chunks: list[np.ndarray],
+        initial_guesses: list[np.ndarray | None] | None = None,
+    ) -> tuple[list[np.ndarray], dict[str, Any]]:
         if len(chunks) <= 1:
             return list(chunks), self._empty_info(len(chunks))
         aligned = [chunks[0].copy()]
@@ -83,6 +104,7 @@ class _BaseRegistrationBackend:
         fitness_values: list[float] = []
         rmse_values: list[float] = []
         backend_counts: Counter[str] = Counter()
+        init_translations: list[list[float]] = []
 
         for source_index, source in enumerate(chunks[1:], start=1):
             if len(source) < 8 or len(model) < 8:
@@ -90,7 +112,17 @@ class _BaseRegistrationBackend:
                 continue
             pairs += 1
             try:
-                transform, fitness, rmse = self._register_pair(source, model)
+                init_transform = None
+                if isinstance(initial_guesses, list) and source_index < len(initial_guesses):
+                    candidate = initial_guesses[source_index]
+                    if candidate is not None:
+                        arr = np.asarray(candidate, dtype=np.float64)
+                        if arr.shape == (4, 4):
+                            init_transform = arr
+                if init_transform is None:
+                    init_transform = np.eye(4, dtype=np.float64)
+                init_translations.append(init_transform[:3, 3].astype(np.float64).tolist())
+                transform, fitness, rmse = self._register_pair(source, model, init_transform=init_transform)
                 raw_transform = np.asarray(transform, dtype=np.float64)
                 transform = self._constrain_transform(raw_transform)
                 fitness, rmse = self._evaluate_transform_if_needed(
@@ -134,6 +166,8 @@ class _BaseRegistrationBackend:
             "registration_pair_fitness": fitness_values,
             "registration_chunk_weights": chunk_weights,
             "registration_allowed_dofs": list(self._allowed_dofs),
+            "registration_max_dof_change": dict(self._max_dof_change),
+            "registration_init_translations": init_translations,
             "registration_input_chunk_count": int(len(chunks)),
             "registration_output_chunk_count": int(len(aligned)),
             "registration_dropped_count": int(len(chunks) - len(aligned)),
@@ -155,6 +189,8 @@ class _BaseRegistrationBackend:
             "registration_pair_fitness": [],
             "registration_chunk_weights": [1.0 for _ in keep_indices],
             "registration_allowed_dofs": list(self._allowed_dofs),
+            "registration_max_dof_change": dict(self._max_dof_change),
+            "registration_init_translations": [],
             "registration_input_chunk_count": int(chunk_count),
             "registration_output_chunk_count": int(chunk_count),
             "registration_dropped_count": 0,
@@ -166,30 +202,48 @@ class _BaseRegistrationBackend:
         matrix = np.asarray(transform, dtype=np.float64)
         if matrix.shape != (4, 4):
             return matrix
-        if self._allowed_dofs_set == set(_ALL_REGISTRATION_DOFS):
+        if self._allowed_dofs_set == set(_ALL_REGISTRATION_DOFS) and not self._max_dof_change:
             return matrix.copy()
         constrained = np.eye(4, dtype=np.float64)
         translation = matrix[:3, 3].copy()
         for dof, axis in _TRANSLATION_DOF_TO_AXIS.items():
             if dof not in self._allowed_dofs_set:
                 translation[axis] = 0.0
+                continue
+            translation[axis] = self._clamp_dof_value(dof, translation[axis])
         constrained[:3, 3] = translation
         rotation = _nearest_rotation_matrix(matrix[:3, :3])
         if not any(dof in self._allowed_dofs_set for dof in _ROTATION_DOFS):
             constrained[:3, :3] = np.eye(3, dtype=np.float64)
             return constrained
-        if all(dof in self._allowed_dofs_set for dof in _ROTATION_DOFS):
+        if all(dof in self._allowed_dofs_set for dof in _ROTATION_DOFS) and not any(
+            dof in self._max_dof_change for dof in _ROTATION_DOFS
+        ):
             constrained[:3, :3] = rotation
             return constrained
         roll, pitch, yaw = _rotation_matrix_to_roll_pitch_yaw(rotation)
         if "roll" not in self._allowed_dofs_set:
             roll = 0.0
+        else:
+            roll = self._clamp_dof_value("roll", roll)
         if "pitch" not in self._allowed_dofs_set:
             pitch = 0.0
+        else:
+            pitch = self._clamp_dof_value("pitch", pitch)
         if "yaw" not in self._allowed_dofs_set:
             yaw = 0.0
+        else:
+            yaw = self._clamp_dof_value("yaw", yaw)
         constrained[:3, :3] = _roll_pitch_yaw_to_matrix(roll, pitch, yaw)
         return constrained
+
+    def _clamp_dof_value(self, dof: str, value: float) -> float:
+        limit = self._max_dof_change.get(dof)
+        if limit is None:
+            return float(value)
+        if dof in _ROTATION_DOFS:
+            limit = np.deg2rad(limit)
+        return float(np.clip(float(value), -float(limit), float(limit)))
 
     def _evaluate_transform_if_needed(
         self,
@@ -213,7 +267,13 @@ class _BaseRegistrationBackend:
         except Exception:
             return float(fitness), float(rmse)
 
-    def _register_pair(self, source_xyz: np.ndarray, target_xyz: np.ndarray) -> tuple[np.ndarray, float, float]:
+    def _register_pair(
+        self,
+        source_xyz: np.ndarray,
+        target_xyz: np.ndarray,
+        *,
+        init_transform: np.ndarray,
+    ) -> tuple[np.ndarray, float, float]:
         raise NotImplementedError
 
 
@@ -240,7 +300,13 @@ class SmallGICPRegistrationBackend(_BaseRegistrationBackend):
         except Exception:
             return None
 
-    def _register_pair(self, source_xyz: np.ndarray, target_xyz: np.ndarray) -> tuple[np.ndarray, float, float]:
+    def _register_pair(
+        self,
+        source_xyz: np.ndarray,
+        target_xyz: np.ndarray,
+        *,
+        init_transform: np.ndarray,
+    ) -> tuple[np.ndarray, float, float]:
         small_gicp = self._small_gicp
         assert small_gicp is not None
         source = np.asarray(source_xyz, dtype=np.float64)
@@ -319,14 +385,20 @@ class SmallGICPRegistrationBackend(_BaseRegistrationBackend):
 class ICPPointToPlaneRegistrationBackend(_BaseRegistrationBackend):
     name = "icp_point_to_plane"
 
-    def _register_pair(self, source_xyz: np.ndarray, target_xyz: np.ndarray) -> tuple[np.ndarray, float, float]:
+    def _register_pair(
+        self,
+        source_xyz: np.ndarray,
+        target_xyz: np.ndarray,
+        *,
+        init_transform: np.ndarray,
+    ) -> tuple[np.ndarray, float, float]:
         source = estimate_normals(source_xyz, radius=max(0.2, self.config.frame_downsample_voxel * 4.0))
         target = estimate_normals(target_xyz, radius=max(0.2, self.config.frame_downsample_voxel * 4.0))
         result = o3d.pipelines.registration.registration_icp(
             source,
             target,
             max_correspondence_distance=float(self.config.registration_max_corr_dist),
-            init=np.eye(4),
+            init=np.asarray(init_transform, dtype=np.float64),
             estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
             criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=int(self.config.registration_max_iter)),
         )
@@ -336,14 +408,20 @@ class ICPPointToPlaneRegistrationBackend(_BaseRegistrationBackend):
 class GeneralizedICPRegistrationBackend(_BaseRegistrationBackend):
     name = "generalized_icp"
 
-    def _register_pair(self, source_xyz: np.ndarray, target_xyz: np.ndarray) -> tuple[np.ndarray, float, float]:
+    def _register_pair(
+        self,
+        source_xyz: np.ndarray,
+        target_xyz: np.ndarray,
+        *,
+        init_transform: np.ndarray,
+    ) -> tuple[np.ndarray, float, float]:
         source = estimate_normals(source_xyz, radius=max(0.2, self.config.frame_downsample_voxel * 4.0))
         target = estimate_normals(target_xyz, radius=max(0.2, self.config.frame_downsample_voxel * 4.0))
         result = o3d.pipelines.registration.registration_generalized_icp(
             source,
             target,
             max_correspondence_distance=float(self.config.registration_max_corr_dist),
-            init=np.eye(4),
+            init=np.asarray(init_transform, dtype=np.float64),
             criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=int(self.config.registration_max_iter)),
         )
         return np.asarray(result.transformation), float(result.fitness), float(result.inlier_rmse)
@@ -352,7 +430,13 @@ class GeneralizedICPRegistrationBackend(_BaseRegistrationBackend):
 class FeatureGlobalThenLocalRegistrationBackend(_BaseRegistrationBackend):
     name = "feature_global_then_local"
 
-    def _register_pair(self, source_xyz: np.ndarray, target_xyz: np.ndarray) -> tuple[np.ndarray, float, float]:
+    def _register_pair(
+        self,
+        source_xyz: np.ndarray,
+        target_xyz: np.ndarray,
+        *,
+        init_transform: np.ndarray,
+    ) -> tuple[np.ndarray, float, float]:
         voxel = max(float(self.config.global_registration_voxel), 0.05)
         source_down = voxel_downsample_numpy(source_xyz, voxel)
         target_down = voxel_downsample_numpy(target_xyz, voxel)
@@ -402,7 +486,11 @@ class KissMatcherICPRegistrationBackend(_BaseRegistrationBackend):
         self._kiss_matcher = self._try_import("kiss_matcher")
         self._small_gicp = None
 
-    def align_chunks(self, chunks: list[np.ndarray]) -> tuple[list[np.ndarray], dict[str, Any]]:
+    def align_chunks(
+        self,
+        chunks: list[np.ndarray],
+        initial_guesses: list[np.ndarray | None] | None = None,
+    ) -> tuple[list[np.ndarray], dict[str, Any]]:
         if self._kiss_matcher is None:
             return list(chunks), {
                 **self._empty_info(len(chunks)),
@@ -410,7 +498,7 @@ class KissMatcherICPRegistrationBackend(_BaseRegistrationBackend):
                 "alignment_method": "unavailable",
                 "registration_skipped": True,
             }
-        return super().align_chunks(chunks)
+        return super().align_chunks(chunks, initial_guesses=initial_guesses)
 
     def _try_import(self, module_name: str):
         try:
@@ -418,7 +506,13 @@ class KissMatcherICPRegistrationBackend(_BaseRegistrationBackend):
         except Exception:
             return None
 
-    def _register_pair(self, source_xyz: np.ndarray, target_xyz: np.ndarray) -> tuple[np.ndarray, float, float]:
+    def _register_pair(
+        self,
+        source_xyz: np.ndarray,
+        target_xyz: np.ndarray,
+        *,
+        init_transform: np.ndarray,
+    ) -> tuple[np.ndarray, float, float]:
         assert self._kiss_matcher is not None
         source = np.asarray(source_xyz, dtype=np.float64)
         target = np.asarray(target_xyz, dtype=np.float64)
@@ -581,7 +675,11 @@ class KissMatcherRegistrationBackend(KissMatcherICPRegistrationBackend):
         self._kiss_matcher = self._try_import("kiss_matcher")
         self._small_gicp = None
 
-    def align_chunks(self, chunks: list[np.ndarray]) -> tuple[list[np.ndarray], dict[str, Any]]:
+    def align_chunks(
+        self,
+        chunks: list[np.ndarray],
+        initial_guesses: list[np.ndarray | None] | None = None,
+    ) -> tuple[list[np.ndarray], dict[str, Any]]:
         if self._kiss_matcher is None:
             return list(chunks), {
                 **self._empty_info(len(chunks)),
@@ -589,9 +687,15 @@ class KissMatcherRegistrationBackend(KissMatcherICPRegistrationBackend):
                 "alignment_method": "unavailable",
                 "registration_skipped": True,
             }
-        return _BaseRegistrationBackend.align_chunks(self, chunks)
+        return _BaseRegistrationBackend.align_chunks(self, chunks, initial_guesses=initial_guesses)
 
-    def _register_pair(self, source_xyz: np.ndarray, target_xyz: np.ndarray) -> tuple[np.ndarray, float, float]:
+    def _register_pair(
+        self,
+        source_xyz: np.ndarray,
+        target_xyz: np.ndarray,
+        *,
+        init_transform: np.ndarray,
+    ) -> tuple[np.ndarray, float, float]:
         module = self._kiss_matcher
         assert module is not None
         source = np.asarray(source_xyz, dtype=np.float64)

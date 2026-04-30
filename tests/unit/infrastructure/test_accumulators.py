@@ -232,7 +232,14 @@ class _ScriptedRegistrationBackend(_BaseRegistrationBackend):
         self.scripted_results = list(scripted_results)
         self.seen_targets: list[np.ndarray] = []
 
-    def _register_pair(self, source_xyz: np.ndarray, target_xyz: np.ndarray) -> tuple[np.ndarray, float, float]:
+    def _register_pair(
+        self,
+        source_xyz: np.ndarray,
+        target_xyz: np.ndarray,
+        *,
+        init_transform: np.ndarray,
+    ) -> tuple[np.ndarray, float, float]:
+        _ = init_transform
         self.seen_targets.append(np.asarray(target_xyz, dtype=np.float32).copy())
         fitness, translation_x = self.scripted_results.pop(0)
         transform = np.eye(4, dtype=np.float64)
@@ -249,15 +256,27 @@ class _ScriptedTransformRegistrationBackend(_BaseRegistrationBackend):
         self.fitness = float(fitness)
         self.rmse = float(rmse)
 
-    def _register_pair(self, source_xyz: np.ndarray, target_xyz: np.ndarray) -> tuple[np.ndarray, float, float]:
-        _ = source_xyz, target_xyz
+    def _register_pair(
+        self,
+        source_xyz: np.ndarray,
+        target_xyz: np.ndarray,
+        *,
+        init_transform: np.ndarray,
+    ) -> tuple[np.ndarray, float, float]:
+        _ = source_xyz, target_xyz, init_transform
         return self.transform.copy(), self.fitness, self.rmse
 
 
 class _SubsetRegistrationAccumulator(VoxelFusionAccumulator):
     fusion_method = "registration_voxel_fusion"
 
-    def _prepare_for_fusion(self, chunks: list[np.ndarray]) -> tuple[list[np.ndarray], dict[str, object]]:
+    def _prepare_for_fusion(
+        self,
+        chunks: list[np.ndarray],
+        *,
+        initial_guesses: list[np.ndarray | None] | None = None,
+    ) -> tuple[list[np.ndarray], dict[str, object]]:
+        _ = initial_guesses
         return [chunks[0], chunks[2]], {
             "alignment_method": "scripted",
             "registration_backend": "scripted",
@@ -289,7 +308,13 @@ class _ScriptedPrepareAccumulator(VoxelFusionAccumulator):
         self.keep_indices = list(keep_indices)
         self.chunk_weights = None if chunk_weights is None else [float(weight) for weight in chunk_weights]
 
-    def _prepare_for_fusion(self, chunks: list[np.ndarray]) -> tuple[list[np.ndarray], dict[str, object]]:
+    def _prepare_for_fusion(
+        self,
+        chunks: list[np.ndarray],
+        *,
+        initial_guesses: list[np.ndarray | None] | None = None,
+    ) -> tuple[list[np.ndarray], dict[str, object]]:
+        _ = initial_guesses
         keep_indices = [int(index) for index in self.keep_indices if 0 <= int(index) < len(chunks)]
         kept_chunks = [chunks[index] for index in keep_indices]
         chunk_weights = self.chunk_weights if self.chunk_weights is not None and len(self.chunk_weights) == len(keep_indices) else [1.0 for _ in keep_indices]
@@ -337,6 +362,59 @@ class _CapturingAccumulator(VoxelFusionAccumulator):
             selected_frame_ids,
             registration_metrics,
         )
+
+
+class _InitGuessCapturingBackend:
+    def __init__(self) -> None:
+        self.chunks: list[np.ndarray] = []
+        self.initial_guesses: list[np.ndarray | None] | None = None
+
+    def align_chunks(
+        self,
+        chunks: list[np.ndarray],
+        initial_guesses: list[np.ndarray | None] | None = None,
+    ) -> tuple[list[np.ndarray], dict[str, object]]:
+        self.chunks = [np.asarray(chunk, dtype=np.float32).copy() for chunk in chunks]
+        if initial_guesses is None:
+            self.initial_guesses = None
+        else:
+            self.initial_guesses = [
+                None if guess is None else np.asarray(guess, dtype=np.float64).copy()
+                for guess in initial_guesses
+            ]
+        init_translations = []
+        if self.initial_guesses is not None:
+            for guess in self.initial_guesses[1:]:
+                if guess is None:
+                    continue
+                init_translations.append(np.asarray(guess[:3, 3], dtype=np.float64).tolist())
+        return list(chunks), {
+            "alignment_method": "captured",
+            "registration_backend": "captured",
+            "registration_pairs": max(0, len(chunks) - 1),
+            "registration_accepted": max(0, len(chunks) - 1),
+            "registration_rejected": 0,
+            "registration_input_chunk_count": len(chunks),
+            "registration_output_chunk_count": len(chunks),
+            "registration_dropped_count": 0,
+            "registration_keep_indices": list(range(len(chunks))),
+            "registration_chunk_weights": [1.0 for _ in chunks],
+            "registration_skipped": False,
+            "registration_init_translations": init_translations,
+        }
+
+
+class _InjectedBackendRegistrationAccumulator(RegistrationVoxelFusionAccumulator):
+    def __init__(
+        self,
+        config: AggregationConfig,
+        output_config: OutputConfig,
+        tracking_config: TrackingConfig,
+        *,
+        backend: _InitGuessCapturingBackend,
+    ) -> None:
+        super().__init__(config, output_config, tracking_config)
+        self.backend = backend
 
 
 def test_aggregation_component_profiler_records_stage_timings(monkeypatch) -> None:
@@ -750,6 +828,52 @@ def test_lane_end_touch_filter_limits_keyframe_motion_and_keeps_intensity_center
     assert np.isclose(float(np.mean(captured_intensity[1])), 0.11)
     assert np.isclose(float(np.mean(captured_intensity[2])), 0.12)
     assert 13 not in result.selected_frame_ids
+
+
+def test_registration_voxel_fusion_uses_kalman_center_init_and_common_anchor_local_chunks() -> None:
+    track = Track(track_id=902, hit_count=2, age=2, missed=0, ended_by_missed=True)
+    for frame_id, center_x in ((100, 10.0), (101, 12.0)):
+        points = np.array(
+            [
+                [center_x - 0.5, 0.0, 0.0],
+                [center_x + 0.5, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        center = np.mean(points, axis=0).astype(np.float32)
+        track.centers.append(center)
+        track.frame_ids.append(frame_id)
+        track.world_points.append(points.copy())
+        track.local_points.append((points - center).astype(np.float32))
+        track.bbox_extents.append(compute_extent(points))
+    backend = _InitGuessCapturingBackend()
+    accumulator = _InjectedBackendRegistrationAccumulator(
+        AggregationConfig(
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.1,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+        ),
+        OutputConfig(require_track_exit=False, save_world=False),
+        TrackingConfig(algorithm="kalman_nn", min_track_hits=1),
+        backend=backend,
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 20.0, -1.0, 1.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert len(backend.chunks) == 2
+    assert np.allclose(np.mean(backend.chunks[0], axis=0), np.array([-1.0, 0.0, 0.0], dtype=np.float32))
+    assert np.allclose(np.mean(backend.chunks[1], axis=0), np.array([1.0, 0.0, 0.0], dtype=np.float32))
+    assert backend.initial_guesses is not None
+    assert len(backend.initial_guesses) == 2
+    assert backend.initial_guesses[0] is not None
+    assert backend.initial_guesses[1] is not None
+    assert np.allclose(backend.initial_guesses[0][:3, 3], np.zeros((3,), dtype=np.float64))
+    assert np.allclose(backend.initial_guesses[1][:3, 3], np.array([-2.0, 0.0, 0.0], dtype=np.float64))
+    assert result.metrics["registration_init_translations"] == [[-2.0, 0.0, 0.0]]
 
 
 def test_lane_end_touch_filter_limits_length_coverage_to_prefix() -> None:
@@ -1434,6 +1558,85 @@ def test_registration_backend_recomputes_metrics_after_dof_projection() -> None:
     assert metrics["registration_accepted"] == 0
     assert metrics["registration_rejected"] == 1
     assert np.isclose(metrics["registration_mean_fitness"], 0.0)
+
+
+def test_registration_backend_clamps_transform_to_per_dof_limits() -> None:
+    source = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.5, 0.1, 0.0],
+            [1.1, 0.0, 0.1],
+            [0.2, 0.8, 0.2],
+            [0.7, 0.9, 0.3],
+            [1.2, 0.4, 0.5],
+            [0.3, 1.2, 0.7],
+            [1.0, 1.1, 0.9],
+        ],
+        dtype=np.float32,
+    )
+    clamped_transform = np.eye(4, dtype=np.float64)
+    clamped_transform[:3, :3] = _rotation_z(np.deg2rad(12.0))
+    clamped_transform[0, 3] = 0.6
+    raw_transform = np.eye(4, dtype=np.float64)
+    raw_transform[:3, :3] = _rotation_z(np.deg2rad(35.0))
+    raw_transform[0, 3] = 1.8
+    target = transform_points(source, clamped_transform)
+    backend = _ScriptedTransformRegistrationBackend(
+        AggregationConfig(
+            registration_min_fitness=0.95,
+            registration_max_translation=3.2,
+            registration_max_corr_dist=0.2,
+            frame_downsample_voxel=0.0,
+            registration_allowed_dofs=["tx", "yaw"],
+            registration_max_dof_change={"tx": 0.6, "yaw": 12.0},
+        ),
+        raw_transform,
+    )
+
+    aligned, metrics = backend.align_chunks([target, source])
+
+    assert len(aligned) == 2
+    assert metrics["registration_max_dof_change"] == {"tx": 0.6, "yaw": 12.0}
+    assert metrics["registration_accepted"] == 1
+    assert np.allclose(aligned[1], target, atol=1e-5)
+
+
+def test_registration_backend_clamps_rotation_even_when_all_rotation_dofs_are_allowed() -> None:
+    source = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.5, 0.1, 0.0],
+            [1.1, 0.0, 0.1],
+            [0.2, 0.8, 0.2],
+            [0.7, 0.9, 0.3],
+            [1.2, 0.4, 0.5],
+            [0.3, 1.2, 0.7],
+            [1.0, 1.1, 0.9],
+        ],
+        dtype=np.float32,
+    )
+    clamped_transform = np.eye(4, dtype=np.float64)
+    clamped_transform[:3, :3] = _rotation_z(np.deg2rad(8.0))
+    raw_transform = np.eye(4, dtype=np.float64)
+    raw_transform[:3, :3] = _rotation_z(np.deg2rad(25.0))
+    target = transform_points(source, clamped_transform)
+    backend = _ScriptedTransformRegistrationBackend(
+        AggregationConfig(
+            registration_min_fitness=0.95,
+            registration_max_translation=3.2,
+            registration_max_corr_dist=0.2,
+            frame_downsample_voxel=0.0,
+            registration_allowed_dofs=["roll", "pitch", "yaw"],
+            registration_max_dof_change={"yaw": 8.0},
+        ),
+        raw_transform,
+    )
+
+    aligned, metrics = backend.align_chunks([target, source])
+
+    assert len(aligned) == 2
+    assert metrics["registration_accepted"] == 1
+    assert np.allclose(aligned[1], target, atol=1e-5)
 
 
 def test_kiss_matcher_icp_backend_returns_unavailable_without_optional_modules(monkeypatch) -> None:

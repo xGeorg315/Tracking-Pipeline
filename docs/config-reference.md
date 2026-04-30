@@ -215,6 +215,7 @@ Hinweise:
 | `registration_min_fitness` | `0.25` | Mindestfitness fuer akzeptierte Registrierung |
 | `registration_max_translation` | `3.2` | Obergrenze fuer akzeptierte Translation |
 | `registration_allowed_dofs` | `[tx, ty, tz, roll, pitch, yaw]` | erlaubte Freiheitsgrade fuer die angewendete Registrierungs-Transformation |
+| `registration_max_dof_change` | `{}` | optionale per-DOF-Klemmung relativ zur Identitaet; `tx/ty/tz` in Metern, `roll/pitch/yaw` in Grad |
 | `enable_registration_underfill_fallback` | `false` | faellt bei zu wenigen behaltenen Registration-Chunks auf die unregistrierten selektierten Chunks zurueck |
 | `registration_min_kept_chunks` | `4` | Mindestanzahl an Registration-Chunks vor dem optionalen Underfill-Fallback |
 | `global_registration_voxel` | `0.12` | Downsampling fuer globales Feature-Matching |

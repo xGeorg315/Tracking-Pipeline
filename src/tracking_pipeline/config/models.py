@@ -9,6 +9,10 @@ def _default_registration_allowed_dofs() -> list[str]:
     return ["tx", "ty", "tz", "roll", "pitch", "yaw"]
 
 
+def _default_registration_max_dof_change() -> dict[str, float]:
+    return {}
+
+
 @dataclass(slots=True)
 class QB2LiveMQTTConfig:
     host: str = ""
@@ -115,6 +119,7 @@ class AggregationConfig:
     registration_min_fitness: float = 0.25
     registration_max_translation: float = 3.2
     registration_allowed_dofs: list[str] = field(default_factory=_default_registration_allowed_dofs)
+    registration_max_dof_change: dict[str, float] = field(default_factory=_default_registration_max_dof_change)
     enable_registration_underfill_fallback: bool = False
     registration_min_kept_chunks: int = 4
     global_registration_voxel: float = 0.12

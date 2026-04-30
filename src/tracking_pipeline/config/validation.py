@@ -165,6 +165,17 @@ def validate_config(config: PipelineConfig) -> None:
             raise ConfigError("aggregation.registration_allowed_dofs entries must be strings")
         if raw_dof not in SUPPORTED_REGISTRATION_DOFS:
             raise ConfigError(f"aggregation.registration_allowed_dofs contains unsupported value: {raw_dof}")
+    if not isinstance(config.aggregation.registration_max_dof_change, dict):
+        raise ConfigError("aggregation.registration_max_dof_change must be a mapping")
+    for raw_dof, raw_limit in config.aggregation.registration_max_dof_change.items():
+        if not isinstance(raw_dof, str):
+            raise ConfigError("aggregation.registration_max_dof_change keys must be strings")
+        if raw_dof not in SUPPORTED_REGISTRATION_DOFS:
+            raise ConfigError(f"aggregation.registration_max_dof_change contains unsupported dof: {raw_dof}")
+        if isinstance(raw_limit, bool) or not isinstance(raw_limit, (int, float)):
+            raise ConfigError(f"aggregation.registration_max_dof_change.{raw_dof} must be numeric")
+        if float(raw_limit) < 0.0:
+            raise ConfigError(f"aggregation.registration_max_dof_change.{raw_dof} must be >= 0")
     if config.aggregation.fusion_weight_mode not in SUPPORTED_FUSION_WEIGHT_MODES:
         raise ConfigError(f"Unsupported fusion weight mode: {config.aggregation.fusion_weight_mode}")
     if config.classification.backend not in SUPPORTED_CLASSIFICATION_BACKENDS:

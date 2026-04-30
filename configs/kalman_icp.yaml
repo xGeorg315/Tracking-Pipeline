@@ -1,22 +1,22 @@
-input:
-  format: qb2_live
-  paths: []
-  qb2_live:
-    sensor_name: class_qb2
-    ip: 10.16.3.160
-    api_key: api_key_123
-    mqtt:
-      host: 10.16.3.111
-      port: 1883
-      topic: blickfeld/states_160
-      keepalive: 60
-    max_frames: 0
-    idle_timeout_sec: 30.0
-    mqtt_max_pending_labels: 100
 # input:
-#   paths:
-#     - ../data/medium_2 # 115 Vehicles
-#     # - ../data/medium_energy # 159 Vehicles
+#   format: qb2_live
+#   paths: []
+#   qb2_live:
+#     sensor_name: class_qb2
+#     ip: 10.16.3.160
+#     api_key: api_key_123
+#     mqtt:
+#       host: 10.16.3.111
+#       port: 1883
+#       topic: blickfeld/states_160
+#       keepalive: 60
+#     max_frames: 0
+#     idle_timeout_sec: 30.0
+#     mqtt_max_pending_labels: 100
+input:
+  paths:
+    - ../data/medium_2 # 115 Vehicles
+    # - ../data/medium_energy # 159 Vehicles
 tracking:
   algorithm: kalman_nn
   max_dist: 7.5
@@ -30,7 +30,9 @@ tracking:
 aggregation:
   algorithm: registration_voxel_fusion
   registration_backend: icp_point_to_plane
-  registration_allowed_dofs: [tx, ty, tz]
+  registration_allowed_dofs: [tx, ty, tz, pitch, roll, yaw]
+  registration_max_dof_change:
+    tz: 0.3
   frame_selection_method: keyframe_motion
   keyframe_keep: 8
   enable_registration_underfill_fallback: true
@@ -59,7 +61,7 @@ postprocessing:
   articulated_max_speed_delta: 0.30
   articulated_min_combined_length: 5.0
 output:
-  mode: dataset
+  mode: run
   dataset_root_dir: dataset
   live_object_list_flush_interval_sec: 1.0
   live_artifact_flush_interval_sec: 2.0
@@ -67,4 +69,4 @@ output:
 warumup_runs: 1
 measure_runs: 1
 runtime:
-  cpu_cores: 4
+  cpu_cores: 10
