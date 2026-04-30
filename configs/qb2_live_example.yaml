@@ -73,7 +73,7 @@ output:
 warumup_runs: 1
 measure_runs: 1
 runtime:
-  cpu_cores: 2
+  cpu_cores: 3
 visualization:
   show_tracker_debug: true
   show_track_outcome_debug: true

@@ -76,6 +76,9 @@ tracking-pipeline run -c configs/qb2_live_example.yaml
 
 Der Live-Run bleibt offen, bis du ihn mit `Ctrl+C` oder `SIGTERM` beendest. Dann finalisiert die Pipeline den aktuellen Stand und schreibt die normalen Run-Artefakte einmal am Ende weg. Wenn `visualization.live_web_enabled: true` gesetzt ist, startet derselbe Prozess zusaetzlich einen headless Browser-Viewer fuer die rohe Live-Punktwolke. Bei `output.statistics_enabled: true` zeigt die CLI-Statuszeile ausserdem direkt die aktuelle Bearbeitungsfrequenz `hz=recent/total`, den MQTT-Pending-Stand `q=labels/snapshots` und die Reader-Drops `drop=overflow/stale`.
 
+Der genaue Ablauf der Live-Config ist auf einer eigenen Seite beschrieben:
+[docs/qb2-live-example-flow.md](docs/qb2-live-example-flow.md).
+
 ### Replay starten
 
 ```bash
@@ -292,12 +295,13 @@ Die vollstaendige Referenz steht in [docs/config-reference.md](docs/config-refer
 | `configs/kalman_feature_global_then_local.yaml` | schwierigere Initiallagen mit globalem Vorab-Alignment |
 | `configs/hungarian_weighted.yaml` | globales Matching plus gewichtete Fusion |
 | `configs/benchmark_curated_real.yaml` | Vergleich mehrerer Presets auf kuratierter Sequenzmenge |
-| `configs/qb2_live_example.yaml` | Live-QB2-Frames plus MQTT-Objektlisten fuer `run` |
+| [`configs/qb2_live_example.yaml`](configs/qb2_live_example.yaml) | Live-QB2-Frames plus MQTT-Objektlisten fuer `run`; Ablauf siehe [QB2 Live Example](docs/qb2-live-example-flow.md) |
 
 ## Weiterfuehrende Docs
 
 - [Config-Referenz](docs/config-reference.md)
 - [Artefakte und Benchmarking](docs/artifacts-and-benchmarking.md)
+- [QB2 Live Example: Pipeline-Verlauf](docs/qb2-live-example-flow.md)
 
 ## Relevante Einstiegspunkte im Code
 
