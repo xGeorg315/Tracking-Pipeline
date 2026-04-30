@@ -43,7 +43,7 @@ aggregation:
   registration_max_translation: 3.5
   registration_min_fitness: 0.3
   registration_max_corr_dist: 0.5
-  shape_consistency_filter: false
+  shape_consistency_filter: true
   truncate_after_lane_end_touch: true
   enable_confidence_point_cap: false
   confidence_point_cap_max_points: 2048

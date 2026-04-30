@@ -1493,6 +1493,112 @@ def test_registration_backend_keeps_only_anchor_and_accepted_chunks() -> None:
     assert np.allclose(aligned[1], chunks[2])
 
 
+def test_registration_backend_uses_correction_relative_to_init_for_translation_gate() -> None:
+    source = _constant_chunk(10.0)
+    accepted_transform = np.eye(4, dtype=np.float64)
+    accepted_transform[0, 3] = -9.2
+    target = transform_points(source, accepted_transform)
+    init_transform = np.eye(4, dtype=np.float64)
+    init_transform[0, 3] = -10.0
+    backend = _ScriptedTransformRegistrationBackend(
+        AggregationConfig(
+            registration_min_fitness=0.25,
+            registration_max_translation=1.0,
+            frame_downsample_voxel=0.0,
+        ),
+        accepted_transform,
+        fitness=1.0,
+    )
+
+    aligned, metrics = backend.align_chunks([target, source], initial_guesses=[np.eye(4, dtype=np.float64), init_transform])
+
+    assert len(aligned) == 2
+    assert metrics["registration_accepted"] == 1
+    assert metrics["registration_rejected"] == 0
+    assert np.allclose(metrics["registration_pair_init_translation_norms"], [10.0])
+    assert np.allclose(metrics["registration_pair_final_translation_norms"], [9.2])
+    assert np.allclose(metrics["registration_pair_correction_translation_norms"], [0.8])
+    assert metrics["registration_reject_reason_counts"] == {}
+    assert np.allclose(aligned[1], target)
+
+
+def test_registration_backend_keeps_absolute_translation_gate_without_init() -> None:
+    source = _constant_chunk(10.0)
+    transform = np.eye(4, dtype=np.float64)
+    transform[0, 3] = -9.2
+    target = transform_points(source, transform)
+    backend = _ScriptedTransformRegistrationBackend(
+        AggregationConfig(
+            registration_min_fitness=0.25,
+            registration_max_translation=1.0,
+            frame_downsample_voxel=0.0,
+        ),
+        transform,
+        fitness=1.0,
+    )
+
+    aligned, metrics = backend.align_chunks([target, source])
+
+    assert len(aligned) == 1
+    assert metrics["registration_accepted"] == 0
+    assert metrics["registration_rejected"] == 1
+    assert np.allclose(metrics["registration_pair_init_translation_norms"], [0.0])
+    assert np.allclose(metrics["registration_pair_final_translation_norms"], [9.2])
+    assert np.allclose(metrics["registration_pair_correction_translation_norms"], [9.2])
+    assert metrics["registration_reject_reason_counts"] == {"translation_gate": 1}
+
+
+def test_registration_backend_rejects_large_correction_relative_to_init() -> None:
+    source = _constant_chunk(10.0)
+    transform = np.eye(4, dtype=np.float64)
+    transform[0, 3] = -7.5
+    target = transform_points(source, transform)
+    init_transform = np.eye(4, dtype=np.float64)
+    init_transform[0, 3] = -10.0
+    backend = _ScriptedTransformRegistrationBackend(
+        AggregationConfig(
+            registration_min_fitness=0.25,
+            registration_max_translation=1.0,
+            frame_downsample_voxel=0.0,
+        ),
+        transform,
+        fitness=1.0,
+    )
+
+    aligned, metrics = backend.align_chunks([target, source], initial_guesses=[np.eye(4, dtype=np.float64), init_transform])
+
+    assert len(aligned) == 1
+    assert metrics["registration_accepted"] == 0
+    assert metrics["registration_rejected"] == 1
+    assert np.allclose(metrics["registration_pair_init_translation_norms"], [10.0])
+    assert np.allclose(metrics["registration_pair_final_translation_norms"], [7.5])
+    assert np.allclose(metrics["registration_pair_correction_translation_norms"], [2.5])
+    assert metrics["registration_reject_reason_counts"] == {"translation_gate": 1}
+
+
+def test_registration_backend_reports_pair_translation_norms_and_reject_reason_counts() -> None:
+    backend = _ScriptedRegistrationBackend(
+        AggregationConfig(
+            registration_min_fitness=0.25,
+            registration_max_translation=3.2,
+            frame_downsample_voxel=0.0,
+        ),
+        scripted_results=[(0.80, 0.5), (0.10, 0.25)],
+    )
+    chunks = [_constant_chunk(0.0), _constant_chunk(1.0), _constant_chunk(2.0)]
+
+    _, metrics = backend.align_chunks(chunks)
+
+    assert metrics["registration_pairs"] == 2
+    assert len(metrics["registration_pair_init_translation_norms"]) == metrics["registration_pairs"]
+    assert len(metrics["registration_pair_final_translation_norms"]) == metrics["registration_pairs"]
+    assert len(metrics["registration_pair_correction_translation_norms"]) == metrics["registration_pairs"]
+    assert np.allclose(metrics["registration_pair_init_translation_norms"], [0.0, 0.0])
+    assert np.allclose(metrics["registration_pair_final_translation_norms"], [0.5, 0.25])
+    assert np.allclose(metrics["registration_pair_correction_translation_norms"], [0.5, 0.25])
+    assert metrics["registration_reject_reason_counts"] == {"fitness": 1}
+
+
 def test_registration_backend_projects_transform_to_allowed_dofs() -> None:
     source = np.array(
         [

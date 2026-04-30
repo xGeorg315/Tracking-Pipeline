@@ -105,6 +105,10 @@ class _BaseRegistrationBackend:
         rmse_values: list[float] = []
         backend_counts: Counter[str] = Counter()
         init_translations: list[list[float]] = []
+        init_translation_norms: list[float] = []
+        final_translation_norms: list[float | None] = []
+        correction_translation_norms: list[float | None] = []
+        reject_reason_counts: Counter[str] = Counter()
 
         for source_index, source in enumerate(chunks[1:], start=1):
             if len(source) < 8 or len(model) < 8:
@@ -122,6 +126,7 @@ class _BaseRegistrationBackend:
                 if init_transform is None:
                     init_transform = np.eye(4, dtype=np.float64)
                 init_translations.append(init_transform[:3, 3].astype(np.float64).tolist())
+                init_translation_norm = self._translation_norm(init_transform)
                 transform, fitness, rmse = self._register_pair(source, model, init_transform=init_transform)
                 raw_transform = np.asarray(transform, dtype=np.float64)
                 transform = self._constrain_transform(raw_transform)
@@ -136,10 +141,15 @@ class _BaseRegistrationBackend:
                 backend_counts[self.name] += 1
                 fitness_values.append(float(fitness))
                 rmse_values.append(float(rmse))
-                if float(fitness) >= float(self.config.registration_min_fitness) and is_valid_transform(
+                init_translation_norms.append(float(init_translation_norm))
+                final_translation_norms.append(self._translation_norm(transform))
+                correction_translation_norms.append(self._correction_translation_norm(transform, init_transform))
+                is_accepted, reject_reason = self._accept_registration(
                     transform,
-                    max_translation=self.config.registration_max_translation,
-                ):
+                    init_transform=init_transform,
+                    fitness=float(fitness),
+                )
+                if is_accepted:
                     aligned_source = transform_points(source, transform)
                     accepted += 1
                     keep_indices.append(source_index)
@@ -151,8 +161,14 @@ class _BaseRegistrationBackend:
                     )
                 else:
                     backend_counts["rejected"] += 1
+                    if reject_reason is not None:
+                        reject_reason_counts[reject_reason] += 1
             except Exception:
+                init_translation_norms.append(float(self._translation_norm(init_transform)))
+                final_translation_norms.append(None)
+                correction_translation_norms.append(None)
                 backend_counts["error"] += 1
+                reject_reason_counts["error"] += 1
 
         return aligned, {
             "alignment_method": self.name,
@@ -168,6 +184,10 @@ class _BaseRegistrationBackend:
             "registration_allowed_dofs": list(self._allowed_dofs),
             "registration_max_dof_change": dict(self._max_dof_change),
             "registration_init_translations": init_translations,
+            "registration_pair_init_translation_norms": init_translation_norms,
+            "registration_pair_final_translation_norms": final_translation_norms,
+            "registration_pair_correction_translation_norms": correction_translation_norms,
+            "registration_reject_reason_counts": dict(reject_reason_counts),
             "registration_input_chunk_count": int(len(chunks)),
             "registration_output_chunk_count": int(len(aligned)),
             "registration_dropped_count": int(len(chunks) - len(aligned)),
@@ -191,6 +211,10 @@ class _BaseRegistrationBackend:
             "registration_allowed_dofs": list(self._allowed_dofs),
             "registration_max_dof_change": dict(self._max_dof_change),
             "registration_init_translations": [],
+            "registration_pair_init_translation_norms": [],
+            "registration_pair_final_translation_norms": [],
+            "registration_pair_correction_translation_norms": [],
+            "registration_reject_reason_counts": {},
             "registration_input_chunk_count": int(chunk_count),
             "registration_output_chunk_count": int(chunk_count),
             "registration_dropped_count": 0,
@@ -245,6 +269,57 @@ class _BaseRegistrationBackend:
             limit = np.deg2rad(limit)
         return float(np.clip(float(value), -float(limit), float(limit)))
 
+    def _translation_norm(self, transform: np.ndarray) -> float:
+        matrix = np.asarray(transform, dtype=np.float64)
+        if matrix.shape != (4, 4) or not np.isfinite(matrix[:3, 3]).all():
+            return float("inf")
+        return float(np.linalg.norm(matrix[:3, 3]))
+
+    def _uses_non_identity_init(self, init_transform: np.ndarray) -> bool:
+        matrix = np.asarray(init_transform, dtype=np.float64)
+        if matrix.shape != (4, 4):
+            return False
+        return not np.allclose(matrix, np.eye(4, dtype=np.float64), rtol=1e-6, atol=1e-8)
+
+    def _correction_transform(self, transform: np.ndarray, init_transform: np.ndarray) -> np.ndarray | None:
+        matrix = np.asarray(transform, dtype=np.float64)
+        init_matrix = np.asarray(init_transform, dtype=np.float64)
+        if not self._uses_non_identity_init(init_matrix):
+            return matrix
+        if matrix.shape != (4, 4) or init_matrix.shape != (4, 4):
+            return None
+        try:
+            return matrix @ np.linalg.inv(init_matrix)
+        except np.linalg.LinAlgError:
+            return None
+
+    def _correction_translation_norm(self, transform: np.ndarray, init_transform: np.ndarray) -> float:
+        correction = self._correction_transform(transform, init_transform)
+        if correction is None:
+            return float("inf")
+        return self._translation_norm(correction)
+
+    def _passes_translation_gate(self, transform: np.ndarray, init_transform: np.ndarray) -> bool:
+        max_translation = self.config.registration_max_translation
+        if max_translation is None:
+            return True
+        return self._correction_translation_norm(transform, init_transform) <= float(max_translation)
+
+    def _accept_registration(
+        self,
+        transform: np.ndarray,
+        *,
+        init_transform: np.ndarray,
+        fitness: float,
+    ) -> tuple[bool, str | None]:
+        if not is_valid_transform(transform, max_translation=None):
+            return False, "invalid_transform"
+        if not self._passes_translation_gate(transform, init_transform):
+            return False, "translation_gate"
+        if float(fitness) < float(self.config.registration_min_fitness):
+            return False, "fitness"
+        return True, None
+
     def _evaluate_transform_if_needed(
         self,
         source_xyz: np.ndarray,
@@ -284,7 +359,11 @@ class SmallGICPRegistrationBackend(_BaseRegistrationBackend):
         super().__init__(config)
         self._small_gicp = self._try_import()
 
-    def align_chunks(self, chunks: list[np.ndarray]) -> tuple[list[np.ndarray], dict[str, Any]]:
+    def align_chunks(
+        self,
+        chunks: list[np.ndarray],
+        initial_guesses: list[np.ndarray | None] | None = None,
+    ) -> tuple[list[np.ndarray], dict[str, Any]]:
         if self._small_gicp is None:
             return list(chunks), {
                 **self._empty_info(len(chunks)),
@@ -292,7 +371,7 @@ class SmallGICPRegistrationBackend(_BaseRegistrationBackend):
                 "alignment_method": "unavailable",
                 "registration_skipped": True,
             }
-        return super().align_chunks(chunks)
+        return super().align_chunks(chunks, initial_guesses=initial_guesses)
 
     def _try_import(self):
         try:
