@@ -30,6 +30,7 @@ SUPPORTED_ACCUMULATORS = {
 SUPPORTED_FRAME_SELECTION_METHODS = {
     "auto",
     "all_track_frames",
+    "last_k_frames",
     "line_touch_last_k",
     "keyframe_motion",
     "length_coverage",
@@ -48,6 +49,7 @@ SUPPORTED_REGISTRATION_BACKENDS = {
 }
 SUPPORTED_REGISTRATION_DOFS = {"tx", "ty", "tz", "roll", "pitch", "yaw"}
 SUPPORTED_FUSION_WEIGHT_MODES = {"uniform", "point_count", "quality"}
+SUPPORTED_VOXEL_REDUCTION_MODES = {"mean", "random_point"}
 SUPPORTED_CLASSIFICATION_BACKENDS = {"pointnext"}
 SUPPORTED_CLASSIFICATION_DEVICES = {"auto", "cpu", "cuda", "mps"}
 SUPPORTED_OUTPUT_MODES = {"run", "dataset"}
@@ -178,6 +180,8 @@ def validate_config(config: PipelineConfig) -> None:
             raise ConfigError(f"aggregation.registration_max_dof_change.{raw_dof} must be >= 0")
     if config.aggregation.fusion_weight_mode not in SUPPORTED_FUSION_WEIGHT_MODES:
         raise ConfigError(f"Unsupported fusion weight mode: {config.aggregation.fusion_weight_mode}")
+    if config.aggregation.voxel_reduction_mode not in SUPPORTED_VOXEL_REDUCTION_MODES:
+        raise ConfigError(f"Unsupported voxel reduction mode: {config.aggregation.voxel_reduction_mode}")
     if config.classification.backend not in SUPPORTED_CLASSIFICATION_BACKENDS:
         raise ConfigError(f"Unsupported classification backend: {config.classification.backend}")
     if config.classification.device not in SUPPORTED_CLASSIFICATION_DEVICES:

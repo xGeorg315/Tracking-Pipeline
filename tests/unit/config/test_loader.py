@@ -1026,7 +1026,7 @@ def test_load_config_accepts_registration_max_dof_change(tmp_path: Path) -> None
     assert config.aggregation.registration_max_dof_change == {"tx": 1.25, "yaw": 12.0}
 
 
-@pytest.mark.parametrize("method", ["quality_coverage", "tail_coverage", "center_diversity"])
+@pytest.mark.parametrize("method", ["quality_coverage", "tail_coverage", "center_diversity", "last_k_frames"])
 def test_load_config_accepts_new_frame_selection_methods(tmp_path: Path, method: str) -> None:
     fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
 
@@ -1052,6 +1052,33 @@ def test_load_config_accepts_new_frame_selection_methods(tmp_path: Path, method:
 
     assert config.input.paths == [str(fixture_dst.resolve())]
     assert config.aggregation.frame_selection_method == method
+
+
+def test_load_config_accepts_random_point_voxel_reduction(tmp_path: Path) -> None:
+    fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+
+    config_path = tmp_path / "config_random_point_voxel_reduction.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "aggregation:",
+                "  voxel_reduction_mode: random_point",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.input.paths == [str(fixture_dst.resolve())]
+    assert config.aggregation.voxel_reduction_mode == "random_point"
 
 
 def test_load_config_rejects_invalid_registration_allowed_dofs(tmp_path: Path) -> None:

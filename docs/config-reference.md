@@ -18,10 +18,11 @@ Diese Seite beschreibt die YAML-Konfiguration der Pipeline auf Basis der aktuell
 - `clustering.algorithm`: `dbscan`, `euclidean_clustering`, `ground_removed_dbscan`, `hdbscan`, `voxel_grid_connected_components`, `range_image_connected_components`, `range_image_depth_jump`, `beam_neighbor_region_growing`
 - `tracking.algorithm`: `euclidean_nn`, `kalman_nn`, `hungarian_kalman`
 - `aggregation.algorithm`: `voxel_fusion`, `registration_voxel_fusion`, `weighted_voxel_fusion`, `occupancy_consensus_fusion`
-- `aggregation.frame_selection_method`: `auto`, `all_track_frames`, `line_touch_last_k`, `keyframe_motion`, `length_coverage`, `quality_coverage`, `tail_coverage`, `center_diversity`, `max_extent`
+- `aggregation.frame_selection_method`: `auto`, `all_track_frames`, `last_k_frames`, `line_touch_last_k`, `keyframe_motion`, `length_coverage`, `quality_coverage`, `tail_coverage`, `center_diversity`, `max_extent`
 - `aggregation.registration_backend`: `small_gicp`, `icp_point_to_plane`, `generalized_icp`, `feature_global_then_local`, `kiss_matcher`, `kiss_matcher_then_icp`
 - `aggregation.registration_allowed_dofs`: `tx`, `ty`, `tz`, `roll`, `pitch`, `yaw`
 - `aggregation.fusion_weight_mode`: `uniform`, `point_count`, `quality`
+- `aggregation.voxel_reduction_mode`: `mean`, `random_point`
 
 ## Beispiel: Pipeline-Config
 
@@ -185,14 +186,15 @@ Hinweise:
 | `symmetry_completion` | `false` | optionale lokale Symmetrievervollstaendigung |
 | `motion_deskew` | `false` | objektrelativer intra-scan Deskew fuer elongierte Tracks anhand von `timestamp_offset` |
 | `truncate_after_lane_end_touch` | `false` | verwirft alle Folgeframes nach erstem Touch am Lane-Ende (`frame_selection_line_axis`-Min-Seite) |
-| `frame_selection_method` | `auto` | Strategie zur Chunk-/Frame-Auswahl: `all_track_frames`, `line_touch_last_k`, `keyframe_motion`, `length_coverage`, `quality_coverage`, `tail_coverage`, `center_diversity`, `max_extent`, `auto` |
+| `frame_selection_method` | `auto` | Strategie zur Chunk-/Frame-Auswahl: `all_track_frames`, `last_k_frames`, `line_touch_last_k`, `keyframe_motion`, `length_coverage`, `quality_coverage`, `tail_coverage`, `center_diversity`, `max_extent`, `auto` |
 | `use_all_frames` | `true` | alle Track-Frames verwenden statt nur Auswahl |
-| `top_k_frames` | `10` | Limit fuer `line_touch_last_k` / Top-K-Auswahl |
+| `top_k_frames` | `10` | Limit fuer `last_k_frames` und `line_touch_last_k` |
 | `keyframe_keep` | `8` | Anzahl Keyframes bei Keyframe-Auswahl |
 | `frame_selection_line_axis` | `y` | Lane-Laengsachse |
 | `frame_selection_line_ratio` | `0.10` | Position der Selektionslinie in Lane-Richtung |
 | `frame_selection_touch_margin` | `0.12` | Toleranz fuer Line-Touch-Selektion |
 | `frame_downsample_voxel` | `0.07` | fruehes Downsampling pro Chunk |
+| `voxel_reduction_mode` | `mean` | reduziert Voxels wahlweise per Mittelwert oder per reproduzierbar zufaelligem Originalpunkt (`random_point`) |
 
 ### Chunk-Qualitaet und Konsistenz
 

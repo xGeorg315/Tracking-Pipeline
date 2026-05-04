@@ -111,6 +111,7 @@ class AggregationConfig:
     frame_selection_line_ratio: float = 0.10
     frame_selection_touch_margin: float = 0.12
     frame_downsample_voxel: float = 0.07
+    voxel_reduction_mode: str = "mean"
     shape_consistency_filter: bool = False
     shape_consistency_max_extent_ratio: float = 2.0
     registration_backend: str = "small_gicp"

@@ -99,6 +99,7 @@ def _symmetry_accumulator(
     save_world: bool = False,
     min_saved_aggregate_points: int = 0,
     fusion_voxel_size: float = 0.10,
+    voxel_reduction_mode: str = "mean",
 ) -> VoxelFusionAccumulator:
     return VoxelFusionAccumulator(
         AggregationConfig(
@@ -107,6 +108,7 @@ def _symmetry_accumulator(
             frame_downsample_voxel=0.0,
             fusion_voxel_size=fusion_voxel_size,
             aggregate_voxel=0.0,
+            voxel_reduction_mode=voxel_reduction_mode,
             post_filter_stat_nb_neighbors=999,
             min_saved_aggregate_points=min_saved_aggregate_points,
         ),
@@ -1061,6 +1063,55 @@ def test_aggregate_per_voxel_preserves_empty_optional_shapes() -> None:
     assert reduced_confidence.shape == (0,)
 
 
+def test_aggregate_per_voxel_random_point_mode_keeps_original_points() -> None:
+    accumulator = _symmetry_accumulator(
+        enabled=False,
+        save_world=True,
+        fusion_voxel_size=0.10,
+        voxel_reduction_mode="random_point",
+    )
+    points = np.array(
+        [
+            [1.02, 0.00, 0.0],
+            [0.02, 0.00, 0.0],
+            [1.04, 0.02, 0.0],
+            [0.06, 0.01, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    intensity = np.array([10.0, 1.0, 30.0, 3.0], dtype=np.float32)
+    confidence = np.array([0.4, 0.5, 0.6, 0.7], dtype=np.float32)
+
+    reduced_xyz, reduced_intensity, reduced_confidence = accumulator._aggregate_per_voxel(points, intensity, confidence, 0.10)
+
+    assert reduced_intensity is not None
+    assert reduced_confidence is not None
+    assert not np.allclose(reduced_xyz[0], np.array([0.04, 0.005, 0.0], dtype=np.float32))
+    assert not np.allclose(reduced_xyz[1], np.array([1.03, 0.01, 0.0], dtype=np.float32))
+    voxel_candidates = [
+        [
+            (np.array([0.02, 0.0, 0.0], dtype=np.float32), 1.0),
+            (np.array([0.06, 0.01, 0.0], dtype=np.float32), 3.0),
+        ],
+        [
+            (np.array([1.02, 0.0, 0.0], dtype=np.float32), 10.0),
+            (np.array([1.04, 0.02, 0.0], dtype=np.float32), 30.0),
+        ],
+    ]
+    for index, point in enumerate(reduced_xyz):
+        match = next(
+            (
+                expected_intensity
+                for expected_point, expected_intensity in voxel_candidates[index]
+                if np.allclose(point, expected_point, atol=1e-6)
+            ),
+            None,
+        )
+        assert match is not None
+        assert np.isclose(float(reduced_intensity[index]), match)
+    assert np.allclose(reduced_confidence, np.array([1.2, 1.0], dtype=np.float32), atol=1e-6)
+
+
 def test_voxel_accumulate_applies_weighted_means_and_keeps_legacy_voxel_order() -> None:
     accumulator = _symmetry_accumulator(enabled=False, save_world=True, fusion_voxel_size=0.10)
     chunks = [
@@ -1114,6 +1165,81 @@ def test_voxel_accumulate_applies_weighted_means_and_keeps_legacy_voxel_order() 
     )
     assert intensity is not None
     assert np.allclose(intensity, np.array([15.0, 8.0, 8.0], dtype=np.float32), atol=1e-6)
+    assert np.allclose(confidence, np.array([0.2, 1.4, 0.5], dtype=np.float32), atol=1e-6)
+
+
+def test_voxel_accumulate_random_point_mode_keeps_original_points() -> None:
+    accumulator = _symmetry_accumulator(
+        enabled=False,
+        save_world=True,
+        fusion_voxel_size=0.10,
+        voxel_reduction_mode="random_point",
+    )
+    chunks = [
+        np.array(
+            [
+                [1.02, 0.00, 0.0],
+                [0.02, 0.00, 0.0],
+                [1.04, 0.02, 0.0],
+                [0.06, 0.02, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        np.array(
+            [
+                [1.00, 0.01, 0.0],
+                [2.01, 0.00, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        np.array([[1.08, 0.02, 0.0]], dtype=np.float32),
+    ]
+    intensities = [
+        np.array([2.0, 10.0, 4.0, 20.0], dtype=np.float32),
+        np.array([6.0, 8.0], dtype=np.float32),
+        np.array([12.0], dtype=np.float32),
+    ]
+
+    xyz, intensity, confidence, raw_points, fusion_voxels_total, fusion_voxels_kept = accumulator._voxel_accumulate(
+        chunks,
+        intensities,
+        [2.0, 1.0, 3.0],
+        [0.2, 0.5, 0.7],
+        0.10,
+        1,
+    )
+
+    assert raw_points == 7
+    assert fusion_voxels_total == 3
+    assert fusion_voxels_kept == 3
+    assert intensity is not None
+    assert not np.allclose(xyz[:2], np.array([[0.04, 0.01, 0.0], [1.05, 0.015, 0.0]], dtype=np.float32))
+    voxel_candidates = [
+        [
+            (np.array([0.02, 0.0, 0.0], dtype=np.float32), 10.0),
+            (np.array([0.06, 0.02, 0.0], dtype=np.float32), 20.0),
+        ],
+        [
+            (np.array([1.0, 0.01, 0.0], dtype=np.float32), 6.0),
+            (np.array([1.02, 0.0, 0.0], dtype=np.float32), 2.0),
+            (np.array([1.04, 0.02, 0.0], dtype=np.float32), 4.0),
+            (np.array([1.08, 0.02, 0.0], dtype=np.float32), 12.0),
+        ],
+        [
+            (np.array([2.01, 0.0, 0.0], dtype=np.float32), 8.0),
+        ],
+    ]
+    for index, point in enumerate(xyz):
+        match = next(
+            (
+                expected_intensity
+                for expected_point, expected_intensity in voxel_candidates[index]
+                if np.allclose(point, expected_point, atol=1e-6)
+            ),
+            None,
+        )
+        assert match is not None
+        assert np.isclose(float(intensity[index]), match)
     assert np.allclose(confidence, np.array([0.2, 1.4, 0.5], dtype=np.float32), atol=1e-6)
 
 

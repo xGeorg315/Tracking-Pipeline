@@ -865,6 +865,86 @@ class VoxelFusionAccumulator:
         np.add.at(reduced, inverse, array.astype(target_dtype, copy=False))
         return reduced
 
+    def _stable_voxel_hash(self, voxels: np.ndarray) -> np.ndarray:
+        voxel_values = np.asarray(voxels, dtype=np.int64)
+        if len(voxel_values) == 0:
+            return np.zeros((0,), dtype=np.uint64)
+        x = voxel_values[:, 0].view(np.uint64)
+        y = voxel_values[:, 1].view(np.uint64)
+        z = voxel_values[:, 2].view(np.uint64)
+        hashed = (
+            x * np.uint64(0x9E3779B185EBCA87)
+            ^ y * np.uint64(0xC2B2AE3D27D4EB4F)
+            ^ z * np.uint64(0x165667B19E3779F9)
+            ^ np.uint64(0xA24BAED4963EE407)
+        )
+        hashed ^= hashed >> 30
+        hashed *= np.uint64(0xBF58476D1CE4E5B9)
+        hashed ^= hashed >> 27
+        hashed *= np.uint64(0x94D049BB133111EB)
+        hashed ^= hashed >> 31
+        return hashed
+
+    def _stable_voxel_unit_interval(self, voxels: np.ndarray) -> np.ndarray:
+        hashed = self._stable_voxel_hash(voxels)
+        return ((hashed >> 11).astype(np.float64, copy=False)) / float(1 << 53)
+
+    def _group_member_order(
+        self,
+        inverse: np.ndarray,
+        group_count: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        order = np.argsort(inverse, kind="stable")
+        counts = np.bincount(inverse, minlength=group_count).astype(np.int32, copy=False)
+        starts = np.zeros((group_count + 1,), dtype=np.int32)
+        if group_count > 0:
+            starts[1:] = np.cumsum(counts, dtype=np.int32)
+        return order, starts
+
+    def _select_random_group_members(
+        self,
+        group_keys: np.ndarray,
+        inverse: np.ndarray,
+        group_count: int,
+    ) -> np.ndarray:
+        if group_count == 0:
+            return np.zeros((0,), dtype=np.int32)
+        order, starts = self._group_member_order(inverse, group_count)
+        counts = np.diff(starts).astype(np.uint64, copy=False)
+        target_offsets = (self._stable_voxel_hash(group_keys) % np.maximum(counts, np.uint64(1))).astype(np.int32, copy=False)
+        return order[starts[:-1] + target_offsets]
+
+    def _select_weighted_group_members(
+        self,
+        group_keys: np.ndarray,
+        inverse: np.ndarray,
+        weights: np.ndarray,
+        group_count: int,
+    ) -> np.ndarray:
+        if group_count == 0:
+            return np.zeros((0,), dtype=np.int32)
+        order, starts = self._group_member_order(inverse, group_count)
+        ordered_weights = np.asarray(weights, dtype=np.float64)[order]
+        thresholds = self._stable_voxel_unit_interval(group_keys)
+        selected = np.zeros((group_count,), dtype=np.int32)
+        hash_values = self._stable_voxel_hash(group_keys)
+        for group_index in range(group_count):
+            start = int(starts[group_index])
+            end = int(starts[group_index + 1])
+            members = order[start:end]
+            member_count = len(members)
+            if member_count == 0:
+                continue
+            group_weights = ordered_weights[start:end]
+            total_weight = float(np.sum(group_weights, dtype=np.float64))
+            if total_weight <= 0.0:
+                selected[group_index] = members[int(hash_values[group_index] % np.uint64(member_count))]
+                continue
+            local_cumsum = np.cumsum(group_weights, dtype=np.float64)
+            local_index = int(np.searchsorted(local_cumsum, thresholds[group_index] * total_weight, side="right"))
+            selected[group_index] = members[min(local_index, member_count - 1)]
+        return selected
+
     def _reduce_points_by_voxel(
         self,
         xyz: np.ndarray,
@@ -876,15 +956,24 @@ class VoxelFusionAccumulator:
         unique_voxels, inverse = self._unique_rows(voxels)
         group_count = len(unique_voxels)
         counts = np.bincount(inverse, minlength=group_count).astype(np.float32)
+        if self.config.voxel_reduction_mode == "random_point":
+            selected_indices = self._select_random_group_members(unique_voxels, inverse, group_count)
+            reduced_points = points[selected_indices].astype(np.float32, copy=False)
+            reduced_intensity = None
+            if intensity is not None:
+                intensity_values = np.asarray(intensity, dtype=np.float32)
+                if len(intensity_values) == len(points):
+                    reduced_intensity = intensity_values[selected_indices].astype(np.float32, copy=False)
+            return unique_voxels, reduced_points, reduced_intensity, counts
         point_sum = self._sum_by_group(points, inverse, group_count, dtype=np.float32)
-        point_means = (point_sum / np.maximum(counts[:, None], 1.0)).astype(np.float32, copy=False)
-        intensity_means = None
+        reduced_points = (point_sum / np.maximum(counts[:, None], 1.0)).astype(np.float32, copy=False)
+        reduced_intensity = None
         if intensity is not None:
             intensity_values = np.asarray(intensity, dtype=np.float32)
             if len(intensity_values) == len(points):
                 intensity_sum = np.bincount(inverse, weights=intensity_values.astype(np.float64), minlength=group_count)
-                intensity_means = (intensity_sum / np.maximum(counts.astype(np.float64), 1.0)).astype(np.float32, copy=False)
-        return unique_voxels, point_means, intensity_means, counts
+                reduced_intensity = (intensity_sum / np.maximum(counts.astype(np.float64), 1.0)).astype(np.float32, copy=False)
+        return unique_voxels, reduced_points, reduced_intensity, counts
 
     def _symmetry_slice_records(
         self,
@@ -1758,7 +1847,7 @@ class VoxelFusionAccumulator:
     ) -> tuple[np.ndarray, np.ndarray | None]:
         if len(xyz) == 0 or voxel_size <= 0:
             return np.asarray(xyz, dtype=np.float32), None if intensity is None else np.asarray(intensity, dtype=np.float32)
-        return self._mean_per_voxel(xyz, intensity, voxel_size)
+        return self._reduce_per_voxel(xyz, intensity, voxel_size)
 
     def _voxel_accumulate(
         self,
@@ -1799,12 +1888,11 @@ class VoxelFusionAccumulator:
             return np.zeros((0, 3), dtype=np.float32), None, np.zeros((0,), dtype=np.float32), raw_points, 0, 0
 
         flattened_voxels = np.concatenate(chunk_voxels, axis=0)
-        _, inverse = self._unique_rows_first_seen(flattened_voxels)
+        fused_voxels, inverse = self._unique_rows_first_seen(flattened_voxels)
         voxel_count = int(np.max(inverse) + 1) if len(inverse) > 0 else 0
         point_means = np.concatenate(chunk_point_means, axis=0).astype(np.float64, copy=False)
         weights = np.concatenate(chunk_weights_per_voxel, axis=0).astype(np.float64, copy=False)
         confidence_weights = np.concatenate(confidence_weights_per_voxel, axis=0).astype(np.float64, copy=False)
-        weighted_point_sum = self._sum_by_group(point_means * weights[:, None], inverse, voxel_count, dtype=np.float64)
         weight_sum = np.bincount(inverse, weights=weights, minlength=voxel_count).astype(np.float64)
         voxel_hits = np.bincount(inverse, minlength=voxel_count).astype(np.int32)
         voxel_confidence_sum = np.bincount(inverse, weights=confidence_weights, minlength=voxel_count).astype(np.float32)
@@ -1812,18 +1900,26 @@ class VoxelFusionAccumulator:
         if not np.any(keep_mask):
             return np.zeros((0, 3), dtype=np.float32), None, np.zeros((0,), dtype=np.float32), raw_points, voxel_count, 0
 
-        xyz = (
-            weighted_point_sum[keep_mask] / np.maximum(weight_sum[keep_mask, None], 1e-6)
-        ).astype(np.float32, copy=False)
+        if self.config.voxel_reduction_mode == "random_point":
+            selected_indices = self._select_weighted_group_members(fused_voxels, inverse, weights, voxel_count)
+            xyz = point_means[selected_indices[keep_mask]].astype(np.float32, copy=False)
+        else:
+            weighted_point_sum = self._sum_by_group(point_means * weights[:, None], inverse, voxel_count, dtype=np.float64)
+            xyz = (
+                weighted_point_sum[keep_mask] / np.maximum(weight_sum[keep_mask, None], 1e-6)
+            ).astype(np.float32, copy=False)
         intensity = None
         if has_intensity:
             intensity_means = np.concatenate(chunk_intensity_means, axis=0).astype(np.float64, copy=False)
-            weighted_intensity_sum = np.bincount(
-                inverse,
-                weights=intensity_means * weights,
-                minlength=voxel_count,
-            ).astype(np.float64)
-            intensity = (weighted_intensity_sum[keep_mask] / np.maximum(weight_sum[keep_mask], 1e-6)).astype(np.float32, copy=False)
+            if self.config.voxel_reduction_mode == "random_point":
+                intensity = intensity_means[selected_indices[keep_mask]].astype(np.float32, copy=False)
+            else:
+                weighted_intensity_sum = np.bincount(
+                    inverse,
+                    weights=intensity_means * weights,
+                    minlength=voxel_count,
+                ).astype(np.float64)
+                intensity = (weighted_intensity_sum[keep_mask] / np.maximum(weight_sum[keep_mask], 1e-6)).astype(np.float32, copy=False)
         confidence = voxel_confidence_sum[keep_mask].astype(np.float32, copy=False)
         return xyz, intensity, confidence, raw_points, voxel_count, int(np.count_nonzero(keep_mask))
 
@@ -2039,7 +2135,7 @@ class VoxelFusionAccumulator:
             ).astype(np.float32, copy=False)
         return np.vstack(bridges).astype(np.float32), bridge_intensity, bridge_confidence, bridge_count
 
-    def _mean_per_voxel(
+    def _reduce_per_voxel(
         self,
         xyz: np.ndarray,
         intensity: np.ndarray | None,

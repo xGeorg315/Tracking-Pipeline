@@ -20,7 +20,7 @@ def test_lane_box_mask_filters_points() -> None:
     assert mask.tolist() == [True, False, False]
 
 
-def test_select_best_frames_for_aggregation_limits_to_last_k_before_touch() -> None:
+def test_select_best_frames_for_aggregation_limits_to_last_k_from_touch() -> None:
     lane_box = LaneBox.from_values([0.0, 10.0, 0.0, 20.0, 0.0, 2.0])
     chunks = [
         np.array([[0.0, 1.0, 0.0]], dtype=np.float32),
@@ -40,7 +40,7 @@ def test_select_best_frames_for_aggregation_limits_to_last_k_before_touch() -> N
         length_coverage_bins=4,
         lane_box=lane_box,
         line_axis="y",
-        line_ratio=0.20,
+        line_ratio=0.15,
         line_touch_margin=0.05,
     )
     assert len(selected_chunks) == 2
@@ -70,6 +70,29 @@ def test_select_best_frames_for_aggregation_keyframe_motion_keeps_endpoints() ->
     assert frame_ids[-1] == 14
     assert len(frame_ids) == 3
     assert info["strategy"] == "keyframe_motion"
+
+
+def test_select_best_frames_for_aggregation_last_k_frames_keeps_last_k() -> None:
+    lane_box = LaneBox.from_values([0.0, 10.0, 0.0, 20.0, 0.0, 2.0])
+    chunks = [np.array([[0.0, float(y), 0.0]], dtype=np.float32) for y in [1.0, 2.0, 5.0, 6.0, 10.0]]
+    centers = [chunk.mean(axis=0) for chunk in chunks]
+    _, _, frame_ids, info = select_best_frames_for_aggregation(
+        chunks=chunks,
+        centers=centers,
+        frame_ids=[10, 11, 12, 13, 14],
+        frame_selection_method="last_k_frames",
+        use_all_frames=False,
+        top_k=3,
+        keyframe_keep=2,
+        length_coverage_bins=4,
+        lane_box=lane_box,
+        line_axis="y",
+        line_ratio=0.20,
+        line_touch_margin=0.05,
+    )
+    assert frame_ids == [12, 13, 14]
+    assert info["strategy"] == "last_k_frames"
+    assert info["candidate_count"] == 5
 
 
 def test_select_best_frames_for_aggregation_length_coverage_preserves_longitudinal_span() -> None:

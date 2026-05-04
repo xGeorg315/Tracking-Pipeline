@@ -331,6 +331,19 @@ def select_best_frames_for_aggregation(
             "candidate_count": len(chunks),
         }
 
+    if method == "last_k_frames":
+        chosen = list(range(len(chunks)))[-max(1, int(top_k)) :]
+        return (
+            [chunks[index] for index in chosen],
+            [centers[index] for index in chosen],
+            [frame_ids[index] for index in chosen],
+            {
+                "strategy": "last_k_frames",
+                "candidate_count": len(chunks),
+                "selected_end_index": int(chosen[-1]),
+            },
+        )
+
     if method == "keyframe_motion":
         chosen = select_keyframes_by_motion(centers, max(1, int(keyframe_keep)))
         return (
@@ -416,7 +429,7 @@ def select_best_frames_for_aggregation(
     lo, hi = lane_axis_bounds(lane_box, axis_idx)
     line_value = lo + clamp01(line_ratio) * (hi - lo)
     touch_idx = find_touch_start_index(chunks, centers, axis_idx, line_value, line_touch_margin)
-    candidate_indices = list(range(0, touch_idx + 1)) if touch_idx is not None else list(range(len(chunks)))
+    candidate_indices = list(range(touch_idx, len(chunks))) if touch_idx is not None else list(range(len(chunks)))
     chosen = candidate_indices[-max(1, int(top_k)) :]
     return (
         [chunks[i] for i in chosen],

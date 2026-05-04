@@ -122,7 +122,7 @@ output:
   mode: run
   root_dir: runs
   dataset_root_dir: dataset
-  save_world: false
+  save_world: true
   save_aggregate_intensity: true
   require_track_exit: true
   track_exit_edge_margin: 5 
