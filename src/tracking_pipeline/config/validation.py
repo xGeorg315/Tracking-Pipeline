@@ -254,6 +254,13 @@ def validate_config(config: PipelineConfig) -> None:
         raise ConfigError("aggregation.min_saved_aggregate_points must be >= 0")
     if config.aggregation.registration_min_kept_chunks < 1:
         raise ConfigError("aggregation.registration_min_kept_chunks must be >= 1")
+    if (
+        config.aggregation.registration_good_chunk_fitness_threshold < 0
+        or config.aggregation.registration_good_chunk_fitness_threshold > 1
+    ):
+        raise ConfigError("aggregation.registration_good_chunk_fitness_threshold must be within [0, 1]")
+    if config.aggregation.registration_target_good_chunks < 1:
+        raise ConfigError("aggregation.registration_target_good_chunks must be >= 1")
     if config.aggregation.confidence_point_cap_max_points < 1:
         raise ConfigError("aggregation.confidence_point_cap_max_points must be >= 1")
     if config.aggregation.confidence_point_cap_bins < 1:

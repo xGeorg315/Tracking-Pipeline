@@ -78,6 +78,7 @@ class _AggregationComponentProfiler:
 
 class VoxelFusionAccumulator:
     fusion_method = "voxel_fusion"
+    _REGISTRATION_RESCUE_POOL_SIZE = 8
     _LONG_VEHICLE_TAIL_POINT_RATIO = 0.25
     _LONG_VEHICLE_TAIL_EXTENT_RATIO = 0.20
     _LONG_VEHICLE_TAIL_CANDIDATE_COUNT = 2
@@ -190,7 +191,14 @@ class VoxelFusionAccumulator:
             metrics = {**self._base_metrics(track), **selection_info, **self._motion_deskew_metrics()}
             return self._result(track, lane_box, np.zeros((0, 3), dtype=np.float32), [], "empty_selection", metrics)
 
-        selected_chunks, selected_intensity, motion_deskew_metrics = self._apply_motion_deskew(
+        (
+            prepared_chunks,
+            prepared_intensity,
+            selected_centers,
+            selected_frame_ids,
+            motion_deskew_metrics,
+            candidate_anchor_center_world,
+        ) = self._prepare_selected_chunks(
             track,
             selected_chunks,
             selected_intensity,
@@ -198,35 +206,9 @@ class VoxelFusionAccumulator:
             selected_frame_ids,
             selected_frame_timestamps_ns,
             selected_point_timestamps_ns,
-            long_vehicle_mode_applied,
+            long_vehicle_mode_applied=long_vehicle_mode_applied,
         )
-        candidate_anchor_center_world = self._candidate_anchor_center_world(selected_centers, track)
-        if not self.output_config.save_world:
-            if self._use_tracker_pose_icp_init():
-                anchor_center = np.asarray(candidate_anchor_center_world, dtype=np.float32)
-                selected_chunks = [
-                    (np.asarray(points, dtype=np.float32) - anchor_center).astype(np.float32, copy=False)
-                    for points in selected_chunks
-                ]
-            else:
-                selected_chunks = [
-                    (np.asarray(points, dtype=np.float32) - np.asarray(center, dtype=np.float32)).astype(np.float32, copy=False)
-                    for points, center in zip(selected_chunks, selected_centers)
-                ]
-
-        selected_triplets = [
-            (
-                *self._voxel_downsample(points, intensity, self.config.frame_downsample_voxel),
-                center,
-                frame_id,
-            )
-            for points, intensity, center, frame_id in zip(selected_chunks, selected_intensity, selected_centers, selected_frame_ids)
-        ]
-        selected_triplets = [(points, intensity, center, frame_id) for points, intensity, center, frame_id in selected_triplets if len(points) > 0]
-        prepared_chunks = [points for points, _, _, _ in selected_triplets]
-        prepared_intensity = [intensity for _, intensity, _, _ in selected_triplets]
-        selected_centers = [center for _, _, center, _ in selected_triplets]
-        selected_frame_ids = [int(frame_id) for _, _, _, frame_id in selected_triplets]
+        attempt_candidate_frame_ids = [int(frame_id) for frame_id in selected_frame_ids]
         if not prepared_chunks:
             metrics = {**self._base_metrics(track), **selection_info, **motion_deskew_metrics}
             return self._result(
@@ -238,40 +220,158 @@ class VoxelFusionAccumulator:
                 metrics,
                 prepared_chunk_count=0,
             )
+        prepared_registration_intensity = [
+            None if values is None else np.asarray(values, dtype=np.float32).copy() for values in prepared_intensity
+        ]
+        prepared_registration_centers = [np.asarray(center, dtype=np.float32).copy() for center in selected_centers]
+        prepared_registration_frame_ids = [int(frame_id) for frame_id in selected_frame_ids]
 
-        registration_initial_guesses = self._registration_initial_guesses(selected_centers)
         if self._should_profile_registration():
             with component_profiler.stage("registration"):
-                accumulation_input, registration_metrics = self._prepare_for_fusion(
+                (
+                    accumulation_input,
+                    prepared_intensity,
+                    selected_centers,
+                    selected_frame_ids,
+                    registration_metrics,
+                ) = self._run_registration_attempt(
                     prepared_chunks,
-                    initial_guesses=registration_initial_guesses,
+                    prepared_intensity,
+                    selected_centers,
+                    selected_frame_ids,
+                    enforce_good_chunk_filter=self.fusion_method == "registration_voxel_fusion" and not long_vehicle_mode_applied,
                 )
         else:
-            accumulation_input, registration_metrics = self._prepare_for_fusion(
+            (
+                accumulation_input,
+                prepared_intensity,
+                selected_centers,
+                selected_frame_ids,
+                registration_metrics,
+            ) = self._run_registration_attempt(
                 prepared_chunks,
-                initial_guesses=registration_initial_guesses,
+                prepared_intensity,
+                selected_centers,
+                selected_frame_ids,
+                enforce_good_chunk_filter=self.fusion_method == "registration_voxel_fusion" and not long_vehicle_mode_applied,
             )
-        if registration_initial_guesses is not None:
-            registration_metrics = dict(registration_metrics)
-            registration_metrics["registration_init_source"] = "kalman_centers"
-            registration_metrics["registration_init_reference_frame_id"] = int(selected_frame_ids[0]) if selected_frame_ids else -1
-        pre_registration_centers = [np.asarray(center, dtype=np.float32).copy() for center in selected_centers]
-        pre_registration_frame_ids = [int(frame_id) for frame_id in selected_frame_ids]
-        pre_registration_intensity = [None if values is None else np.asarray(values, dtype=np.float32).copy() for values in prepared_intensity]
-        (
-            accumulation_input,
-            prepared_intensity,
-            selected_centers,
-            selected_frame_ids,
-            registration_metrics,
-        ) = self._apply_registration_subset(
-            accumulation_input,
-            prepared_chunks,
-            prepared_intensity,
-            selected_centers,
-            selected_frame_ids,
-            registration_metrics,
+        selected_selection_info = dict(selection_info)
+        selected_motion_metrics = dict(motion_deskew_metrics)
+        selected_candidate_anchor_center_world = np.asarray(candidate_anchor_center_world, dtype=np.float32).copy()
+        attempt_good_chunk_count = int(registration_metrics.get("registration_good_chunk_count", 0))
+        attempt_good_chunk_indices = [int(index) for index in registration_metrics.get("registration_good_chunk_indices", [])]
+        attempt_bad_chunk_indices = [int(index) for index in registration_metrics.get("registration_bad_chunk_indices", [])]
+        attempt_output_chunk_count = int(registration_metrics.get("registration_attempt_output_chunk_count", 0))
+        attempt_dropped_chunk_count = int(registration_metrics.get("registration_attempt_dropped_count", 0))
+        attempt_keep_indices = [int(index) for index in registration_metrics.get("registration_attempt_keep_indices", [])]
+        attempt_chunk_weights = [float(weight) for weight in registration_metrics.get("registration_attempt_chunk_weights", [])]
+        rescue_attempted = False
+        rescue_used = False
+        if self._should_attempt_registration_rescue(
+            long_vehicle_mode_applied=long_vehicle_mode_applied,
+            good_chunk_count=attempt_good_chunk_count,
+            filtered_frame_ids=track_frame_ids,
+            selected_frame_ids=attempt_candidate_frame_ids,
+        ):
+            rescue_attempted = True
+            rescue_selection = self._select_registration_rescue_candidates(
+                track=track,
+                lane_box=lane_box,
+                frame_selection_method=frame_selection_method,
+                filtered_chunks=list(world_chunks),
+                filtered_intensity=list(chunk_intensity),
+                filtered_point_timestamps_ns=list(chunk_point_timestamps_ns),
+                filtered_centers=list(track_centers),
+                filtered_frame_ids=list(track_frame_ids),
+                filtered_frame_timestamps_ns=list(track_frame_timestamps_ns),
+                selection_info_base={**lane_end_touch_info, **chunk_quality_info},
+                long_vehicle_mode_applied=long_vehicle_mode_applied,
+            )
+            if rescue_selection is not None:
+                (
+                    rescue_chunks,
+                    rescue_intensity,
+                    rescue_centers,
+                    rescue_frame_ids,
+                    rescue_selection_info,
+                    rescue_motion_metrics,
+                    rescue_candidate_anchor_center_world,
+                ) = rescue_selection
+                if self._should_profile_registration():
+                    with component_profiler.stage("registration"):
+                        (
+                            rescue_accumulation_input,
+                            rescue_prepared_intensity,
+                            rescue_selected_centers,
+                            rescue_selected_frame_ids,
+                            rescue_registration_metrics,
+                        ) = self._run_registration_attempt(
+                            rescue_chunks,
+                            rescue_intensity,
+                            rescue_centers,
+                            rescue_frame_ids,
+                            enforce_good_chunk_filter=True,
+                        )
+                else:
+                    (
+                        rescue_accumulation_input,
+                        rescue_prepared_intensity,
+                        rescue_selected_centers,
+                        rescue_selected_frame_ids,
+                        rescue_registration_metrics,
+                    ) = self._run_registration_attempt(
+                        rescue_chunks,
+                        rescue_intensity,
+                        rescue_centers,
+                        rescue_frame_ids,
+                        enforce_good_chunk_filter=True,
+                    )
+                rescue_good_chunk_count = int(rescue_registration_metrics.get("registration_good_chunk_count", 0))
+                if (
+                    rescue_good_chunk_count >= int(self.config.registration_target_good_chunks)
+                    or rescue_good_chunk_count > attempt_good_chunk_count
+                ):
+                    rescue_used = True
+                    prepared_chunks = list(rescue_chunks)
+                    prepared_registration_intensity = [
+                        None if values is None else np.asarray(values, dtype=np.float32).copy()
+                        for values in rescue_intensity
+                    ]
+                    prepared_registration_centers = [
+                        np.asarray(center, dtype=np.float32).copy() for center in rescue_centers
+                    ]
+                    prepared_registration_frame_ids = [int(frame_id) for frame_id in rescue_frame_ids]
+                    accumulation_input = rescue_accumulation_input
+                    prepared_intensity = rescue_prepared_intensity
+                    selected_centers = rescue_selected_centers
+                    selected_frame_ids = rescue_selected_frame_ids
+                    registration_metrics = rescue_registration_metrics
+                    selected_selection_info = dict(rescue_selection_info)
+                    selected_motion_metrics = dict(rescue_motion_metrics)
+                    selected_candidate_anchor_center_world = np.asarray(
+                        rescue_candidate_anchor_center_world,
+                        dtype=np.float32,
+                    ).copy()
+        registration_metrics = dict(registration_metrics)
+        registration_metrics["registration_good_chunk_fitness_threshold"] = float(
+            self.config.registration_good_chunk_fitness_threshold
         )
+        registration_metrics["registration_target_good_chunks"] = int(self.config.registration_target_good_chunks)
+        registration_metrics["registration_good_chunk_count_attempt"] = int(attempt_good_chunk_count)
+        registration_metrics["registration_good_chunk_count_final"] = int(
+            registration_metrics.get("registration_good_chunk_count", 0)
+        )
+        registration_metrics["registration_good_chunk_rescue_attempted"] = bool(rescue_attempted)
+        registration_metrics["registration_good_chunk_rescue_used"] = bool(rescue_used)
+        registration_metrics["registration_good_chunk_indices_attempt"] = list(attempt_good_chunk_indices)
+        registration_metrics["registration_good_chunk_indices_final"] = [
+            int(index) for index in registration_metrics.get("registration_good_chunk_indices", [])
+        ]
+        registration_metrics["registration_bad_chunk_indices_attempt"] = list(attempt_bad_chunk_indices)
+        registration_metrics["registration_attempt_output_chunk_count"] = int(attempt_output_chunk_count)
+        registration_metrics["registration_attempt_dropped_count"] = int(attempt_dropped_chunk_count)
+        registration_metrics["registration_attempt_keep_indices"] = list(attempt_keep_indices)
+        registration_metrics["registration_attempt_chunk_weights"] = list(attempt_chunk_weights)
         (
             accumulation_input,
             prepared_intensity,
@@ -285,11 +385,11 @@ class VoxelFusionAccumulator:
             prepared_intensity,
             selected_centers,
             selected_frame_ids,
-            pre_registration_intensity,
-            pre_registration_centers,
-            pre_registration_frame_ids,
+            prepared_registration_intensity,
+            prepared_registration_centers,
+            prepared_registration_frame_ids,
             registration_metrics,
-            selection_info,
+            selected_selection_info,
             long_vehicle_mode_applied=long_vehicle_mode_applied,
         )
         chunk_weights = self._chunk_weights(track, accumulation_input, registration_metrics, long_vehicle_mode_applied)
@@ -305,8 +405,8 @@ class VoxelFusionAccumulator:
         if len(fused_xyz) == 0:
             metrics = {
                 **self._base_metrics(track),
-                **selection_info,
-                **motion_deskew_metrics,
+                **selected_selection_info,
+                **selected_motion_metrics,
                 **registration_metrics,
                 **self._aggregation_timing_metrics(component_profiler.snapshot()),
             }
@@ -320,7 +420,7 @@ class VoxelFusionAccumulator:
                 prepared_chunk_count=len(accumulation_input),
                 candidate_points_world=None,
                 candidate_intensity_world=None,
-                candidate_anchor_center_world=candidate_anchor_center_world,
+                candidate_anchor_center_world=selected_candidate_anchor_center_world,
                 candidate_status="missing",
             )
 
@@ -351,11 +451,11 @@ class VoxelFusionAccumulator:
             dimension_metrics = self._vehicle_dimension_metrics(filtered_xyz)
             metrics = {
                 **self._base_metrics(track),
-                **selection_info,
-                **motion_deskew_metrics,
+                **selected_selection_info,
+                **selected_motion_metrics,
                 **registration_metrics,
                 "alignment_method": registration_metrics.get("alignment_method", "none"),
-                "frame_selection_method": selection_info.get("strategy", self.config.frame_selection_method),
+                "frame_selection_method": selected_selection_info.get("strategy", self.config.frame_selection_method),
                 "fusion_method": self.fusion_method,
                 "chunk_weights": chunk_weights,
                 "raw_point_count": raw_points_total,
@@ -406,7 +506,7 @@ class VoxelFusionAccumulator:
                 candidate_points_world, candidate_intensity_world = self._candidate_world_outputs(
                     completed_xyz,
                     completed_intensity,
-                    candidate_anchor_center_world,
+                    selected_candidate_anchor_center_world,
                 )
                 metrics["point_count_after_downsample"] = int(len(completed_xyz))
                 point_count_after_confidence_cap = int(len(capped_xyz))
@@ -445,7 +545,7 @@ class VoxelFusionAccumulator:
             confidence_point_cap_applied=confidence_point_cap_applied,
             candidate_points_world=candidate_points_world,
             candidate_intensity_world=candidate_intensity_world,
-            candidate_anchor_center_world=candidate_anchor_center_world,
+            candidate_anchor_center_world=selected_candidate_anchor_center_world,
             candidate_status=candidate_status,
         )
 
@@ -1121,6 +1221,8 @@ class VoxelFusionAccumulator:
         selected_centers: list[np.ndarray],
         selected_frame_ids: list[int],
         registration_metrics: dict[str, Any],
+        *,
+        enforce_good_chunk_filter: bool = True,
     ) -> tuple[list[np.ndarray], list[np.ndarray | None], list[np.ndarray], list[int], dict[str, Any]]:
         input_count = len(prepared_intensity)
         keep_indices = registration_metrics.get("registration_keep_indices")
@@ -1144,30 +1246,67 @@ class VoxelFusionAccumulator:
             attempt_chunk_weights = [1.0 for _ in keep_indices]
         else:
             attempt_chunk_weights = [float(weight) for weight in chunk_weights]
-        fallback_min_kept_chunks = max(1, int(self.config.registration_min_kept_chunks))
-        fallback_enabled = bool(self.config.enable_registration_underfill_fallback)
-        fallback_applied = (
-            fallback_enabled
-            and not bool(synced_metrics.get("registration_skipped", False))
-            and attempt_output_count < fallback_min_kept_chunks
-            and attempt_output_count < input_count
-        )
-        if fallback_applied:
-            effective_chunks = list(prepared_chunks)
-            effective_intensity = list(prepared_intensity)
-            effective_centers = list(selected_centers)
-            effective_frame_ids = [int(frame_id) for frame_id in selected_frame_ids]
-            effective_keep_indices = list(range(input_count))
-            effective_chunk_weights = [1.0 for _ in effective_keep_indices]
+        if not enforce_good_chunk_filter:
+            fallback_min_kept_chunks = max(1, int(self.config.registration_min_kept_chunks))
+            fallback_enabled = bool(self.config.enable_registration_underfill_fallback)
+            fallback_applied = (
+                fallback_enabled
+                and not bool(synced_metrics.get("registration_skipped", False))
+                and attempt_output_count < fallback_min_kept_chunks
+                and attempt_output_count < input_count
+            )
+            if fallback_applied:
+                effective_chunks = list(prepared_chunks)
+                effective_intensity = list(prepared_intensity)
+                effective_centers = list(selected_centers)
+                effective_frame_ids = [int(frame_id) for frame_id in selected_frame_ids]
+                effective_keep_indices = list(range(input_count))
+                effective_chunk_weights = [1.0 for _ in effective_keep_indices]
+            else:
+                effective_chunks = list(accumulation_input)
+                effective_intensity = [prepared_intensity[index] for index in keep_indices]
+                effective_centers = [selected_centers[index] for index in keep_indices]
+                effective_frame_ids = [int(selected_frame_ids[index]) for index in keep_indices]
+                effective_keep_indices = list(keep_indices)
+                effective_chunk_weights = attempt_chunk_weights
+            bad_indices: list[int] = []
+            synced_metrics["registration_fallback_applied"] = bool(fallback_applied)
+            synced_metrics["registration_fallback_min_kept_chunks"] = int(fallback_min_kept_chunks)
         else:
-            effective_chunks = list(accumulation_input)
-            effective_intensity = [prepared_intensity[index] for index in keep_indices]
-            effective_centers = [selected_centers[index] for index in keep_indices]
-            effective_frame_ids = [int(selected_frame_ids[index]) for index in keep_indices]
-            effective_keep_indices = list(keep_indices)
-            effective_chunk_weights = attempt_chunk_weights
-        synced_metrics["registration_fallback_applied"] = bool(fallback_applied)
-        synced_metrics["registration_fallback_min_kept_chunks"] = int(fallback_min_kept_chunks)
+            pair_fitness = synced_metrics.get("registration_pair_fitness")
+            if not isinstance(pair_fitness, list):
+                pair_fitness = []
+            fitness_threshold = float(self.config.registration_good_chunk_fitness_threshold)
+            accepted_chunks_by_index = {
+                int(index): np.asarray(chunk, dtype=np.float32).copy()
+                for index, chunk in zip(keep_indices, accumulation_input)
+            }
+            accepted_weights_by_index = {
+                int(index): float(weight)
+                for index, weight in zip(keep_indices, attempt_chunk_weights)
+            }
+            good_non_anchor_indices: list[int] = []
+            bad_indices = []
+            for index in keep_indices:
+                if int(index) == 0:
+                    continue
+                fitness = pair_fitness[int(index) - 1] if (int(index) - 1) < len(pair_fitness) else None
+                if fitness is not None and float(fitness) >= fitness_threshold:
+                    good_non_anchor_indices.append(int(index))
+                else:
+                    bad_indices.append(int(index))
+            has_reference_chunk = 0 in accepted_chunks_by_index
+            if has_reference_chunk and good_non_anchor_indices:
+                effective_keep_indices = [0, *good_non_anchor_indices]
+            else:
+                effective_keep_indices = []
+            effective_chunks = [accepted_chunks_by_index[index] for index in effective_keep_indices if index in accepted_chunks_by_index]
+            effective_intensity = [prepared_intensity[index] for index in effective_keep_indices]
+            effective_centers = [selected_centers[index] for index in effective_keep_indices]
+            effective_frame_ids = [int(selected_frame_ids[index]) for index in effective_keep_indices]
+            effective_chunk_weights = [accepted_weights_by_index.get(index, 1.0) for index in effective_keep_indices]
+            synced_metrics["registration_fallback_applied"] = False
+            synced_metrics["registration_fallback_min_kept_chunks"] = int(max(1, int(self.config.registration_min_kept_chunks)))
         synced_metrics["registration_attempt_output_chunk_count"] = attempt_output_count
         synced_metrics["registration_attempt_dropped_count"] = attempt_dropped_count
         synced_metrics["registration_attempt_keep_indices"] = list(keep_indices)
@@ -1176,6 +1315,9 @@ class VoxelFusionAccumulator:
         synced_metrics["registration_dropped_count"] = max(0, int(input_count - len(effective_keep_indices)))
         synced_metrics["registration_keep_indices"] = list(effective_keep_indices)
         synced_metrics["registration_chunk_weights"] = list(effective_chunk_weights)
+        synced_metrics["registration_good_chunk_count"] = int(len(effective_keep_indices))
+        synced_metrics["registration_good_chunk_indices"] = list(effective_keep_indices)
+        synced_metrics["registration_bad_chunk_indices"] = list(bad_indices)
         return (
             effective_chunks,
             effective_intensity,
@@ -1210,6 +1352,253 @@ class VoxelFusionAccumulator:
             return []
         mapping = {int(frame_id): int(values[index]) if index < len(values) else -1 for index, frame_id in enumerate(source_frame_ids)}
         return [int(mapping.get(int(frame_id), -1)) for frame_id in target_frame_ids]
+
+    def _prepare_selected_chunks(
+        self,
+        track: Track,
+        selected_chunks: list[np.ndarray],
+        selected_intensity: list[np.ndarray | None],
+        selected_centers: list[np.ndarray],
+        selected_frame_ids: list[int],
+        selected_frame_timestamps_ns: list[int],
+        selected_point_timestamps_ns: list[np.ndarray | None],
+        *,
+        long_vehicle_mode_applied: bool,
+    ) -> tuple[
+        list[np.ndarray],
+        list[np.ndarray | None],
+        list[np.ndarray],
+        list[int],
+        dict[str, Any],
+        np.ndarray,
+    ]:
+        selected_chunks, selected_intensity, motion_deskew_metrics = self._apply_motion_deskew(
+            track,
+            selected_chunks,
+            selected_intensity,
+            selected_centers,
+            selected_frame_ids,
+            selected_frame_timestamps_ns,
+            selected_point_timestamps_ns,
+            long_vehicle_mode_applied,
+        )
+        candidate_anchor_center_world = self._candidate_anchor_center_world(selected_centers, track)
+        if not self.output_config.save_world:
+            if self._use_tracker_pose_icp_init():
+                anchor_center = np.asarray(candidate_anchor_center_world, dtype=np.float32)
+                selected_chunks = [
+                    (np.asarray(points, dtype=np.float32) - anchor_center).astype(np.float32, copy=False)
+                    for points in selected_chunks
+                ]
+            else:
+                selected_chunks = [
+                    (np.asarray(points, dtype=np.float32) - np.asarray(center, dtype=np.float32)).astype(np.float32, copy=False)
+                    for points, center in zip(selected_chunks, selected_centers)
+                ]
+
+        selected_triplets = [
+            (
+                *self._voxel_downsample(points, intensity, self.config.frame_downsample_voxel),
+                center,
+                frame_id,
+            )
+            for points, intensity, center, frame_id in zip(
+                selected_chunks,
+                selected_intensity,
+                selected_centers,
+                selected_frame_ids,
+            )
+        ]
+        selected_triplets = [
+            (points, intensity, center, frame_id)
+            for points, intensity, center, frame_id in selected_triplets
+            if len(points) > 0
+        ]
+        prepared_chunks = [points for points, _, _, _ in selected_triplets]
+        prepared_intensity = [intensity for _, intensity, _, _ in selected_triplets]
+        prepared_centers = [center for _, _, center, _ in selected_triplets]
+        prepared_frame_ids = [int(frame_id) for _, _, _, frame_id in selected_triplets]
+        return (
+            prepared_chunks,
+            prepared_intensity,
+            prepared_centers,
+            prepared_frame_ids,
+            motion_deskew_metrics,
+            np.asarray(candidate_anchor_center_world, dtype=np.float32),
+        )
+
+    def _should_attempt_registration_rescue(
+        self,
+        *,
+        long_vehicle_mode_applied: bool,
+        good_chunk_count: int,
+        filtered_frame_ids: list[int],
+        selected_frame_ids: list[int],
+    ) -> bool:
+        return (
+            self.fusion_method == "registration_voxel_fusion"
+            and not long_vehicle_mode_applied
+            and int(good_chunk_count) < int(self.config.registration_target_good_chunks)
+            and len(filtered_frame_ids) > len(selected_frame_ids)
+        )
+
+    def _select_registration_rescue_candidates(
+        self,
+        *,
+        track: Track,
+        lane_box: LaneBox,
+        frame_selection_method: str,
+        filtered_chunks: list[np.ndarray],
+        filtered_intensity: list[np.ndarray | None],
+        filtered_point_timestamps_ns: list[np.ndarray | None],
+        filtered_centers: list[np.ndarray],
+        filtered_frame_ids: list[int],
+        filtered_frame_timestamps_ns: list[int],
+        selection_info_base: dict[str, Any],
+        long_vehicle_mode_applied: bool,
+    ) -> tuple[
+        list[np.ndarray],
+        list[np.ndarray | None],
+        list[np.ndarray],
+        list[int],
+        dict[str, Any],
+        dict[str, Any],
+        np.ndarray,
+    ] | None:
+        if not filtered_chunks:
+            return None
+        rescue_limit = min(len(filtered_frame_ids), int(self._REGISTRATION_RESCUE_POOL_SIZE))
+        if rescue_limit <= 0:
+            return None
+        rescue_chunks, rescue_centers, rescue_frame_ids, rescue_selection_info = select_best_frames_for_aggregation(
+            chunks=list(filtered_chunks),
+            centers=list(filtered_centers),
+            frame_ids=list(filtered_frame_ids),
+            frame_selection_method=frame_selection_method,
+            use_all_frames=self.config.use_all_frames,
+            top_k=rescue_limit,
+            keyframe_keep=rescue_limit,
+            length_coverage_bins=self.config.length_coverage_bins,
+            lane_box=lane_box,
+            line_axis=self.config.frame_selection_line_axis,
+            line_ratio=self.config.frame_selection_line_ratio,
+            line_touch_margin=self.config.frame_selection_touch_margin,
+        )
+        rescue_selection_info = {**selection_info_base, **rescue_selection_info}
+        (
+            rescue_chunks,
+            rescue_centers,
+            rescue_frame_ids,
+            rescue_selection_info,
+        ) = self._enforce_long_vehicle_component_coverage(
+            rescue_chunks,
+            rescue_centers,
+            rescue_frame_ids,
+            list(filtered_chunks),
+            list(filtered_centers),
+            list(filtered_frame_ids),
+            rescue_selection_info,
+            long_vehicle_mode_applied=long_vehicle_mode_applied,
+        )
+        if len(rescue_frame_ids) > rescue_limit:
+            rescue_chunks = list(rescue_chunks[-rescue_limit:])
+            rescue_centers = list(rescue_centers[-rescue_limit:])
+            rescue_frame_ids = [int(frame_id) for frame_id in rescue_frame_ids[-rescue_limit:]]
+        rescue_intensity = self._select_optional_by_frame_ids(filtered_frame_ids, filtered_intensity, rescue_frame_ids)
+        rescue_point_timestamps_ns = self._select_optional_by_frame_ids(
+            filtered_frame_ids,
+            filtered_point_timestamps_ns,
+            rescue_frame_ids,
+        )
+        rescue_frame_timestamps_ns = self._select_scalar_by_frame_ids(
+            filtered_frame_ids,
+            filtered_frame_timestamps_ns,
+            rescue_frame_ids,
+        )
+        if self.config.shape_consistency_filter:
+            pre_shape_frame_ids = [int(frame_id) for frame_id in rescue_frame_ids]
+            rescue_chunks, rescue_centers, rescue_frame_ids, shape_info = filter_chunks_by_shape_consistency(
+                rescue_chunks,
+                rescue_centers,
+                rescue_frame_ids,
+                self.config.shape_consistency_max_extent_ratio,
+            )
+            rescue_intensity = self._select_optional_by_frame_ids(pre_shape_frame_ids, rescue_intensity, rescue_frame_ids)
+            rescue_point_timestamps_ns = self._select_optional_by_frame_ids(
+                pre_shape_frame_ids,
+                rescue_point_timestamps_ns,
+                rescue_frame_ids,
+            )
+            rescue_frame_timestamps_ns = self._select_scalar_by_frame_ids(
+                pre_shape_frame_ids,
+                rescue_frame_timestamps_ns,
+                rescue_frame_ids,
+            )
+            rescue_selection_info = {**rescue_selection_info, **shape_info}
+        if not rescue_chunks:
+            return None
+        (
+            prepared_chunks,
+            prepared_intensity,
+            prepared_centers,
+            prepared_frame_ids,
+            motion_deskew_metrics,
+            candidate_anchor_center_world,
+        ) = self._prepare_selected_chunks(
+            track,
+            rescue_chunks,
+            rescue_intensity,
+            rescue_centers,
+            rescue_frame_ids,
+            rescue_frame_timestamps_ns,
+            rescue_point_timestamps_ns,
+            long_vehicle_mode_applied=long_vehicle_mode_applied,
+        )
+        if not prepared_chunks:
+            return None
+        return (
+            prepared_chunks,
+            prepared_intensity,
+            prepared_centers,
+            prepared_frame_ids,
+            rescue_selection_info,
+            motion_deskew_metrics,
+            candidate_anchor_center_world,
+        )
+
+    def _run_registration_attempt(
+        self,
+        prepared_chunks: list[np.ndarray],
+        prepared_intensity: list[np.ndarray | None],
+        selected_centers: list[np.ndarray],
+        selected_frame_ids: list[int],
+        *,
+        enforce_good_chunk_filter: bool,
+    ) -> tuple[list[np.ndarray], list[np.ndarray | None], list[np.ndarray], list[int], dict[str, Any]]:
+        registration_initial_guesses = self._registration_initial_guesses(selected_centers)
+        if self._should_profile_registration():
+            accumulation_input, registration_metrics = self._prepare_for_fusion(
+                prepared_chunks,
+                initial_guesses=registration_initial_guesses,
+            )
+        else:
+            accumulation_input, registration_metrics = self._prepare_for_fusion(
+                prepared_chunks,
+                initial_guesses=registration_initial_guesses,
+            )
+        if registration_initial_guesses is not None:
+            registration_metrics = dict(registration_metrics)
+            registration_metrics["registration_init_source"] = "kalman_centers"
+            registration_metrics["registration_init_reference_frame_id"] = int(selected_frame_ids[0]) if selected_frame_ids else -1
+        return self._apply_registration_subset(
+            accumulation_input,
+            prepared_chunks,
+            prepared_intensity,
+            selected_centers,
+            selected_frame_ids,
+            registration_metrics,
+            enforce_good_chunk_filter=enforce_good_chunk_filter,
+        )
 
     def _motion_deskew_metrics(self) -> dict[str, Any]:
         return {

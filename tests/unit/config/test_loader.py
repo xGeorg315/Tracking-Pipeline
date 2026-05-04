@@ -596,6 +596,35 @@ def test_load_config_reads_registration_underfill_fallback_settings(tmp_path: Pa
     assert config.aggregation.registration_min_kept_chunks == 5
 
 
+def test_load_config_reads_registration_good_chunk_settings(tmp_path: Path) -> None:
+    fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+
+    config_path = tmp_path / "config_registration_good_chunks.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "aggregation:",
+                "  registration_good_chunk_fitness_threshold: 0.93",
+                "  registration_target_good_chunks: 5",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.input.paths == [str(fixture_dst.resolve())]
+    assert config.aggregation.registration_good_chunk_fitness_threshold == pytest.approx(0.93)
+    assert config.aggregation.registration_target_good_chunks == 5
+
+
 def test_load_config_reads_classification_settings_and_resolves_paths(tmp_path: Path) -> None:
     fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
     pointnext_root = tmp_path / "PointNeXt"
@@ -1275,6 +1304,46 @@ def test_load_config_rejects_non_positive_voxel_size_for_voxel_grid_clusterer(tm
     )
 
     with pytest.raises(ConfigError, match="aggregation.registration_min_kept_chunks must be >= 1"):
+        load_config(config_path)
+
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "aggregation:",
+                "  registration_good_chunk_fitness_threshold: 1.1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="aggregation.registration_good_chunk_fitness_threshold must be within \\[0, 1\\]"):
+        load_config(config_path)
+
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "aggregation:",
+                "  registration_target_good_chunks: 0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="aggregation.registration_target_good_chunks must be >= 1"):
         load_config(config_path)
 
 

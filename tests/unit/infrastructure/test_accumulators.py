@@ -288,6 +288,7 @@ class _SubsetRegistrationAccumulator(VoxelFusionAccumulator):
             "registration_input_chunk_count": len(chunks),
             "registration_output_chunk_count": 2,
             "registration_dropped_count": 1,
+            "registration_pair_fitness": [0.10, 0.95],
             "registration_keep_indices": [0, 2],
             "registration_chunk_weights": [1.0, 0.8],
             "registration_skipped": False,
@@ -305,10 +306,12 @@ class _ScriptedPrepareAccumulator(VoxelFusionAccumulator):
         *,
         keep_indices: list[int],
         chunk_weights: list[float] | None = None,
+        pair_fitness: list[float] | None = None,
     ):
         super().__init__(config, output_config, tracking_config)
         self.keep_indices = list(keep_indices)
         self.chunk_weights = None if chunk_weights is None else [float(weight) for weight in chunk_weights]
+        self.pair_fitness = None if pair_fitness is None else [float(value) for value in pair_fitness]
 
     def _prepare_for_fusion(
         self,
@@ -322,6 +325,7 @@ class _ScriptedPrepareAccumulator(VoxelFusionAccumulator):
         chunk_weights = self.chunk_weights if self.chunk_weights is not None and len(self.chunk_weights) == len(keep_indices) else [1.0 for _ in keep_indices]
         pair_count = max(0, len(chunks) - 1)
         accepted = max(0, len(keep_indices) - (1 if 0 in keep_indices else 0))
+        pair_fitness = self.pair_fitness if self.pair_fitness is not None and len(self.pair_fitness) == pair_count else [1.0 for _ in range(pair_count)]
         return kept_chunks, {
             "alignment_method": "scripted",
             "registration_backend": "scripted",
@@ -331,8 +335,60 @@ class _ScriptedPrepareAccumulator(VoxelFusionAccumulator):
             "registration_input_chunk_count": len(chunks),
             "registration_output_chunk_count": len(keep_indices),
             "registration_dropped_count": max(0, len(chunks) - len(keep_indices)),
+            "registration_pair_fitness": pair_fitness,
             "registration_keep_indices": keep_indices,
             "registration_chunk_weights": chunk_weights,
+            "registration_skipped": False,
+        }
+
+
+class _SequencedPrepareAccumulator(VoxelFusionAccumulator):
+    fusion_method = "registration_voxel_fusion"
+
+    def __init__(
+        self,
+        config: AggregationConfig,
+        output_config: OutputConfig,
+        tracking_config: TrackingConfig,
+        *,
+        scripted_calls: list[dict[str, object]],
+    ) -> None:
+        super().__init__(config, output_config, tracking_config)
+        self.scripted_calls = [dict(call) for call in scripted_calls]
+        self.call_index = 0
+
+    def _prepare_for_fusion(
+        self,
+        chunks: list[np.ndarray],
+        *,
+        initial_guesses: list[np.ndarray | None] | None = None,
+    ) -> tuple[list[np.ndarray], dict[str, object]]:
+        _ = initial_guesses
+        call = self.scripted_calls[min(self.call_index, len(self.scripted_calls) - 1)]
+        self.call_index += 1
+        raw_keep_indices = call.get("keep_indices", list(range(len(chunks))))
+        keep_indices = [int(index) for index in raw_keep_indices if 0 <= int(index) < len(chunks)]
+        kept_chunks = [chunks[index] for index in keep_indices]
+        pair_count = max(0, len(chunks) - 1)
+        pair_fitness = call.get("pair_fitness")
+        if not isinstance(pair_fitness, list) or len(pair_fitness) != pair_count:
+            pair_fitness = [1.0 for _ in range(pair_count)]
+        chunk_weights = call.get("chunk_weights")
+        if not isinstance(chunk_weights, list) or len(chunk_weights) != len(keep_indices):
+            chunk_weights = [1.0 for _ in keep_indices]
+        accepted = max(0, len(keep_indices) - (1 if 0 in keep_indices else 0))
+        return kept_chunks, {
+            "alignment_method": "sequenced",
+            "registration_backend": "sequenced",
+            "registration_pairs": pair_count,
+            "registration_accepted": accepted,
+            "registration_rejected": max(0, pair_count - accepted),
+            "registration_input_chunk_count": len(chunks),
+            "registration_output_chunk_count": len(keep_indices),
+            "registration_dropped_count": max(0, len(chunks) - len(keep_indices)),
+            "registration_pair_fitness": [float(value) for value in pair_fitness],
+            "registration_keep_indices": keep_indices,
+            "registration_chunk_weights": [float(weight) for weight in chunk_weights],
             "registration_skipped": False,
         }
 
@@ -350,6 +406,8 @@ class _CapturingAccumulator(VoxelFusionAccumulator):
         selected_centers: list[np.ndarray],
         selected_frame_ids: list[int],
         registration_metrics: dict[str, object],
+        *,
+        enforce_good_chunk_filter: bool = True,
     ) -> tuple[list[np.ndarray], list[np.ndarray | None], list[np.ndarray], list[int], dict[str, object]]:
         self.captured["prepared_intensity"] = [
             None if values is None else np.asarray(values, dtype=np.float32).copy() for values in prepared_intensity
@@ -363,6 +421,7 @@ class _CapturingAccumulator(VoxelFusionAccumulator):
             selected_centers,
             selected_frame_ids,
             registration_metrics,
+            enforce_good_chunk_filter=enforce_good_chunk_filter,
         )
 
 
@@ -399,6 +458,7 @@ class _InitGuessCapturingBackend:
             "registration_input_chunk_count": len(chunks),
             "registration_output_chunk_count": len(chunks),
             "registration_dropped_count": 0,
+            "registration_pair_fitness": [1.0 for _ in range(max(0, len(chunks) - 1))],
             "registration_keep_indices": list(range(len(chunks))),
             "registration_chunk_weights": [1.0 for _ in chunks],
             "registration_skipped": False,
@@ -1584,12 +1644,12 @@ def test_registration_voxel_fusion_accumulator_falls_back_without_backend() -> N
     if hasattr(accumulator.backend, "_small_gicp"):
         accumulator.backend._small_gicp = None
     result = accumulator.accumulate(_track(), LaneBox.from_values([-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]))
-    assert result.status == "saved"
+    assert result.status == "empty_fused"
     assert result.metrics["registration_backend"] == "unavailable"
-    assert result.metrics["registration_keep_indices"] == [0, 1, 2]
+    assert result.metrics["registration_keep_indices"] == []
     assert result.metrics["registration_input_chunk_count"] == 3
-    assert result.metrics["registration_output_chunk_count"] == 3
-    assert result.metrics["registration_dropped_count"] == 0
+    assert result.metrics["registration_output_chunk_count"] == 0
+    assert result.metrics["registration_dropped_count"] == 3
     assert result.metrics["registration_fallback_applied"] is False
     assert result.metrics["registration_fallback_min_kept_chunks"] == 4
     assert result.metrics["registration_attempt_output_chunk_count"] == 3
@@ -2035,12 +2095,15 @@ def test_registration_subset_keeps_frame_ids_intensity_and_chunk_weights_aligned
     assert result.metrics["registration_output_chunk_count"] == 2
     assert result.metrics["registration_dropped_count"] == 1
     assert result.metrics["registration_chunk_weights"] == [1.0, 0.8]
+    assert result.metrics["registration_good_chunk_count_final"] == 2
+    assert result.metrics["registration_good_chunk_indices_final"] == [0, 2]
+    assert result.metrics["registration_bad_chunk_indices_attempt"] == []
     assert result.intensity is not None
     assert len(result.intensity) == 2
     assert np.allclose(np.sort(result.intensity), np.array([0.1, 0.9], dtype=np.float32))
 
 
-def test_registration_underfill_fallback_restores_all_selected_chunks_and_attempt_metrics() -> None:
+def test_registration_good_chunk_filter_discards_low_fitness_chunks_without_restoring_bad_ones() -> None:
     chunks = [_constant_chunk(float(x_value)) for x_value in (0.0, 10.0, 20.0, 30.0)]
     intensities = [np.full((len(chunk),), value, dtype=np.float32) for chunk, value in zip(chunks, (0.1, 0.2, 0.3, 0.4))]
     track = _track_from_chunks(chunks, intensities=intensities, start_frame=200, track_id=71)
@@ -2054,67 +2117,93 @@ def test_registration_underfill_fallback_restores_all_selected_chunks_and_attemp
             min_saved_aggregate_points=0,
             enable_registration_underfill_fallback=True,
             registration_min_kept_chunks=4,
-        ),
-        OutputConfig(require_track_exit=False, save_world=True),
-        TrackingConfig(min_track_hits=1),
-        keep_indices=[0],
-        chunk_weights=[1.0],
-    )
-
-    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 31.0, -1.0, 1.0, -1.0, 1.0]))
-
-    assert result.status == "saved"
-    assert result.selected_frame_ids == [200, 201, 202, 203]
-    assert result.metrics["registration_fallback_applied"] is True
-    assert result.metrics["registration_fallback_min_kept_chunks"] == 4
-    assert result.metrics["registration_input_chunk_count"] == 4
-    assert result.metrics["registration_output_chunk_count"] == 4
-    assert result.metrics["registration_dropped_count"] == 0
-    assert result.metrics["registration_keep_indices"] == [0, 1, 2, 3]
-    assert result.metrics["registration_chunk_weights"] == [1.0, 1.0, 1.0, 1.0]
-    assert result.metrics["registration_attempt_output_chunk_count"] == 1
-    assert result.metrics["registration_attempt_dropped_count"] == 3
-    assert result.metrics["registration_attempt_keep_indices"] == [0]
-    assert result.metrics["registration_attempt_chunk_weights"] == [1.0]
-    assert result.intensity is not None
-    assert np.allclose(np.unique(np.round(result.intensity, decimals=1)), np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32))
-
-
-def test_registration_underfill_fallback_does_not_apply_when_threshold_is_met() -> None:
-    chunks = [_constant_chunk(float(x_value)) for x_value in (0.0, 10.0, 20.0, 30.0)]
-    track = _track_from_chunks(chunks, start_frame=300, track_id=72)
-    accumulator = _ScriptedPrepareAccumulator(
-        AggregationConfig(
-            frame_selection_method="all_track_frames",
-            frame_downsample_voxel=0.0,
-            fusion_voxel_size=0.1,
-            aggregate_voxel=0.0,
-            post_filter_stat_nb_neighbors=999,
-            min_saved_aggregate_points=0,
-            enable_registration_underfill_fallback=True,
-            registration_min_kept_chunks=4,
+            registration_good_chunk_fitness_threshold=0.9,
+            registration_target_good_chunks=4,
         ),
         OutputConfig(require_track_exit=False, save_world=True),
         TrackingConfig(min_track_hits=1),
         keep_indices=[0, 1, 2, 3],
         chunk_weights=[1.0, 0.9, 0.8, 0.7],
+        pair_fitness=[0.95, 0.40, 0.92],
     )
 
     result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 31.0, -1.0, 1.0, -1.0, 1.0]))
 
     assert result.status == "saved"
-    assert result.selected_frame_ids == [300, 301, 302, 303]
+    assert result.selected_frame_ids == [200, 201, 203]
     assert result.metrics["registration_fallback_applied"] is False
-    assert result.metrics["registration_output_chunk_count"] == 4
-    assert result.metrics["registration_keep_indices"] == [0, 1, 2, 3]
-    assert result.metrics["registration_chunk_weights"] == [1.0, 0.9, 0.8, 0.7]
+    assert result.metrics["registration_fallback_min_kept_chunks"] == 4
+    assert result.metrics["registration_input_chunk_count"] == 4
+    assert result.metrics["registration_output_chunk_count"] == 3
+    assert result.metrics["registration_dropped_count"] == 1
+    assert result.metrics["registration_keep_indices"] == [0, 1, 3]
+    assert result.metrics["registration_chunk_weights"] == [1.0, 0.9, 0.7]
     assert result.metrics["registration_attempt_output_chunk_count"] == 4
+    assert result.metrics["registration_attempt_dropped_count"] == 0
     assert result.metrics["registration_attempt_keep_indices"] == [0, 1, 2, 3]
     assert result.metrics["registration_attempt_chunk_weights"] == [1.0, 0.9, 0.8, 0.7]
+    assert result.metrics["registration_good_chunk_count_attempt"] == 3
+    assert result.metrics["registration_good_chunk_count_final"] == 3
+    assert result.metrics["registration_good_chunk_indices_attempt"] == [0, 1, 3]
+    assert result.metrics["registration_good_chunk_indices_final"] == [0, 1, 3]
+    assert result.metrics["registration_bad_chunk_indices_attempt"] == [2]
+    assert result.metrics["registration_good_chunk_rescue_attempted"] is False
+    assert result.metrics["registration_good_chunk_rescue_used"] is False
+    assert result.intensity is not None
+    assert np.allclose(np.unique(np.round(result.intensity, decimals=1)), np.array([0.1, 0.2, 0.4], dtype=np.float32))
 
 
-def test_registration_underfill_fallback_restores_all_preselected_chunks_even_below_threshold() -> None:
-    chunks = [_constant_chunk(float(x_value)) for x_value in (0.0, 10.0, 20.0)]
+def test_registration_rescue_uses_expanded_candidate_pool_to_reach_four_good_chunks() -> None:
+    chunks = [_constant_chunk(float(x_value)) for x_value in (0.0, 10.0, 20.0, 30.0, 40.0, 50.0)]
+    track = _track_from_chunks(chunks, start_frame=300, track_id=72)
+    accumulator = _SequencedPrepareAccumulator(
+        AggregationConfig(
+            frame_selection_method="last_k_frames",
+            top_k_frames=4,
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.1,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            registration_good_chunk_fitness_threshold=0.9,
+            registration_target_good_chunks=4,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+        scripted_calls=[
+            {
+                "keep_indices": [0, 1, 2, 3],
+                "chunk_weights": [1.0, 0.9, 0.8, 0.7],
+                "pair_fitness": [0.95, 0.20, 0.93],
+            },
+            {
+                "keep_indices": [0, 1, 2, 3, 4, 5],
+                "chunk_weights": [1.0, 0.95, 0.9, 0.85, 0.8, 0.75],
+                "pair_fitness": [0.91, 0.92, 0.40, 0.93, 0.94],
+            },
+        ],
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 31.0, -1.0, 1.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert result.selected_frame_ids == [300, 301, 302, 304, 305]
+    assert result.metrics["registration_output_chunk_count"] == 5
+    assert result.metrics["registration_keep_indices"] == [0, 1, 2, 4, 5]
+    assert result.metrics["registration_chunk_weights"] == [1.0, 0.95, 0.9, 0.8, 0.75]
+    assert result.metrics["registration_good_chunk_count_attempt"] == 3
+    assert result.metrics["registration_good_chunk_count_final"] == 5
+    assert result.metrics["registration_good_chunk_indices_attempt"] == [0, 1, 3]
+    assert result.metrics["registration_good_chunk_indices_final"] == [0, 1, 2, 4, 5]
+    assert result.metrics["registration_bad_chunk_indices_attempt"] == [2]
+    assert result.metrics["registration_good_chunk_rescue_attempted"] is True
+    assert result.metrics["registration_good_chunk_rescue_used"] is True
+    assert result.metrics["registration_attempt_output_chunk_count"] == 4
+    assert result.metrics["registration_attempt_keep_indices"] == [0, 1, 2, 3]
+
+
+def test_registration_keeps_largest_exclusively_good_subset_when_four_good_chunks_are_unavailable() -> None:
+    chunks = [_constant_chunk(float(x_value)) for x_value in (0.0, 10.0, 20.0, 30.0, 40.0)]
     track = _track_from_chunks(chunks, start_frame=400, track_id=73)
     accumulator = _ScriptedPrepareAccumulator(
         AggregationConfig(
@@ -2124,25 +2213,27 @@ def test_registration_underfill_fallback_restores_all_preselected_chunks_even_be
             aggregate_voxel=0.0,
             post_filter_stat_nb_neighbors=999,
             min_saved_aggregate_points=0,
-            enable_registration_underfill_fallback=True,
-            registration_min_kept_chunks=4,
+            registration_good_chunk_fitness_threshold=0.9,
+            registration_target_good_chunks=4,
         ),
         OutputConfig(require_track_exit=False, save_world=True),
         TrackingConfig(min_track_hits=1),
-        keep_indices=[0],
+        keep_indices=[0, 1, 2, 3, 4],
+        pair_fitness=[0.91, 0.20, 0.10, 0.92],
     )
 
-    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 21.0, -1.0, 1.0, -1.0, 1.0]))
+    result = accumulator.accumulate(track, LaneBox.from_values([-1.0, 41.0, -1.0, 1.0, -1.0, 1.0]))
 
     assert result.status == "saved"
-    assert result.selected_frame_ids == [400, 401, 402]
-    assert result.metrics["registration_fallback_applied"] is True
+    assert result.selected_frame_ids == [400, 401, 404]
     assert result.metrics["registration_output_chunk_count"] == 3
-    assert result.metrics["registration_dropped_count"] == 0
-    assert result.metrics["registration_keep_indices"] == [0, 1, 2]
-    assert result.metrics["registration_chunk_weights"] == [1.0, 1.0, 1.0]
-    assert result.metrics["registration_attempt_output_chunk_count"] == 1
-    assert result.metrics["registration_attempt_keep_indices"] == [0]
+    assert result.metrics["registration_dropped_count"] == 2
+    assert result.metrics["registration_keep_indices"] == [0, 1, 4]
+    assert result.metrics["registration_good_chunk_count_final"] == 3
+    assert result.metrics["registration_good_chunk_indices_final"] == [0, 1, 4]
+    assert result.metrics["registration_bad_chunk_indices_attempt"] == [2, 3]
+    assert result.metrics["registration_good_chunk_rescue_attempted"] is False
+    assert result.metrics["registration_good_chunk_rescue_used"] is False
 
 
 def test_voxel_fusion_stat_filter_keeps_intensity_aligned() -> None:

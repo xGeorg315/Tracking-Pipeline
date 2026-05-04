@@ -38,6 +38,8 @@ aggregation:
   keyframe_keep: 8
   voxel_reduction_mode: random_point
   enable_registration_underfill_fallback: true
+  registration_good_chunk_fitness_threshold: 0.90
+  registration_target_good_chunks: 4
   enable_tail_bridge: false
   enable_post_filter_stat_outlier_removal: false
   registration_min_kept_chunks: 2

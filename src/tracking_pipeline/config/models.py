@@ -123,6 +123,8 @@ class AggregationConfig:
     registration_max_dof_change: dict[str, float] = field(default_factory=_default_registration_max_dof_change)
     enable_registration_underfill_fallback: bool = False
     registration_min_kept_chunks: int = 4
+    registration_good_chunk_fitness_threshold: float = 0.90
+    registration_target_good_chunks: int = 4
     global_registration_voxel: float = 0.12
     fusion_voxel_size: float = 0.05
     fusion_min_observations: int = 1
