@@ -330,8 +330,8 @@ Wichtige Semantik:
 | `mode` | `run` | exklusiver Output-Modus: `run` fuer klassischen Run-Ordner, `dataset` fuer den globalen Dataset-Baum |
 | `root_dir` | `runs` | Zielverzeichnis fuer Run-Artefakte bei `mode: run` |
 | `dataset_root_dir` | `dataset` | Zielverzeichnis fuer den globalen Dataset-Baum bei `mode: dataset` |
-| `raw_frames_enabled` | `false` | schreibt ausgewaehlte Objekt-Frames aus `chunk_quality_kept_frame_ids` zusaetzlich als Frame-Segment (`manifest.jsonl` + `.npz`-Frames) |
-| `raw_frames_dir` | `` | optionaler Ziel-Root fuer diese Objekt-Frames; leer bedeutet bei `mode: dataset` `<dataset_root_dir>/_raw_frames/<run_id>/`, sonst `<run_dir>/raw_frames/` |
+| `raw_frames_enabled` | `false` | schreibt ausgewaehlte Objekt-Frames aus `chunk_quality_kept_frame_ids` zusaetzlich als PCDs unter `pcd/<pred_class>/<day>/<bucket>/<object_id>/<sample_id>/`; bei aktivem `aggregation.motion_deskew` werden die PCD-Punkte vor dem Schreiben deskewed, sofern Point-Timestamps und Track-Geschwindigkeit verfuegbar sind |
+| `raw_frames_dir` | `` | optionaler Ziel-Root fuer diese Objekt-Frame-PCDs; leer bedeutet bei `mode: dataset` `<dataset_root_dir>/_raw_frames/<run_id>/`, sonst `<run_dir>/raw_frames/` |
 | `save_world` | `false` | speichert Aggregate in Welt- statt Lokalkoordinaten |
 | `save_aggregate_intensity` | `false` | schreibt range-korrigierte Reflectivity als PCD-Feld `reflectivity` mit |
 | `require_track_exit` | `true` | speichert nur Tracks, die die Lane-Box verlassen haben |

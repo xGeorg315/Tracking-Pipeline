@@ -32,9 +32,9 @@ tracking:
 aggregation:
   algorithm: registration_voxel_fusion
   registration_backend: icp_point_to_plane
-  registration_allowed_dofs: [tx, ty, tz, pitch, roll, yaw]
+  registration_allowed_dofs: [tx, ty, tz, yaw, pitch, roll]
   registration_max_dof_change:
-    tz: 0.3
+    tz: 0.30
   frame_selection_method: keyframe_motion
   top_k_frames: 5
   keyframe_keep: 8

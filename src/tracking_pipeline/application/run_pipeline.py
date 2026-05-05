@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from collections import Counter, defaultdict
 from contextlib import contextmanager
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -37,6 +38,7 @@ from tracking_pipeline.application.performance import (
 )
 from tracking_pipeline.application.track_outcomes import build_track_outcomes
 from tracking_pipeline.config.models import PipelineConfig, RuntimeConfig
+from tracking_pipeline.domain.rules import axis_to_index
 from tracking_pipeline.domain.models import (
     AggregateResult,
     FrameData,
@@ -47,10 +49,11 @@ from tracking_pipeline.domain.models import (
     Track,
     TrackOutcomeDebug,
 )
-from tracking_pipeline.infrastructure.io.frame_segment import FrameSegmentWriter
+from tracking_pipeline.infrastructure.io.pcd_writer import PCDWriter
 from tracking_pipeline.infrastructure.logging.run_logger import get_run_logger
 from tracking_pipeline.infrastructure.visualization.live_frame_publisher import LiveFramePublisher
 from tracking_pipeline.infrastructure.visualization.live_pcd_web_server import LivePCDWebServer
+from tracking_pipeline.shared.ids import aggregate_file_stem, object_file_stem
 
 LIVE_ARTIFACT_TRACKER_DEBUG_FRAME_COUNT = 1
 LIVE_GT_MATCH_HISTORY_MARGIN_SEC = 5.0
@@ -222,9 +225,10 @@ def run_pipeline(config: PipelineConfig, project_root: Path, live_observer=None)
         config.input.format,
         config.output.live_object_list_flush_interval_sec,
     )
-    raw_frame_writer: FrameSegmentWriter | None = None
+    raw_frame_root: Path | None = None
+    raw_frame_pcd_written_keys: set[tuple[int, int]] = set()
     try:
-        raw_frame_writer = _start_raw_frame_writer(config, project_root, writer, run_dir, logger)
+        raw_frame_root = _start_raw_frame_output_dir(config, project_root, writer, run_dir, logger)
         latest_object_labels: dict[int, ObjectLabelData] = {}
         object_label_history_by_id: dict[int, list[ObjectLabelData]] = defaultdict(list)
         object_list_seen_ids: set[int] = set()
@@ -374,6 +378,8 @@ def run_pipeline(config: PipelineConfig, project_root: Path, live_observer=None)
                         live_snapshot_track_outcomes=live_snapshot_track_outcomes,
                         live_snapshot_announced_finished_track_ids=live_snapshot_announced_finished_track_ids,
                         save_aggregate_intensity=config.output.save_aggregate_intensity,
+                        raw_frame_root=raw_frame_root,
+                        raw_frame_pcd_written_keys=raw_frame_pcd_written_keys,
                         live_observer=live_observer,
                         logger=logger,
                     )
@@ -536,7 +542,16 @@ def run_pipeline(config: PipelineConfig, project_root: Path, live_observer=None)
                 frame_count=frame_count,
                 gt_match_summary=gt_match_summary,
             )
-            _write_selected_object_frames(raw_frame_writer, live_snapshot_tracks, aggregate_results, profiler)
+            _write_selected_object_frame_pcds(
+                raw_frame_root,
+                config,
+                live_snapshot_tracks,
+                aggregate_results,
+                matched_gt,
+                unmatched_saved_tracks,
+                profiler,
+                written_keys=raw_frame_pcd_written_keys,
+            )
             _begin_writer_snapshot(writer, run_dir)
             _clear_live_artifact_outputs(writer, run_dir)
             for result in aggregate_results:
@@ -647,7 +662,16 @@ def run_pipeline(config: PipelineConfig, project_root: Path, live_observer=None)
                 if statistics_enabled
                 else _empty_class_statistics()
             )
-            _write_selected_object_frames(raw_frame_writer, tracks, aggregate_results, profiler)
+            _write_selected_object_frame_pcds(
+                raw_frame_root,
+                config,
+                tracks,
+                aggregate_results,
+                matched_gt,
+                unmatched_saved_tracks,
+                profiler,
+                written_keys=raw_frame_pcd_written_keys,
+            )
             _begin_writer_snapshot(writer, run_dir)
             for result in aggregate_results:
                 if result.status == "saved":
@@ -780,33 +804,32 @@ def run_pipeline(config: PipelineConfig, project_root: Path, live_observer=None)
         )
         return summary
     finally:
-        _close_raw_frame_writer(raw_frame_writer, logger)
         _notify_live_observer(live_observer, logger, "on_run_finished")
         _stop_live_web_viewer(live_web_runtime)
         _stop_live_status_reporter(live_status_reporter, reader)
 
 
-def _start_raw_frame_writer(
+def _start_raw_frame_output_dir(
     config: PipelineConfig,
     project_root: Path,
     writer,
     run_dir: Path,
     logger,
-) -> FrameSegmentWriter | None:
+) -> Path | None:
     if not bool(config.output.raw_frames_enabled):
         return None
     run_id = str(getattr(writer, "_run_id", "") or run_dir.name)
-    segment_dir = _resolve_raw_frame_segment_dir(config, project_root, run_dir, run_id)
+    segment_dir = _resolve_raw_frame_output_dir(config, project_root, run_dir, run_id)
     try:
-        raw_writer = FrameSegmentWriter(segment_dir)
+        segment_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         logger.warning("Raw frame recording disabled; cannot write to %s: %s", segment_dir, exc)
         return None
     logger.info("Raw frame recording enabled: %s", segment_dir)
-    return raw_writer
+    return segment_dir
 
 
-def _resolve_raw_frame_segment_dir(config: PipelineConfig, project_root: Path, run_dir: Path, run_id: str) -> Path:
+def _resolve_raw_frame_output_dir(config: PipelineConfig, project_root: Path, run_dir: Path, run_id: str) -> Path:
     configured_dir = str(config.output.raw_frames_dir).strip()
     if configured_dir:
         root = Path(configured_dir)
@@ -818,23 +841,328 @@ def _resolve_raw_frame_segment_dir(config: PipelineConfig, project_root: Path, r
     return run_dir / "raw_frames"
 
 
-def _write_selected_object_frames(
-    raw_frame_writer: FrameSegmentWriter | None,
+def _write_selected_object_frame_pcds(
+    raw_frame_root: Path | None,
+    config: PipelineConfig,
     tracks: dict[int, Track],
     aggregate_results: list[AggregateResult],
+    matched_gt: list[GTMatchResult],
+    unmatched_saved_tracks: list[GTMatchResult],
     profiler: PerformanceProfiler,
+    *,
+    written_keys: set[tuple[int, int]] | None = None,
 ) -> None:
-    if raw_frame_writer is None:
+    if raw_frame_root is None:
         return
-    with profiler.stage("write_raw_frames"):
-        for result in aggregate_results:
-            if str(result.status) != "saved":
-                continue
-            track = tracks.get(int(result.track_id))
+    result_by_track = {
+        int(result.track_id): result
+        for result in aggregate_results
+        if str(result.status) == "saved"
+    }
+    if not result_by_track:
+        return
+    contexts = _raw_frame_pcd_contexts(result_by_track, matched_gt, unmatched_saved_tracks, tracks)
+    pcd_writer = PCDWriter()
+    with profiler.stage("write_raw_frame_pcds"):
+        for track_id in sorted(result_by_track):
+            result = result_by_track[int(track_id)]
+            track = tracks.get(int(track_id))
             if track is None:
                 continue
+            context = contexts.get(int(track_id))
+            if context is None:
+                continue
             for frame in _selected_object_frames(track, result):
-                raw_frame_writer.write_frame(frame)
+                frame_key = (int(track_id), int(frame.frame_index))
+                if written_keys is not None and frame_key in written_keys:
+                    continue
+                frame_dir = _raw_frame_pcd_sample_dir(raw_frame_root, context)
+                frame_stem = f"frame_{int(frame.frame_index):06d}"
+                pcd_path = frame_dir / f"{frame_stem}.pcd"
+                points, deskew_payload = _deskew_raw_frame_points_for_export(config, track, frame)
+                pcd_writer.write(
+                    pcd_path,
+                    points,
+                    intensity=frame.point_intensity,
+                    scalar_field_name="reflectivity",
+                )
+                _write_raw_frame_pcd_metadata(frame_dir, frame_stem, frame, result, context, pcd_path, deskew_payload)
+                if written_keys is not None:
+                    written_keys.add(frame_key)
+
+
+def _raw_frame_pcd_contexts(
+    result_by_track: dict[int, AggregateResult],
+    matched_gt: list[GTMatchResult],
+    unmatched_saved_tracks: list[GTMatchResult],
+    tracks: dict[int, Track],
+) -> dict[int, dict[str, object]]:
+    contexts: dict[int, dict[str, object]] = {}
+    for track_id, result in result_by_track.items():
+        contexts[int(track_id)] = _raw_frame_default_pcd_context(result, tracks.get(int(track_id)))
+
+    for match in matched_gt:
+        if not bool(match.matched):
+            continue
+        track_id = int(match.track_id)
+        result = result_by_track.get(track_id)
+        if result is None:
+            continue
+        pred_class = _raw_predicted_class_name(result)
+        gt_class = str(match.gt_obj_class or "").strip()
+        bucket = "gt-pred-same" if gt_class and pred_class and gt_class == pred_class else "gt-pred-different"
+        gt_object_id = int(match.gt_object_id) if match.gt_object_id is not None else None
+        contexts[track_id] = _raw_frame_pcd_context(
+            result=result,
+            track=tracks.get(track_id),
+            pred_class=pred_class,
+            bucket=bucket,
+            gt_object_id=gt_object_id,
+            timestamp_ns=_first_int(
+                match.our_last_timestamp_ns,
+                match.gt_timestamp_ns,
+            ),
+        )
+
+    for unmatched in unmatched_saved_tracks:
+        track_id = int(unmatched.track_id)
+        result = result_by_track.get(track_id)
+        if result is None:
+            continue
+        contexts[track_id] = _raw_frame_pcd_context(
+            result=result,
+            track=tracks.get(track_id),
+            pred_class=_raw_predicted_class_name(result),
+            bucket="unmatched_pred",
+            gt_object_id=None,
+            timestamp_ns=_first_int(unmatched.our_last_timestamp_ns),
+        )
+    return contexts
+
+
+def _raw_frame_default_pcd_context(result: AggregateResult, track: Track | None) -> dict[str, object]:
+    return _raw_frame_pcd_context(
+        result=result,
+        track=track,
+        pred_class=_raw_predicted_class_name(result),
+        bucket="unmatched_pred",
+        gt_object_id=None,
+        timestamp_ns=_track_last_timestamp_ns(track),
+    )
+
+
+def _raw_frame_pcd_context(
+    *,
+    result: AggregateResult,
+    track: Track | None,
+    pred_class: str,
+    bucket: str,
+    gt_object_id: int | None,
+    timestamp_ns: int,
+) -> dict[str, object]:
+    track_id = int(result.track_id)
+    run_id = str(result.metrics.get("run_id", "") or "").strip()
+    object_folder = object_file_stem(int(gt_object_id)) if gt_object_id is not None else "object_unmatched"
+    sample_parts = ["run_PLACEHOLDER", aggregate_file_stem(track_id)]
+    if gt_object_id is not None:
+        sample_parts.append(object_file_stem(int(gt_object_id)))
+    sample_id_suffix = "__".join(sample_parts[1:])
+    return {
+        "track_id": track_id,
+        "gt_object_id": gt_object_id,
+        "predicted_class_name": pred_class,
+        "class_name": _safe_dataset_name(pred_class, fallback="UNKNOWN_PRED"),
+        "bucket": str(bucket or "unmatched_pred"),
+        "day_key": _date_key_from_timestamp_ns(timestamp_ns),
+        "object_folder": object_folder,
+        "sample_id_suffix": sample_id_suffix,
+        "run_id": run_id,
+        "selected_frame_ids": [int(frame_id) for frame_id in result.selected_frame_ids],
+        "status": str(result.status),
+        "point_count": int(len(result.points)),
+        "track_frame_count": 0 if track is None else int(len(track.frame_ids)),
+    }
+
+
+def _raw_frame_pcd_sample_dir(root: Path, context: dict[str, object]) -> Path:
+    run_id = str(context.get("run_id", "") or "").strip() or root.name
+    sample_id = "__".join([f"run_{run_id}", str(context["sample_id_suffix"])])
+    return (
+        root
+        / "pcd"
+        / str(context["class_name"])
+        / str(context["day_key"])
+        / str(context["bucket"])
+        / str(context["object_folder"])
+        / sample_id
+    )
+
+
+def _write_raw_frame_pcd_metadata(
+    frame_dir: Path,
+    frame_stem: str,
+    frame: FrameData,
+    result: AggregateResult,
+    context: dict[str, object],
+    pcd_path: Path,
+    deskew_payload: dict[str, object],
+) -> None:
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    run_id = str(context.get("run_id", "") or "").strip() or frame_dir.parents[5].name
+    sample_id = frame_dir.name
+    payload = {
+        "sample_id": sample_id,
+        "run_id": run_id,
+        "track_id": int(result.track_id),
+        "gt_object_id": context.get("gt_object_id"),
+        "frame_index": int(frame.frame_index),
+        "timestamp_ns": int(frame.timestamp_ns),
+        "source_path": str(frame.source_path),
+        "source_frame_index": int(frame.source_frame_index),
+        "source_sequence_index": int(frame.source_sequence_index),
+        "selected_frame_ids": [int(frame_id) for frame_id in context.get("selected_frame_ids", [])],
+        "point_count": int(len(frame.points)),
+        "has_reflectivity": frame.point_intensity is not None,
+        "status": str(context.get("status", "")),
+        "bucket": str(context.get("bucket", "")),
+        "class_name": str(context.get("class_name", "")),
+        "predicted_class_name": str(context.get("predicted_class_name", "")),
+        "day": str(context.get("day_key", "")),
+        "pcd_path": str(pcd_path.relative_to(frame_dir.parent.parent.parent.parent.parent.parent)),
+        "deskew": dict(deskew_payload),
+    }
+    json_path = frame_dir / f"{frame_stem}.json"
+    json_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _upsert_raw_frame_manifest_row(frame_dir / "manifest.jsonl", payload)
+
+
+def _upsert_raw_frame_manifest_row(path: Path, payload: dict[str, object]) -> None:
+    rows = []
+    if path.exists():
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    frame_index = int(payload.get("frame_index", -1))
+    rows = [row for row in rows if int(row.get("frame_index", -1)) != frame_index]
+    rows.append(dict(payload))
+    rows.sort(key=lambda row: int(row.get("frame_index", -1)))
+    path.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8")
+
+
+def _deskew_raw_frame_points_for_export(
+    config: PipelineConfig,
+    track: Track,
+    frame: FrameData,
+) -> tuple[np.ndarray, dict[str, object]]:
+    points = np.asarray(frame.points, dtype=np.float32)
+    payload: dict[str, object] = {
+        "enabled": bool(config.aggregation.motion_deskew),
+        "applied": False,
+        "skipped_reason": "disabled" if not bool(config.aggregation.motion_deskew) else "not_run",
+        "axis": str(config.aggregation.frame_selection_line_axis),
+        "speed_mps": 0.0,
+        "time_span_ms": 0.0,
+        "mean_abs_shift_m": 0.0,
+    }
+    if not bool(config.aggregation.motion_deskew):
+        return points, payload
+    if len(points) == 0:
+        payload["skipped_reason"] = "empty_frame"
+        return points, payload
+    if frame.point_timestamp_ns is None:
+        payload["skipped_reason"] = "no_point_timestamps"
+        return points, payload
+    point_times = np.asarray(frame.point_timestamp_ns, dtype=np.int64)
+    if len(point_times) != len(points):
+        payload["skipped_reason"] = "point_timestamp_length_mismatch"
+        return points, payload
+    axis_idx = axis_to_index(config.aggregation.frame_selection_line_axis)
+    speed_mps = _raw_track_velocity_along_axis(track, int(frame.frame_index), axis_idx)
+    if speed_mps is None:
+        payload["skipped_reason"] = "no_velocity_estimate"
+        return points, payload
+    if abs(float(speed_mps)) < 1.0:
+        payload["skipped_reason"] = "insufficient_velocity"
+        payload["speed_mps"] = float(speed_mps)
+        return points, payload
+
+    dt_seconds = (point_times.astype(np.float64) - float(np.median(point_times))) * 1e-9
+    shifts = float(speed_mps) * dt_seconds
+    corrected = points.copy()
+    corrected[:, axis_idx] = corrected[:, axis_idx] - shifts.astype(np.float32)
+    payload.update(
+        {
+            "applied": True,
+            "skipped_reason": "applied",
+            "speed_mps": float(speed_mps),
+            "time_span_ms": float((int(np.max(point_times)) - int(np.min(point_times))) * 1e-6),
+            "mean_abs_shift_m": float(np.mean(np.abs(shifts))),
+        }
+    )
+    return corrected.astype(np.float32, copy=False), payload
+
+
+def _raw_track_velocity_along_axis(track: Track, frame_id: int, axis_idx: int) -> float | None:
+    if len(track.centers) < 2 or len(track.frame_ids) != len(track.centers):
+        return None
+    if len(track.frame_timestamps_ns) != len(track.frame_ids):
+        return None
+    try:
+        observation_index = next(index for index, value in enumerate(track.frame_ids) if int(value) == int(frame_id))
+    except StopIteration:
+        return None
+    if observation_index <= 0:
+        return _raw_velocity_between(track, observation_index, min(observation_index + 1, len(track.centers) - 1), axis_idx)
+    if observation_index >= (len(track.centers) - 1):
+        return _raw_velocity_between(track, max(observation_index - 1, 0), observation_index, axis_idx)
+    return _raw_velocity_between(track, observation_index - 1, observation_index + 1, axis_idx)
+
+
+def _raw_velocity_between(track: Track, left_index: int, right_index: int, axis_idx: int) -> float | None:
+    if left_index == right_index:
+        return None
+    left_time_ns = int(track.frame_timestamps_ns[left_index])
+    right_time_ns = int(track.frame_timestamps_ns[right_index])
+    dt_ns = right_time_ns - left_time_ns
+    if dt_ns <= 0:
+        return None
+    displacement = np.asarray(track.centers[right_index], dtype=np.float64) - np.asarray(track.centers[left_index], dtype=np.float64)
+    return float(displacement[axis_idx] / (float(dt_ns) * 1e-9))
+
+
+def _raw_predicted_class_name(result: AggregateResult) -> str:
+    return str(result.metrics.get("predicted_class_name", "") or "UNKNOWN_PRED").strip() or "UNKNOWN_PRED"
+
+
+def _track_last_timestamp_ns(track: Track | None) -> int:
+    if track is not None and track.frame_timestamps_ns:
+        return int(track.frame_timestamps_ns[-1])
+    return -1
+
+
+def _date_key_from_timestamp_ns(timestamp_ns: int) -> str:
+    try:
+        if int(timestamp_ns) > 0:
+            return datetime.fromtimestamp(float(timestamp_ns) / 1_000_000_000.0).astimezone().strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    return datetime.now().astimezone().strftime("%Y-%m-%d")
+
+
+def _safe_dataset_name(value: str, *, fallback: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        text = str(fallback)
+    return "".join(character if character.isalnum() or character in {"-", "_", "."} else "_" for character in text)
+
+
+def _first_int(*values: object) -> int:
+    for value in values:
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return -1
 
 
 def _selected_object_frames(track: Track, result: AggregateResult) -> list[FrameData]:
@@ -885,16 +1213,6 @@ def _track_optional_array_at(values: list[np.ndarray | None], index: int, dtype)
     if value is None:
         return None
     return np.asarray(value, dtype=dtype)
-
-
-def _close_raw_frame_writer(raw_frame_writer: FrameSegmentWriter | None, logger) -> None:
-    if raw_frame_writer is None:
-        return
-    try:
-        raw_frame_writer.close()
-    except Exception as exc:  # pragma: no cover - best effort during shutdown
-        if logger is not None:
-            logger.warning("Closing raw frame recording failed: %s", exc)
 
 
 def _notify_live_observer(observer, logger, method_name: str, **kwargs):
@@ -1519,6 +1837,8 @@ def _maybe_write_incremental_live_artifact_snapshot(
     live_snapshot_track_outcomes: dict[int, TrackOutcomeDebug],
     live_snapshot_announced_finished_track_ids: set[int],
     save_aggregate_intensity: bool,
+    raw_frame_root: Path | None = None,
+    raw_frame_pcd_written_keys: set[tuple[int, int]] | None = None,
     live_observer=None,
     logger=None,
     force: bool = False,
@@ -1702,6 +2022,17 @@ def _maybe_write_incremental_live_artifact_snapshot(
         unmatched_gt_objects = list(live_artifact_state.get("cached_unmatched_gt_objects") or [])
         gt_match_summary = dict(cached_gt_match_summary)
         class_stats = dict(cached_class_stats) if statistics_enabled else _empty_class_statistics()
+
+    _write_selected_object_frame_pcds(
+        raw_frame_root,
+        config,
+        live_snapshot_tracks,
+        aggregate_results,
+        matched_gt,
+        unmatched_saved_tracks,
+        profiler,
+        written_keys=raw_frame_pcd_written_keys,
+    )
 
     summary = _build_incremental_live_summary(
         config=config,

@@ -11,6 +11,7 @@ from tracking_pipeline.application.class_normalization import ClassNormalizer
 from tracking_pipeline.application.performance import PerformanceProfiler, derive_hz
 from tracking_pipeline.application.replay_run import replay_run
 from tracking_pipeline.application.run_pipeline import (
+    _deskew_raw_frame_points_for_export,
     _live_gt_match_label_history,
     _live_snapshot_tracker_states,
     _maybe_write_incremental_live_artifact_snapshot,
@@ -48,7 +49,6 @@ from tracking_pipeline.domain.models import (
     TrackOutcomeDebug,
 )
 from tracking_pipeline.infrastructure.io.dataset_artifact_writer import DatasetArtifactWriter
-from tracking_pipeline.infrastructure.io.frame_segment import FrameSegmentReader
 from tracking_pipeline.infrastructure.postprocessing.articulated_vehicle_merge import ArticulatedVehicleMergePostprocessor
 
 
@@ -722,25 +722,28 @@ def test_run_pipeline_records_raw_frames_inside_dataset_root(monkeypatch, tmp_pa
     summary = run_pipeline(config, tmp_path)
 
     segment_dir = tmp_path / "new-config-dataset" / "_raw_frames" / "test_run"
-    loaded = list(FrameSegmentReader().iter_frames([str(segment_dir)]))
+    raw_pcd_paths = sorted((segment_dir / "pcd").glob("UNKNOWN_PRED/*/unmatched_pred/object_unmatched/*/*.pcd"))
     assert summary.output_dir == str(tmp_path / "new-config-dataset")
-    assert (segment_dir / "manifest.jsonl").exists()
-    assert (segment_dir / "segment.json").exists()
-    assert len(loaded) == 1
-    assert loaded[0].frame_index == 0
-    assert loaded[0].timestamp_ns == 200
-    assert loaded[0].source_path == "track://1/chunk_quality_kept"
-    assert np.array_equal(loaded[0].points, np.array([[0.95, 0.0, 0.0]], dtype=np.float32))
+    assert not (segment_dir / "frames").exists()
+    assert not (segment_dir / "manifest.jsonl").exists()
+    assert len(raw_pcd_paths) == 1
 
 
-def test_run_pipeline_continues_when_raw_frame_writer_cannot_start(monkeypatch, tmp_path: Path) -> None:
+def test_run_pipeline_continues_when_raw_frame_output_dir_cannot_start(monkeypatch, tmp_path: Path) -> None:
+    blocked_raw_root = tmp_path / "raw_frames_file"
+    blocked_raw_root.write_text("not a directory\n", encoding="utf-8")
     config = PipelineConfig(
         input=InputConfig(paths=["ignored_a.pb", "ignored_b.pb"]),
         preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
         clustering=ClusteringConfig(),
         tracking=TrackingConfig(),
         aggregation=AggregationConfig(),
-        output=OutputConfig(mode="dataset", dataset_root_dir=str(tmp_path / "new-config-dataset"), raw_frames_enabled=True),
+        output=OutputConfig(
+            mode="dataset",
+            dataset_root_dir=str(tmp_path / "new-config-dataset"),
+            raw_frames_enabled=True,
+            raw_frames_dir=str(blocked_raw_root),
+        ),
         visualization=VisualizationConfig(),
     )
 
@@ -751,12 +754,7 @@ def test_run_pipeline_continues_when_raw_frame_writer_cannot_start(monkeypatch, 
             self._run_id = "test_run"
             return path
 
-    class _PermissionDeniedFrameSegmentWriter:
-        def __init__(self, root):
-            raise PermissionError(13, "Permission denied", str(root))
-
     fake_writer = _DatasetLikeFakeWriter(tmp_path)
-    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.FrameSegmentWriter", _PermissionDeniedFrameSegmentWriter)
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_reader", lambda cfg: _FakeReader())
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_clusterer", lambda cfg: _FakeClusterer())
     monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: _FakeTracker())
@@ -1535,6 +1533,9 @@ def test_incremental_live_dataset_flush_keeps_existing_pred_without_new_saved_tr
     latest_object_labels = {42: object_label}
     object_list_seen_ids = {42}
     announced_finished_track_ids: set[int] = set()
+    raw_frame_pcd_written_keys: set[tuple[int, int]] = set()
+    raw_segment_dir = tmp_path / "raw_frames" / "test_run"
+    raw_segment_dir.mkdir(parents=True)
 
     _maybe_write_incremental_live_artifact_snapshot(
         config=config,
@@ -1563,6 +1564,8 @@ def test_incremental_live_dataset_flush_keeps_existing_pred_without_new_saved_tr
         live_snapshot_track_outcomes=live_snapshot_track_outcomes,
         live_snapshot_announced_finished_track_ids=announced_finished_track_ids,
         save_aggregate_intensity=False,
+        raw_frame_root=raw_segment_dir,
+        raw_frame_pcd_written_keys=raw_frame_pcd_written_keys,
     )
 
     pred_dir = run_dir / "car" / "1970-01-01" / "gt-pred-same" / "pred"
@@ -1598,12 +1601,53 @@ def test_incremental_live_dataset_flush_keeps_existing_pred_without_new_saved_tr
         live_snapshot_track_outcomes=live_snapshot_track_outcomes,
         live_snapshot_announced_finished_track_ids=announced_finished_track_ids,
         save_aggregate_intensity=False,
+        raw_frame_root=raw_segment_dir,
+        raw_frame_pcd_written_keys=raw_frame_pcd_written_keys,
     )
 
     second_pred_json_paths = sorted(pred_dir.glob("*.json"))
     second_pred_pcd_paths = sorted(pred_dir.glob("*.pcd"))
     assert second_pred_json_paths == first_pred_json_paths
     assert second_pred_pcd_paths == first_pred_pcd_paths
+    assert not (raw_segment_dir / "frames").exists()
+    raw_pcd_paths = sorted((raw_segment_dir / "pcd").glob("car/1970-01-01/gt-pred-same/object_0042/*/*.pcd"))
+    raw_json_paths = sorted((raw_segment_dir / "pcd").glob("car/1970-01-01/gt-pred-same/object_0042/*/*.json"))
+    assert len(raw_pcd_paths) == 1
+    assert len(raw_json_paths) == 1
+    raw_payload = json.loads(raw_json_paths[0].read_text(encoding="utf-8"))
+    assert raw_payload["track_id"] == 1
+    assert raw_payload["gt_object_id"] == 42
+    assert raw_payload["predicted_class_name"] == "car"
+    assert raw_payload["frame_index"] == 0
+
+
+def test_raw_frame_pcd_export_deskews_points_when_timestamps_and_velocity_exist() -> None:
+    config = PipelineConfig(
+        input=InputConfig(paths=[]),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        aggregation=AggregationConfig(motion_deskew=True, frame_selection_line_axis="x"),
+    )
+    track = Track(
+        track_id=1,
+        centers=[
+            np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        ],
+        frame_ids=[0, 1],
+        frame_timestamps_ns=[0, 1_000_000_000],
+    )
+    frame = FrameData(
+        frame_index=1,
+        timestamp_ns=1_000_000_000,
+        points=np.array([[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float32),
+        point_timestamp_ns=np.array([950_000_000, 1_050_000_000], dtype=np.int64),
+    )
+
+    corrected, payload = _deskew_raw_frame_points_for_export(config, track, frame)
+
+    assert payload["applied"] is True
+    assert payload["skipped_reason"] == "applied"
+    assert corrected[:, 0] == pytest.approx([1.05, 1.95])
 
 
 def test_incremental_live_artifact_snapshot_skips_track_snapshot_before_flush_interval(tmp_path: Path) -> None:
