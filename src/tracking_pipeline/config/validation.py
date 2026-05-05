@@ -148,6 +148,10 @@ def validate_config(config: PipelineConfig) -> None:
             raise ConfigError("input.qb2_live.mqtt.keepalive must be > 0")
         if not config.input.paths:
             raise ConfigError("input.paths must not be empty")
+    if not isinstance(config.output.raw_frames_enabled, bool):
+        raise ConfigError("output.raw_frames_enabled must be a boolean")
+    if config.output.raw_frames_enabled and not isinstance(config.output.raw_frames_dir, str):
+        raise ConfigError("output.raw_frames_dir must be a string")
     if config.clustering.algorithm not in SUPPORTED_CLUSTERERS:
         raise ConfigError(f"Unsupported clustering algorithm: {config.clustering.algorithm}")
     if config.tracking.algorithm not in SUPPORTED_TRACKERS:
@@ -214,6 +218,8 @@ def validate_config(config: PipelineConfig) -> None:
         raise ConfigError("aggregation.enable_registration_underfill_fallback must be a boolean")
     if not isinstance(config.aggregation.enable_confidence_point_cap, bool):
         raise ConfigError("aggregation.enable_confidence_point_cap must be a boolean")
+    if not isinstance(config.aggregation.enable_long_vehicle_rear_fallback, bool):
+        raise ConfigError("aggregation.enable_long_vehicle_rear_fallback must be a boolean")
     if not isinstance(config.aggregation.enable_tail_bridge, bool):
         raise ConfigError("aggregation.enable_tail_bridge must be a boolean")
     if not isinstance(config.aggregation.enable_post_filter_stat_outlier_removal, bool):

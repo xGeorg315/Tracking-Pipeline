@@ -302,6 +302,35 @@ def test_load_config_reads_live_output_flush_settings(tmp_path: Path) -> None:
     assert config.output.live_tracker_debug_flush_interval_sec == pytest.approx(12.0)
 
 
+def test_load_config_reads_raw_frame_output_settings(tmp_path: Path) -> None:
+    fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "output:",
+                "  raw_frames_enabled: true",
+                "  raw_frames_dir: raw_frames_custom",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.input.paths == [str(fixture_dst.resolve())]
+    assert config.output.raw_frames_enabled is True
+    assert config.output.raw_frames_dir == "raw_frames_custom"
+
+
 def test_load_config_reads_live_web_visualization_settings(tmp_path: Path) -> None:
     config_path = tmp_path / "config_qb2_live_live_web.yaml"
     config_path.write_text(
@@ -565,6 +594,33 @@ def test_load_config_reads_tail_bridge_toggle(tmp_path: Path) -> None:
 
     assert config.input.paths == [str(fixture_dst.resolve())]
     assert config.aggregation.enable_tail_bridge is False
+
+
+def test_load_config_reads_long_vehicle_rear_fallback_toggle(tmp_path: Path) -> None:
+    fixture_dst = _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+
+    config_path = tmp_path / "config_long_vehicle_rear_fallback_toggle.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "aggregation:",
+                "  enable_long_vehicle_rear_fallback: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.input.paths == [str(fixture_dst.resolve())]
+    assert config.aggregation.enable_long_vehicle_rear_fallback is False
 
 
 def test_load_config_reads_registration_underfill_fallback_settings(tmp_path: Path) -> None:
@@ -1257,6 +1313,31 @@ def test_load_config_rejects_non_boolean_tail_bridge_toggle(tmp_path: Path) -> N
     )
 
     with pytest.raises(ConfigError, match="aggregation.enable_tail_bridge must be a boolean"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_non_boolean_long_vehicle_rear_fallback_toggle(tmp_path: Path) -> None:
+    _copy_sample_pb(tmp_path / "data" / "sample_a42.pb")
+
+    config_path = tmp_path / "config_invalid_long_vehicle_rear_fallback_toggle.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "input:",
+                "  paths:",
+                "    - data/sample_a42.pb",
+                "  format: a42_pb",
+                "preprocessing:",
+                "  lane_box: [-1.0, 1.0, 0.0, 10.0, 0.0, 2.0]",
+                "aggregation:",
+                "  enable_long_vehicle_rear_fallback: nope",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="aggregation.enable_long_vehicle_rear_fallback must be a boolean"):
         load_config(config_path)
 
 

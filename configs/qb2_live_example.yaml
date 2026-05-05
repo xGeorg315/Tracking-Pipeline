@@ -32,12 +32,19 @@ tracking:
 aggregation:
   algorithm: registration_voxel_fusion
   registration_backend: icp_point_to_plane
+  registration_allowed_dofs: [tx, ty, tz, pitch, roll, yaw]
+  registration_max_dof_change:
+    tz: 0.3
   frame_selection_method: keyframe_motion
+  top_k_frames: 5
   keyframe_keep: 8
-  symmetry_completion: true
+  voxel_reduction_mode: random_point
   enable_registration_underfill_fallback: true
+  registration_good_chunk_fitness_threshold: 0.90
+  registration_target_good_chunks: 4
   enable_tail_bridge: false
-  enable_post_filter_stat_outlier_removal: true
+  enable_long_vehicle_rear_fallback: false
+  enable_post_filter_stat_outlier_removal: false
   registration_min_kept_chunks: 2
   registration_max_iter: 30
   registration_max_translation: 3.5
@@ -64,7 +71,8 @@ classification:
   enabled: true
 output:
   mode: dataset
-  dataset_root_dir: /mnt/data/Tracking-Pipeline/dataset
+  dataset_root_dir: /mnt/data/Tracking-Pipeline/new-config-dataset
+  raw_frames_enabled: true
   statistics_enabled: false
   final_full_recompute: false
   live_object_list_flush_interval_sec: 5.0

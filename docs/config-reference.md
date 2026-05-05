@@ -184,7 +184,7 @@ Hinweise:
 | --- | --- | --- |
 | `algorithm` | `voxel_fusion` | Akkumulator-Auswahl |
 | `symmetry_completion` | `false` | optionale lokale Symmetrievervollstaendigung |
-| `motion_deskew` | `false` | objektrelativer intra-scan Deskew fuer elongierte Tracks anhand von `timestamp_offset` |
+| `motion_deskew` | `false` | objektrelativer intra-scan Deskew fuer alle Tracks anhand von `timestamp_offset`, sofern Point-Timestamps und Track-Geschwindigkeit verfuegbar sind |
 | `truncate_after_lane_end_touch` | `false` | verwirft alle Folgeframes nach erstem Touch am Lane-Ende (`frame_selection_line_axis`-Min-Seite) |
 | `frame_selection_method` | `auto` | Strategie zur Chunk-/Frame-Auswahl: `all_track_frames`, `last_k_frames`, `line_touch_last_k`, `keyframe_motion`, `length_coverage`, `quality_coverage`, `tail_coverage`, `center_diversity`, `max_extent`, `auto` |
 | `use_all_frames` | `true` | alle Track-Frames verwenden statt nur Auswahl |
@@ -246,6 +246,7 @@ Hinweise:
 | `long_vehicle_length_threshold` | `4.5` | Schwellwert fuer Long-Vehicle-Klassifikation |
 | `length_coverage_bins` | `10` | Bins fuer laengenbasierte Frame-Selektion |
 | `min_track_quality_for_save_long_vehicle` | `0.0` | Mindestqualitaet fuer Long Vehicles |
+| `enable_long_vehicle_rear_fallback` | `true` | stellt rejected Rear-/Tail-Chunks bei Long Vehicles mit reduziertem Gewicht wieder her |
 | `enable_tail_bridge` | `true` | schaltet Tail-Bridge komplett ein oder aus; bei `false` entfaellt auch die teure Komponentenbildung in diesem Schritt |
 | `tail_bridge_longitudinal_gap_max` | `1.5` | maximaler Laengsabstand fuer Tail-Bridge |
 | `tail_bridge_lateral_gap_max` | `0.8` | maximaler lateraler Abstand fuer Tail-Bridge |
@@ -329,6 +330,8 @@ Wichtige Semantik:
 | `mode` | `run` | exklusiver Output-Modus: `run` fuer klassischen Run-Ordner, `dataset` fuer den globalen Dataset-Baum |
 | `root_dir` | `runs` | Zielverzeichnis fuer Run-Artefakte bei `mode: run` |
 | `dataset_root_dir` | `dataset` | Zielverzeichnis fuer den globalen Dataset-Baum bei `mode: dataset` |
+| `raw_frames_enabled` | `false` | schreibt ausgewaehlte Objekt-Frames aus `chunk_quality_kept_frame_ids` zusaetzlich als Frame-Segment (`manifest.jsonl` + `.npz`-Frames) |
+| `raw_frames_dir` | `` | optionaler Ziel-Root fuer diese Objekt-Frames; leer bedeutet bei `mode: dataset` `<dataset_root_dir>/_raw_frames/<run_id>/`, sonst `<run_dir>/raw_frames/` |
 | `save_world` | `false` | speichert Aggregate in Welt- statt Lokalkoordinaten |
 | `save_aggregate_intensity` | `false` | schreibt range-korrigierte Reflectivity als PCD-Feld `reflectivity` mit |
 | `require_track_exit` | `true` | speichert nur Tracks, die die Lane-Box verlassen haben |

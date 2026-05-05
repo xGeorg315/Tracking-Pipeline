@@ -48,6 +48,7 @@ from tracking_pipeline.domain.models import (
     TrackOutcomeDebug,
 )
 from tracking_pipeline.infrastructure.io.dataset_artifact_writer import DatasetArtifactWriter
+from tracking_pipeline.infrastructure.io.frame_segment import FrameSegmentReader
 from tracking_pipeline.infrastructure.postprocessing.articulated_vehicle_merge import ArticulatedVehicleMergePostprocessor
 
 
@@ -690,6 +691,85 @@ def test_run_pipeline_passes_aggregate_intensity_flag_to_writer(monkeypatch, tmp
     summary = run_pipeline(config, tmp_path)
 
     assert fake_writer.aggregate_write_intensity_flags == [True]
+
+
+def test_run_pipeline_records_raw_frames_inside_dataset_root(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(paths=["ignored_a.pb", "ignored_b.pb"]),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(mode="dataset", dataset_root_dir=str(tmp_path / "new-config-dataset"), raw_frames_enabled=True),
+        visualization=VisualizationConfig(),
+    )
+
+    class _DatasetLikeFakeWriter(_FakeWriter):
+        def prepare_run_dir(self, config):
+            path = Path(config.output.dataset_root_dir)
+            path.mkdir(parents=True, exist_ok=True)
+            self._run_id = "test_run"
+            return path
+
+    fake_writer = _DatasetLikeFakeWriter(tmp_path)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_reader", lambda cfg: _FakeReader())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: _FakeTracker())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda cfg, root: fake_writer)
+
+    summary = run_pipeline(config, tmp_path)
+
+    segment_dir = tmp_path / "new-config-dataset" / "_raw_frames" / "test_run"
+    loaded = list(FrameSegmentReader().iter_frames([str(segment_dir)]))
+    assert summary.output_dir == str(tmp_path / "new-config-dataset")
+    assert (segment_dir / "manifest.jsonl").exists()
+    assert (segment_dir / "segment.json").exists()
+    assert len(loaded) == 1
+    assert loaded[0].frame_index == 0
+    assert loaded[0].timestamp_ns == 200
+    assert loaded[0].source_path == "track://1/chunk_quality_kept"
+    assert np.array_equal(loaded[0].points, np.array([[0.95, 0.0, 0.0]], dtype=np.float32))
+
+
+def test_run_pipeline_continues_when_raw_frame_writer_cannot_start(monkeypatch, tmp_path: Path) -> None:
+    config = PipelineConfig(
+        input=InputConfig(paths=["ignored_a.pb", "ignored_b.pb"]),
+        preprocessing=PreprocessingConfig(lane_box=[-1, 1, -1, 1, -1, 1]),
+        clustering=ClusteringConfig(),
+        tracking=TrackingConfig(),
+        aggregation=AggregationConfig(),
+        output=OutputConfig(mode="dataset", dataset_root_dir=str(tmp_path / "new-config-dataset"), raw_frames_enabled=True),
+        visualization=VisualizationConfig(),
+    )
+
+    class _DatasetLikeFakeWriter(_FakeWriter):
+        def prepare_run_dir(self, config):
+            path = Path(config.output.dataset_root_dir)
+            path.mkdir(parents=True, exist_ok=True)
+            self._run_id = "test_run"
+            return path
+
+    class _PermissionDeniedFrameSegmentWriter:
+        def __init__(self, root):
+            raise PermissionError(13, "Permission denied", str(root))
+
+    fake_writer = _DatasetLikeFakeWriter(tmp_path)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.FrameSegmentWriter", _PermissionDeniedFrameSegmentWriter)
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_reader", lambda cfg: _FakeReader())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_clusterer", lambda cfg: _FakeClusterer())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_tracker", lambda cfg: _FakeTracker())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_track_postprocessors", lambda cfg: [])
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_accumulator", lambda cfg: _FakeAccumulator())
+    monkeypatch.setattr("tracking_pipeline.application.run_pipeline.build_artifact_writer", lambda cfg, root: fake_writer)
+
+    summary = run_pipeline(config, tmp_path)
+
+    assert summary.output_dir == str(tmp_path / "new-config-dataset")
+    assert summary.saved_aggregates == 1
+    assert fake_writer.summary_write_count > 0
+    assert not (tmp_path / "new-config-dataset" / "_raw_frames").exists()
 
 
 def test_run_pipeline_merges_articulated_vehicle_tracks(monkeypatch, tmp_path: Path) -> None:

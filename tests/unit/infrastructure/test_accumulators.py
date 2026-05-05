@@ -1049,16 +1049,17 @@ def test_motion_deskew_corrects_distorted_local_chunks_for_long_vehicle() -> Non
     assert result.metrics["extent_y"] < 1e-4
 
 
-def test_motion_deskew_skips_non_elongated_candidate() -> None:
+def test_motion_deskew_corrects_chunks_without_long_vehicle_mode() -> None:
     track = _motion_distorted_track()
     accumulator = _motion_deskew_accumulator(enabled=True, save_world=False, long_vehicle_mode=False)
 
     result = accumulator.accumulate(track, LaneBox.from_values([-5.0, 5.0, -5.0, 25.0, -1.0, 1.0]))
 
     assert result.status == "saved"
-    assert result.metrics["motion_deskew_applied"] is False
-    assert result.metrics["motion_deskew_skipped_reason"] == "not_elongated_candidate"
-    assert np.isclose(result.metrics["extent_y"], 1.0, atol=1e-4)
+    assert result.metrics["motion_deskew_applied"] is True
+    assert result.metrics["motion_deskew_skipped_reason"] == "applied"
+    assert result.metrics["motion_deskew_corrected_chunk_count"] == 3
+    assert np.isclose(result.metrics["extent_y"], 0.0, atol=1e-4)
 
 
 def test_motion_deskew_skips_when_point_timestamps_are_missing() -> None:
@@ -2616,6 +2617,7 @@ def test_chunk_quality_filter_removes_weak_tail_before_keyframe_motion() -> None
     assert result.status == "saved"
     assert result.metrics["chunk_quality_total"] == 8
     assert result.metrics["chunk_quality_kept"] == 4
+    assert result.metrics["chunk_quality_kept_frame_ids"] == [101, 102, 103, 104]
     assert result.metrics["chunk_quality_segment_start_frame"] == 101
     assert result.metrics["chunk_quality_segment_end_frame"] == 104
     assert 107 not in result.selected_frame_ids
@@ -3020,6 +3022,38 @@ def test_long_vehicle_rear_registration_fallback_restores_rejected_chunks() -> N
     assert result.metrics["rear_fallback_used"] is True
     assert result.metrics["rear_registration_rejected_count"] == 2
     assert result.metrics["registration_output_chunk_count"] == 3
+
+
+def test_long_vehicle_rear_registration_fallback_can_be_disabled() -> None:
+    chunks = [_constant_chunk(0.0), _constant_chunk(0.6), _constant_chunk(1.2)]
+    track = _track_from_chunks(chunks, track_id=89)
+    track.quality_metrics = {"is_long_vehicle": True}
+    track.state["long_vehicle_component_role"] = "rear"
+    accumulator = _ScriptedPrepareAccumulator(
+        AggregationConfig(
+            algorithm="registration_voxel_fusion",
+            frame_selection_method="all_track_frames",
+            frame_downsample_voxel=0.0,
+            fusion_voxel_size=0.05,
+            aggregate_voxel=0.0,
+            post_filter_stat_nb_neighbors=999,
+            min_saved_aggregate_points=0,
+            long_vehicle_mode=True,
+            enable_long_vehicle_rear_fallback=False,
+        ),
+        OutputConfig(require_track_exit=False, save_world=True),
+        TrackingConfig(min_track_hits=1),
+        keep_indices=[0],
+        chunk_weights=[1.0],
+    )
+
+    result = accumulator.accumulate(track, LaneBox.from_values([-2.0, 2.0, -1.0, 4.0, -1.0, 1.0]))
+
+    assert result.status == "saved"
+    assert result.metrics["rear_fallback_used"] is False
+    assert result.metrics["rear_registration_rejected_count"] == 0
+    assert result.metrics["registration_output_chunk_count"] == 1
+    assert result.metrics["registration_keep_indices"] == [0]
 
 
 def test_merge_long_vehicle_aggregates_keeps_rear_component_behind_lead_anchor() -> None:

@@ -1629,10 +1629,7 @@ class VoxelFusionAccumulator:
         if not chunks:
             metrics["motion_deskew_skipped_reason"] = "empty_selection"
             return [], list(intensity), metrics
-        if not self._motion_deskew_candidate(track, long_vehicle_mode_applied):
-            metrics["motion_deskew_skipped_reason"] = "not_elongated_candidate"
-            return list(chunks), list(intensity), metrics
-        _ = centers, frame_timestamps_ns
+        _ = centers, frame_timestamps_ns, long_vehicle_mode_applied
 
         axis_idx = axis_to_index(self.config.frame_selection_line_axis)
         corrected_chunks: list[np.ndarray] = []
@@ -1694,23 +1691,6 @@ class VoxelFusionAccumulator:
             }
         )
         return corrected_chunks, list(intensity), metrics
-
-    def _motion_deskew_candidate(self, track: Track, long_vehicle_mode_applied: bool) -> bool:
-        if long_vehicle_mode_applied or self.config.long_vehicle_mode:
-            return True
-        is_long_vehicle = track.quality_metrics.get("is_long_vehicle")
-        if bool(is_long_vehicle):
-            return True
-        extents = (
-            np.asarray(track.bbox_extents, dtype=np.float64)
-            if track.bbox_extents
-            else np.asarray([compute_extent(points) for points in track.world_points], dtype=np.float64)
-        )
-        if extents.size == 0:
-            return False
-        axis_idx = axis_to_index(self.config.frame_selection_line_axis)
-        max_extent = float(np.max(extents[:, axis_idx]))
-        return max_extent >= (0.85 * float(self.config.long_vehicle_length_threshold))
 
     def _track_velocity_along_axis(self, track: Track, frame_id: int, axis_idx: int) -> float | None:
         if len(track.centers) < 2 or len(track.frame_ids) != len(track.centers):
@@ -1836,6 +1816,7 @@ class VoxelFusionAccumulator:
             "chunk_quality_filter_enabled": bool(self.config.chunk_quality_filter),
             "chunk_quality_total": total,
             "chunk_quality_kept": total,
+            "chunk_quality_kept_frame_ids": [int(frame_id) for frame_id in frame_ids],
             "chunk_quality_segment_start_frame": -1 if not frame_ids else int(frame_ids[0]),
             "chunk_quality_segment_end_frame": -1 if not frame_ids else int(frame_ids[-1]),
             "peak_chunk_point_count": 0,
@@ -1910,6 +1891,7 @@ class VoxelFusionAccumulator:
             "chunk_quality_filter_enabled": True,
             "chunk_quality_total": total,
             "chunk_quality_kept": len(kept_indices),
+            "chunk_quality_kept_frame_ids": [int(frame_ids[index]) for index in kept_indices],
             "chunk_quality_segment_start_frame": int(frame_ids[min(kept_indices)]),
             "chunk_quality_segment_end_frame": int(frame_ids[max(kept_indices)]),
             "peak_chunk_point_count": peak_point_count,
@@ -2026,7 +2008,11 @@ class VoxelFusionAccumulator:
         metrics = dict(registration_metrics)
         metrics.setdefault("rear_registration_rejected_count", 0)
         metrics.setdefault("rear_fallback_used", False)
-        if not long_vehicle_mode_applied or len(prepared_chunks) <= len(accumulation_input):
+        if (
+            not long_vehicle_mode_applied
+            or not bool(self.config.enable_long_vehicle_rear_fallback)
+            or len(prepared_chunks) <= len(accumulation_input)
+        ):
             return accumulation_input, kept_intensity, kept_centers, kept_frame_ids, metrics
 
         keep_indices = [int(index) for index in metrics.get("registration_keep_indices", [])]

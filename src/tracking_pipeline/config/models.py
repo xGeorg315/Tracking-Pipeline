@@ -139,6 +139,7 @@ class AggregationConfig:
     long_vehicle_length_threshold: float = 4.5
     length_coverage_bins: int = 10
     min_track_quality_for_save_long_vehicle: float = 0.0
+    enable_long_vehicle_rear_fallback: bool = True
     enable_tail_bridge: bool = True
     tail_bridge_longitudinal_gap_max: float = 1.5
     tail_bridge_lateral_gap_max: float = 0.8
@@ -196,6 +197,8 @@ class OutputConfig:
     mode: str = "run"
     root_dir: str = "runs"
     dataset_root_dir: str = "dataset"
+    raw_frames_enabled: bool = False
+    raw_frames_dir: str = ""
     save_world: bool = False
     save_aggregate_intensity: bool = False
     require_track_exit: bool = True

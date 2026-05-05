@@ -39,6 +39,7 @@ from tracking_pipeline.application.track_outcomes import build_track_outcomes
 from tracking_pipeline.config.models import PipelineConfig, RuntimeConfig
 from tracking_pipeline.domain.models import (
     AggregateResult,
+    FrameData,
     GTMatchResult,
     ObjectLabelData,
     RunPerformance,
@@ -46,6 +47,7 @@ from tracking_pipeline.domain.models import (
     Track,
     TrackOutcomeDebug,
 )
+from tracking_pipeline.infrastructure.io.frame_segment import FrameSegmentWriter
 from tracking_pipeline.infrastructure.logging.run_logger import get_run_logger
 from tracking_pipeline.infrastructure.visualization.live_frame_publisher import LiveFramePublisher
 from tracking_pipeline.infrastructure.visualization.live_pcd_web_server import LivePCDWebServer
@@ -220,7 +222,9 @@ def run_pipeline(config: PipelineConfig, project_root: Path, live_observer=None)
         config.input.format,
         config.output.live_object_list_flush_interval_sec,
     )
+    raw_frame_writer: FrameSegmentWriter | None = None
     try:
+        raw_frame_writer = _start_raw_frame_writer(config, project_root, writer, run_dir, logger)
         latest_object_labels: dict[int, ObjectLabelData] = {}
         object_label_history_by_id: dict[int, list[ObjectLabelData]] = defaultdict(list)
         object_list_seen_ids: set[int] = set()
@@ -532,6 +536,7 @@ def run_pipeline(config: PipelineConfig, project_root: Path, live_observer=None)
                 frame_count=frame_count,
                 gt_match_summary=gt_match_summary,
             )
+            _write_selected_object_frames(raw_frame_writer, live_snapshot_tracks, aggregate_results, profiler)
             _begin_writer_snapshot(writer, run_dir)
             _clear_live_artifact_outputs(writer, run_dir)
             for result in aggregate_results:
@@ -642,6 +647,7 @@ def run_pipeline(config: PipelineConfig, project_root: Path, live_observer=None)
                 if statistics_enabled
                 else _empty_class_statistics()
             )
+            _write_selected_object_frames(raw_frame_writer, tracks, aggregate_results, profiler)
             _begin_writer_snapshot(writer, run_dir)
             for result in aggregate_results:
                 if result.status == "saved":
@@ -774,9 +780,121 @@ def run_pipeline(config: PipelineConfig, project_root: Path, live_observer=None)
         )
         return summary
     finally:
+        _close_raw_frame_writer(raw_frame_writer, logger)
         _notify_live_observer(live_observer, logger, "on_run_finished")
         _stop_live_web_viewer(live_web_runtime)
         _stop_live_status_reporter(live_status_reporter, reader)
+
+
+def _start_raw_frame_writer(
+    config: PipelineConfig,
+    project_root: Path,
+    writer,
+    run_dir: Path,
+    logger,
+) -> FrameSegmentWriter | None:
+    if not bool(config.output.raw_frames_enabled):
+        return None
+    run_id = str(getattr(writer, "_run_id", "") or run_dir.name)
+    segment_dir = _resolve_raw_frame_segment_dir(config, project_root, run_dir, run_id)
+    try:
+        raw_writer = FrameSegmentWriter(segment_dir)
+    except OSError as exc:
+        logger.warning("Raw frame recording disabled; cannot write to %s: %s", segment_dir, exc)
+        return None
+    logger.info("Raw frame recording enabled: %s", segment_dir)
+    return raw_writer
+
+
+def _resolve_raw_frame_segment_dir(config: PipelineConfig, project_root: Path, run_dir: Path, run_id: str) -> Path:
+    configured_dir = str(config.output.raw_frames_dir).strip()
+    if configured_dir:
+        root = Path(configured_dir)
+        if not root.is_absolute():
+            root = (project_root / root).resolve()
+        return root / run_id
+    if str(config.output.mode) == "dataset":
+        return run_dir / "_raw_frames" / run_id
+    return run_dir / "raw_frames"
+
+
+def _write_selected_object_frames(
+    raw_frame_writer: FrameSegmentWriter | None,
+    tracks: dict[int, Track],
+    aggregate_results: list[AggregateResult],
+    profiler: PerformanceProfiler,
+) -> None:
+    if raw_frame_writer is None:
+        return
+    with profiler.stage("write_raw_frames"):
+        for result in aggregate_results:
+            if str(result.status) != "saved":
+                continue
+            track = tracks.get(int(result.track_id))
+            if track is None:
+                continue
+            for frame in _selected_object_frames(track, result):
+                raw_frame_writer.write_frame(frame)
+
+
+def _selected_object_frames(track: Track, result: AggregateResult) -> list[FrameData]:
+    frame_ids = _raw_object_frame_ids(result)
+    if not frame_ids:
+        return []
+    frame_to_index = {int(frame_id): index for index, frame_id in enumerate(track.frame_ids)}
+    frames: list[FrameData] = []
+    for frame_id in frame_ids:
+        index = frame_to_index.get(int(frame_id))
+        if index is None or index >= len(track.world_points):
+            continue
+        points = np.asarray(track.world_points[index], dtype=np.float32)
+        if len(points) == 0:
+            continue
+        frames.append(
+            FrameData(
+                frame_index=int(frame_id),
+                timestamp_ns=_track_frame_timestamp_at(track, index),
+                points=points,
+                point_intensity=_track_optional_array_at(track.world_intensity, index, np.float32),
+                point_timestamp_ns=_track_optional_array_at(track.point_timestamps_ns, index, np.int64),
+                source_path=f"track://{int(track.track_id)}/chunk_quality_kept",
+                source_frame_index=int(frame_id),
+                source_sequence_index=int(track.track_id),
+            )
+        )
+    return frames
+
+
+def _raw_object_frame_ids(result: AggregateResult) -> list[int]:
+    raw_frame_ids = result.metrics.get("chunk_quality_kept_frame_ids")
+    if isinstance(raw_frame_ids, (list, tuple)):
+        return [int(frame_id) for frame_id in raw_frame_ids]
+    return [int(frame_id) for frame_id in result.selected_frame_ids]
+
+
+def _track_frame_timestamp_at(track: Track, index: int) -> int:
+    if index < len(track.frame_timestamps_ns):
+        return int(track.frame_timestamps_ns[index])
+    return -1
+
+
+def _track_optional_array_at(values: list[np.ndarray | None], index: int, dtype) -> np.ndarray | None:
+    if index >= len(values):
+        return None
+    value = values[index]
+    if value is None:
+        return None
+    return np.asarray(value, dtype=dtype)
+
+
+def _close_raw_frame_writer(raw_frame_writer: FrameSegmentWriter | None, logger) -> None:
+    if raw_frame_writer is None:
+        return
+    try:
+        raw_frame_writer.close()
+    except Exception as exc:  # pragma: no cover - best effort during shutdown
+        if logger is not None:
+            logger.warning("Closing raw frame recording failed: %s", exc)
 
 
 def _notify_live_observer(observer, logger, method_name: str, **kwargs):

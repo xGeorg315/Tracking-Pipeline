@@ -70,9 +70,10 @@ aggregation:
   min_track_quality_for_save: 0.0
   min_saved_aggregate_points: 50
   long_vehicle_mode: false
-  long_vehicle_length_threshold: 4.5
+  long_vehicle_length_threshold: 9999.5
   length_coverage_bins: 10
   min_track_quality_for_save_long_vehicle: 0.0
+  enable_long_vehicle_rear_fallback: true
   enable_tail_bridge: true
   tail_bridge_longitudinal_gap_max: 1.5
   tail_bridge_lateral_gap_max: 0.8
